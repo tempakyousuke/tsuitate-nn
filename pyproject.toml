@@ -1,0 +1,17 @@
+[project]
+name = "tsuitate-nn"
+version = "0.1.0"
+description = "tsuitate-bot の局面valueネット学習パイプライン（フェーズ1: 粒子上のvalueネット）"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "torch>=2.9,<3",
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "onnx>=1.16",
+    "onnxscript>=0.1",
+    "scikit-learn>=1.5",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
