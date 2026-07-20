@@ -9,18 +9,22 @@
 import torch
 from torch import nn
 
-# tsuitate-bot の value_features.rs::VALUE_FEATURES と一致させること
-INPUT_DIM = 14
+# tsuitate-bot の value_features.rs::VALUE_FEATURES + TRANSITION_FEATURES と一致させること
+INPUT_DIM = 22
 
 
 class ValueNet(nn.Module):
-    def __init__(self, input_dim: int = INPUT_DIM, hidden: int = 64) -> None:
+    def __init__(
+        self, input_dim: int = INPUT_DIM, hidden: int = 64, dropout: float = 0.2
+    ) -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden, hidden // 2),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden // 2, 1),
             nn.Sigmoid(),
         )

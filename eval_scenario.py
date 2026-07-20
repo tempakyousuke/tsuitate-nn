@@ -48,7 +48,7 @@ def main() -> None:
         scores = model(torch.from_numpy(x)).numpy()
 
     ranked = sorted(zip(df["usi"], scores), key=lambda t: -t[1])
-    print("候補の評価（値が高いほど良い、手番側視点の勝率相当）:")
+    print("候補の評価（値が高いほど良い、着手した側視点の勝率相当）:")
     for usi, score in ranked:
         print(f"  {usi:>8}  {score:.4f}")
 
