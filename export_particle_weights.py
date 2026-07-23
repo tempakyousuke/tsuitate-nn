@@ -77,6 +77,9 @@ def main() -> None:
     train_groups = [g for g in all_groups if train_mask[g[0]]]
     val_groups = [g for g in all_groups if not train_mask[g[0]]]
 
+    # train_particle.py と同じ規約: モデル生成直前にseedをリセット
+    # （比較で評価したMLPと同じ初期値・学習軌跡になる）
+    torch.manual_seed(args.seed)
     model = OppMoveNet(input_dim=len(FEATURE_NAMES), hidden=args.hidden)
     model, best_metrics = train(
         model,

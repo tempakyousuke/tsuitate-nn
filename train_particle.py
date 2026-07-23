@@ -91,6 +91,12 @@ def build_groups(df: pd.DataFrame) -> list[np.ndarray]:
     return groups
 
 
+# 推論側（particle_nn.rs 呼び出し元）は forward 出力を clamp(-15, 15) してから
+# 使うので、学習・評価のスコアにも同じ clamp を入れて分布を揃える
+# （codexレビュー指摘、2026-07-23）
+CLAMP = 15.0
+
+
 def group_nll(
     scores: torch.Tensor, chosen: torch.Tensor, group_rows: list[np.ndarray]
 ) -> torch.Tensor:
@@ -125,7 +131,7 @@ def evaluate_scores(scores: torch.Tensor, chosen: torch.Tensor, group_rows) -> d
 def evaluate(model, x, offset, chosen, group_rows) -> dict:
     model.eval()
     with torch.no_grad():
-        scores = model(x) + offset
+        scores = torch.clamp(model(x), -CLAMP, CLAMP) + offset
     return evaluate_scores(scores, chosen, group_rows)
 
 
@@ -161,7 +167,7 @@ def train(
             batch_rows = [train_groups[i] for i in batch_idx]
             all_rows = np.concatenate(batch_rows)
             opt.zero_grad()
-            scores = model(x_train[all_rows]) + offset_train[all_rows]
+            scores = torch.clamp(model(x_train[all_rows]), -CLAMP, CLAMP) + offset_train[all_rows]
             offset = 0
             local_groups = []
             for rows in batch_rows:
@@ -239,6 +245,11 @@ def main() -> None:
     results = {}
     for name, hidden in [("linear", None), ("mlp", args.hidden)]:
         print(f"\n=== {name} (hidden={hidden}) ===")
+        # モデル生成直前にseedをリセットする: export_particle_weights.py が
+        # 同じseedで学習したMLPと初期値・学習軌跡を一致させるため
+        # （codexレビュー指摘、2026-07-23: 「比較で評価したモデル」と
+        # 「出荷するモデル」が別物になる事故の防止）
+        torch.manual_seed(args.seed)
         model = OppMoveNet(input_dim=len(FEATURE_NAMES), hidden=hidden)
         model, best_metrics = train(
             model,
