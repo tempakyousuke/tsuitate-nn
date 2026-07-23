@@ -55,6 +55,8 @@ FEATURE_NAMES = [
     "moved_promoted",
     "move_dist",
     "from_home",
+    # 逆方向反則特徴量（2026-07-23）: 直前の敵側手番の反則回数
+    "my_foul_count_last_turn",
 ]
 
 # ①-bのアブレーション比較用: base = ①-aの13特徴量（駒種ブロックなし）
