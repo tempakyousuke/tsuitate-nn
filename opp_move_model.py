@@ -13,8 +13,10 @@ import torch
 from torch import nn
 
 # tsuitate-bot の opp_move_features.rs::OPP_MOVE_FEATURES と一致させること
-# （2026-07-23: my_foul_count_last_turn 追加で23→24）
-INPUT_DIM = 24
+# （2026-07-23: my_foul_count_last_turn 追加で23→24、
+#  2026-07-24: en_prise_flee 追加で24→25。en_prise_flee_home 交互作用の
+#  26次元化は bishop×home セルの反実仮想悪化で不採用）
+INPUT_DIM = 25
 
 
 class OppMoveNet(nn.Module):
