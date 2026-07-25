@@ -58,6 +58,11 @@ STATE_FEATURE_NAMES = [
     "my_max_exchange_loss",
     "opp_max_exchange_loss",
     "ply_progress",
+    # 接近特徴量（2026-07-25 追加。value_features.rs::APPROACH_STATE_FEATURE_NAMES）
+    "my_prey_proximity",
+    "opp_prey_proximity",
+    "my_king_siege",
+    "opp_king_siege",
 ]
 TRANSITION_FEATURE_NAMES = [
     "moved_piece_value",
@@ -66,13 +71,23 @@ TRANSITION_FEATURE_NAMES = [
     "captured_value",
     "net_capture_then_recapture",
     "gives_check",
+    # 接近特徴量（value_features.rs::APPROACH_TRANSITION_FEATURE_NAMES）
+    "king_approach",
+    "prey_approach",
+    "king_closeness_after",
+    "moved_piece_supported",
+    "supported_prey_approach",
 ]
 EXPECTED_FEATURE_NAMES = STATE_FEATURE_NAMES + TRANSITION_FEATURE_NAMES
 
 
-def load_data(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
+def load_data(
+    path: Path,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str], np.ndarray | None]:
     df = pd.read_csv(path)
-    feature_names = [c for c in df.columns if c not in ("game_id", "ply", "label")]
+    feature_names = [
+        c for c in df.columns if c not in ("game_id", "ply", "label", "mat_swing")
+    ]
     if feature_names != EXPECTED_FEATURE_NAMES:
         raise ValueError(
             "特徴量の名前・順序が train.py::EXPECTED_FEATURE_NAMES と不一致 "
@@ -92,7 +107,14 @@ def load_data(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]
     x = df[feature_names].to_numpy(dtype=np.float32)
     y = df["label"].to_numpy(dtype=np.float32)
     groups = df["game_id"].to_numpy()
-    return x, y, groups, feature_names
+    # mat_swing（N手先に実現した駒得。export_value_data::SWING_HORIZON）は
+    # 任意列。無ければ勝敗ラベルのみで従来どおり学習する
+    swing = (
+        df["mat_swing"].to_numpy(dtype=np.float32)
+        if "mat_swing" in df.columns
+        else None
+    )
+    return x, y, groups, feature_names, swing
 
 
 def load_pairwise_data(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -227,11 +249,32 @@ def main() -> None:
     ap.add_argument("--patience", type=int, default=30)
     ap.add_argument("--val-fraction", type=float, default=0.15)
     ap.add_argument("--seed", type=int, default=0)
+    # 目標値に「N手先に実現した駒得」を混ぜる割合と、そのsigmoidスケール（歩換算）
+    ap.add_argument("--swing-weight", type=float, default=0.0)
+    ap.add_argument("--swing-scale", type=float, default=8.0)
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
-    x, y, groups, feature_names = load_data(args.data)
+    x, y, groups, feature_names, swing = load_data(args.data)
     print(f"データ: {x.shape[0]}行 x {x.shape[1]}特徴量 / {len(np.unique(groups))}局")
+
+    # 目標値のブレンド: label（最終勝敗）と「N手先に実現した駒得」の合成。
+    # この領域は対局の約66%が反則負けで終わる（アリーナ実測 2026-07-26）ため
+    # 勝敗ラベルは反則レースにほぼ支配されていて、局面の良し悪しに対する
+    # 教師としては弱い（実測: mat_swing と label の相関は 0.096）。
+    # 「多手かけて駒を取りに行く」の価値は実現した駒得のほうが密な信号になる
+    if args.swing_weight > 0.0:
+        if swing is None:
+            raise ValueError(
+                "--swing-weight を使うには mat_swing 列が要る"
+                "（export_value_data を作り直すこと）"
+            )
+        swing_target = 1.0 / (1.0 + np.exp(-swing / args.swing_scale))
+        y = (1.0 - args.swing_weight) * y + args.swing_weight * swing_target
+        print(
+            f"目標値をブレンド: label {1 - args.swing_weight:.2f} + "
+            f"駒得スイング {args.swing_weight:.2f}（scale={args.swing_scale}）"
+        )
 
     # 対局（game_id）単位で分割する。同じ対局の別手番が学習/検証の両方に
     # 入るとデータリークになるため、行単位のtrain_test_splitは使わない
