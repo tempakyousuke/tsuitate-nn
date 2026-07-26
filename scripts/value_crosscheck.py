@@ -56,8 +56,14 @@ def main() -> None:
         return 1.0 / (1.0 + np.exp(-z))
 
     # value_nn.rs のテストと同じ4ケース（インデックスは
-    # VALUE_FEATURE_NAMES + TRANSITION_FEATURE_NAMES の並び）
-    state = 20  # VALUE_FEATURES
+    # VALUE_FEATURE_NAMES + TRANSITION_FEATURE_NAMES の並び）。
+    # 着手側の開始位置 = VALUE_FEATURES は **Rust ソースから読む**
+    # （直書きすると特徴量を足したときに静かにズレる。2026-07-26に実際に踏んだ）
+    vf_src = (SRC.parent / "value_features.rs").read_text()
+    state = int(
+        re.search(r"pub const VALUE_FEATURES: usize = (\d+)", vf_src).group(1)
+    )
+    print(f"VALUE_FEATURES={state}（value_features.rs から取得）")
     quiet = np.zeros(n)
     quiet[15] = 0.3  # ply_progress
     quiet[state + 0] = 1.0  # moved_piece_value（歩）

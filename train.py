@@ -63,6 +63,11 @@ STATE_FEATURE_NAMES = [
     "opp_prey_proximity",
     "my_king_siege",
     "opp_king_siege",
+    # 予防的な紐（2026-07-26。docs/yaneuraou-lessons.md の V3）
+    "my_linked_value",
+    "my_unlinked_value",
+    "opp_linked_value",
+    "opp_unlinked_value",
 ]
 TRANSITION_FEATURE_NAMES = [
     "moved_piece_value",
@@ -75,7 +80,7 @@ TRANSITION_FEATURE_NAMES = [
     "king_approach",
     "prey_approach",
     "king_closeness_after",
-    "moved_piece_supported",
+    "moved_piece_support_margin",
     "supported_prey_approach",
 ]
 EXPECTED_FEATURE_NAMES = STATE_FEATURE_NAMES + TRANSITION_FEATURE_NAMES

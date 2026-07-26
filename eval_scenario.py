@@ -39,7 +39,9 @@ def main() -> None:
             f"学習時={feature_names}"
         )
 
-    model = ValueNet()
+    # 入力次元は**保存された正規化統計から取る**（model.py の INPUT_DIM は
+    # 現行の特徴量定義に追随するので、古いモデルを読むと食い違う）
+    model = ValueNet(input_dim=len(feature_names))
     model.load_state_dict(torch.load(args.model / "model.pt"))
     model.eval()
 
