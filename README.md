@@ -90,3 +90,31 @@ transition特徴量を**base→着手後**の遷移として出力する（学�
 （両方5/5で安定）には一歩届かない。次の一手候補・経緯の全詳細は
 `tsuitate-bot/docs/nn-value-phase1.md`参照。**bot本体への推論統合・
 ONNX推論クレートの選定はまだ行っていない**。
+
+## 信念ネット（NN段階②、2026-07-27）
+
+`belief_model.py` / `train_belief.py` / `export_belief_weights.py` /
+`analyze_belief.py` / `compare_probe.py`。
+
+観測履歴だけからマスごとに「そこに相手の駒がいる確率」を予測する
+pointwise MLP（35 → 64 → 32 → 占有ロジット + 駒種9クラスの補助ヘッド）。
+特徴量の定義は tsuitate-bot の `src/belief_features.rs` に一本化してある。
+
+```
+# tsuitate-bot 側: 記録用アリーナ → artifact 回収 → 学習データ
+cargo run --release --bin export_belief_data -- <jsonl...> > tsuitate-nn/data/belief.csv
+# 学習（対局単位で train/val 分割・正規化統計も学習splitのみ）
+python train_belief.py --data data/belief.csv --out out_belief_seed0/ --seed 0
+# 現行の粒子フィルタとの突き合わせ（ゲート1）
+cargo run --release --bin belief_probe -- <jsonl...> > probe.csv   # bot 側・重い
+python analyze_belief.py --probe probe.csv --model out_belief_seed0/
+# Rust へ重みを書き出す
+python export_belief_weights.py --model-dir out_belief_seed0/ \
+    --out ../tsuitate-bot/src/belief_nn.rs --note "..."
+```
+
+**結果**: オフライン較正は現行の粒子フィルタに決定的に勝つ
+（アリーナ・ホールドアウトで対数損失 0.6227 → 0.3777）が、
+**強さには変換できていない**（供給チャネルを2つ試して両方とも勝率中立）。
+既定0のノブとして bot 側に入っている。全経緯は
+`tsuitate-bot/docs/nn-stage2-belief-net.md`。
