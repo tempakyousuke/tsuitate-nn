@@ -33,12 +33,14 @@ def rust_array_1d(name: str, values: np.ndarray) -> str:
 
 
 def rust_array_2d(name: str, values: np.ndarray) -> str:
+    """2次元の重みは `static` で置く（`const` だと使用箇所ごとに実体が作られるため
+    clippy::large_const_arrays が出る。信念ネットの W1 は 35×64 でその閾値を超える）"""
     rows = []
     for row in values.tolist():
         body = ", ".join(f"{v:.8e}" for v in row)
         rows.append(f"    [{body}],")
     rows_str = "\n".join(rows)
-    return f"pub const {name}: [[f64; {values.shape[1]}]; {values.shape[0]}] = [\n{rows_str}\n];"
+    return f"pub static {name}: [[f64; {values.shape[1]}]; {values.shape[0]}] = [\n{rows_str}\n];"
 
 
 def main() -> None:
