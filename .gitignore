@@ -3,4 +3,6 @@ __pycache__/
 *.pyc
 out/
 data/*.csv
+data/rl_records/
+out_rnad/
 *.egg-info/
