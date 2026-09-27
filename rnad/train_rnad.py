@@ -60,6 +60,8 @@ def main() -> None:
     ap.add_argument("--eval-every", type=int, default=25)
     ap.add_argument("--eval-games", type=int, default=128)
     ap.add_argument("--export-every", type=int, default=100)
+    ap.add_argument("--checkpoint-every", type=int, default=25,
+                    help="checkpoint を書く間隔（Spot で止められたらここから再開する）")
     ap.add_argument("--schedule", type=int, default=100, help="正則化方策を差し替える間隔（更新回数）")
     ap.add_argument("--lr", type=float, default=5e-5)
     ap.add_argument("--eta", type=float, default=0.2)
@@ -134,8 +136,12 @@ def main() -> None:
               f"({t1 - t0:.1f}s + {t2 - t1:.1f}s)", flush=True)
         if step % args.eval_every == 0:
             evaluate(step)
+        if step % args.checkpoint_every == 0 or step % args.export_every == 0:
+            # 書きかけで止められても前の checkpoint が壊れないよう、別名に書いてから置き換える
+            tmp = ck_path.with_suffix(".tmp")
+            torch.save(learner.state_dict(), tmp)
+            tmp.replace(ck_path)
         if step % args.export_every == 0 or step == args.steps:
-            torch.save(learner.state_dict(), ck_path)
             write_weights(learner.target, out / f"policy_{step}.bin")
     torch.save(learner.state_dict(), ck_path)
 

@@ -290,13 +290,22 @@ class RNaDLearner:
 
 
 @torch.no_grad()
-def sample_actions(net, obs, mask, device, generator=None):
-    """マスク内の softmax からサンプリングし (行動, その確率) を返す"""
-    logits, _ = net(torch.from_numpy(obs).to(device))
-    pi = legal_policy(logits, torch.from_numpy(mask).to(device)).cpu().double()
-    pi = pi / pi.sum(-1, keepdim=True)
-    action = torch.multinomial(pi, 1, generator=generator).squeeze(1)
-    return action, pi.gather(1, action[:, None]).squeeze(1).float()
+def sample_actions(net, obs, mask, device):
+    """マスク内の softmax からサンプリングし (行動, その確率) を返す。
+
+    サンプリングはデバイス上で行い、戻すのは選んだ手と確率だけ（[局数, 11259] の確率を
+    CPU へ運んでサンプリングすると、GPU では自己対局の律速になる。2026-09-28 実測で L4 の
+    1更新 20 秒のうち 15 秒が自己対局）
+    """
+    logits, _ = net(torch.from_numpy(obs).to(device, non_blocking=True))
+    legal = torch.from_numpy(mask).to(device, non_blocking=True)
+    masked = logits.float().masked_fill(~legal, float("-inf"))
+    # Gumbel-max（softmax からのサンプリングと同じ分布）。torch.multinomial は MPS で
+    # 確率 0 の手（マスク外）を選ぶことがあったので使わない（2026-09-28 実測）
+    u = torch.rand_like(masked).clamp_(1e-20, 1.0)
+    action = (masked - torch.log(-torch.log(u))).argmax(-1)
+    prob = masked.softmax(-1).gather(1, action[:, None]).squeeze(1)
+    return action.cpu(), prob.cpu()
 
 
 def collect(env, net, device, max_steps=260):
