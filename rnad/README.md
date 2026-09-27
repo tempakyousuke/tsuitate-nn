@@ -21,6 +21,22 @@ VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop --release -m ../tsuitate-bot/rl
 ARENA_MATCH_SEED=20260927 cargo run --release --bin arena -- 100 "rl_policy:<policy.bin の絶対パス>" heuristic
 ```
 
+## M2b: R-NaD（自己対局）
+
+```sh
+.venv/bin/python rnad/tests/test_rnad.py                       # 参照実装（OpenSpiel の JAX 版）との一致
+.venv/bin/python rnad/train_rnad.py --init out_rnad/bc/checkpoint.pt --out out_rnad/rnad_bc
+```
+
+- `rnad.py`: R-NaD 本体。OpenSpiel の rnad.py（削除直前の d1dcdf5）の移植で、**損失と勾配が参照と
+  一致する**ことを `tests/` のフィクスチャ（参照実装で乱数入力から計算した npz）で検査する。
+  行動数が 11,259 あるので、参照が作る [A] 次元の Q ベクトルは作らず、アドバンテージを
+  ステップごとのスカラーへ分解して持つ（数学的に同じ）
+- `train_rnad.py`: 1回の更新 = バッチ数ぶんの局を最後まで自己対局 → 1ステップ。進み具合は
+  **錨（既定は模倣学習のネット）との直接対戦の勝率**で測る。`<out>/log.jsonl` に更新・評価ごとの記録、
+  `policy_<step>.bin` はターゲットネットの Rust 用の重み（CI の arena で測れる）
+- BatchNorm は常に eval モード（初期化したネットの統計に固定）
+
 | ファイル | 中身 |
 | --- | --- |
 | `model.py` | 方策・価値ネット（ResNet。方策 [139,9,9]、価値 tanh）。**層を変えたら tsuitate-bot の `src/rl/policy_net.rs` と `export_weights.py` も直す** |
