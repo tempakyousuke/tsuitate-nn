@@ -353,9 +353,11 @@ def sample_actions(net, obs, mask, device, generator=None):
 # 観測の自玉のプレーン（tsuitate-bot の rl::encode の ROLES 順で玉は 7 番目）。盤は手番側を
 # 先手向きに正規化しているので、行 0〜2（正規化後の段 1〜3）が常に敵陣
 KING_PLANE = 7
+# 段階的な入玉ボーナスの節目（玉の初期位置からの前進段数）。6 = 敵陣3段目への進入
+GRADED_MILESTONES = (3, 4, 5, 6)
 
 
-def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0):
+def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode="enter"):
     """`env`（auto_reset=False の VecEnv）の全局を1局ずつ最後まで自己対局し、学習用に並べる。
 
     戻り値の obs / legal / action / mu_a / t / b は有効なステップだけを平らにしたもの、
@@ -365,7 +367,13 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0):
     `nyugyoku_lambda` > 0 なら**入玉ボーナス**（docs/rl-deepnash-design.md の「報酬を変えた
     スタイル特化モデル」）: 玉が敵陣3段目以内に**初めて入った**側に +λ、相手に −λ（ゼロ和）。
     入ったかどうかはその側が次に観測したときの自玉の位置（自駒なので観測にある情報）で判定し、
-    報酬はその側の直前の着手（= 玉を入れた手）に付ける
+    報酬はその側の直前の着手（= 玉を入れた手）に付ける。
+
+    `nyugyoku_mode="graded"` は**段階的なボーナス**: 玉が初期位置から 3・4・5・6 段前進した地点へ
+    **初めて**着くたびに λ/4（敵陣へ入るまでに計 λ）。入玉そのものは稀すぎてボーナスが学習の信号に
+    ならなかった（arm C、2026-09-28）ので、毎局のように起きる「最初の数段の前進」から信号を届ける。
+    ポテンシャル型ではない（最適方策を変える = 入玉を好むモデルにする）のは意図どおり。
+    戻り値の `advance` は各局・各側の玉の最大前進段数 [B, 2]
     """
     env.reset()
     B = env.num_envs
@@ -374,6 +382,7 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0):
     player = torch.zeros(max_steps, B, dtype=torch.long)
     reward = torch.zeros(max_steps, B, 2)
     entered = np.zeros((B, 2), dtype=bool)
+    advance = np.zeros((B, 2), dtype=np.int64)
     last_act = np.full((B, 2), -1, dtype=np.int64)
     outcome = np.zeros((B, 2), dtype=np.float32)
     for t in range(max_steps):
@@ -382,14 +391,26 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0):
             break
         obs, mask, pl = env.observe()
         idx = np.flatnonzero(alive)
-        in_camp = obs[idx, KING_PLANE, 0:3, :].any(axis=(1, 2))
+        # 自玉の段（正規化後の行 0〜8。玉が無い = 取られた局面は -1）→ 前進段数 = 8 − 行
+        king_rows = obs[idx, KING_PLANE].any(axis=2)
+        has_king = king_rows.any(axis=1)
+        row = np.where(has_king, king_rows.argmax(axis=1), 8)
+        adv_now = 8 - row
         for i, b in enumerate(idx):
             p = int(pl[b])
-            if in_camp[i] and not entered[b, p]:
+            bonus = 0.0
+            if adv_now[i] >= 6 and not entered[b, p]:
                 entered[b, p] = True
-                if nyugyoku_lambda > 0 and last_act[b, p] >= 0:
-                    reward[last_act[b, p], b, p] += nyugyoku_lambda
-                    reward[last_act[b, p], b, 1 - p] -= nyugyoku_lambda
+                if nyugyoku_mode == "enter":
+                    bonus += nyugyoku_lambda
+            if adv_now[i] > advance[b, p]:
+                if nyugyoku_mode == "graded":
+                    newly = [m for m in GRADED_MILESTONES if advance[b, p] < m <= adv_now[i]]
+                    bonus += nyugyoku_lambda / len(GRADED_MILESTONES) * len(newly)
+                advance[b, p] = adv_now[i]
+            if bonus > 0 and last_act[b, p] >= 0:
+                reward[last_act[b, p], b, p] += bonus
+                reward[last_act[b, p], b, 1 - p] -= bonus
             last_act[b, p] = t
         a, mu = sample_actions(net, obs[idx], mask[idx], device)
         actions = np.full(B, -1, dtype=np.int64)
@@ -413,7 +434,7 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0):
         "obs": torch.cat(obs_l), "legal": torch.cat(legal_l), "action": torch.cat(act_l),
         "mu_a": torch.cat(mu_l), "t": torch.cat(t_l), "b": torch.cat(b_l),
         "valid": valid[:T], "player": player[:T], "reward": reward[:T],
-        "entered": entered, "outcome": outcome,
+        "entered": entered, "advance": advance, "outcome": outcome,
     }
 
 

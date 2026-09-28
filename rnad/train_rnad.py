@@ -118,6 +118,8 @@ def main() -> None:
     ap.add_argument("--nyugyoku", default="",
                     help="入玉ボーナスの λ の予定（例 '1.0:800,0.5:400,0.25:400,0'。空 = 使わない）。"
                          "区間は更新回数で、正則化方策の差し替え間隔の倍数")
+    ap.add_argument("--nyugyoku-mode", choices=["enter", "graded"], default="enter",
+                    help="enter = 敵陣への初進入で λ / graded = 前進 3・4・5・6 段の初到達ごとに λ/4")
     ap.add_argument("--device", default="auto")
     args = ap.parse_args()
 
@@ -184,7 +186,7 @@ def main() -> None:
     while learner.step_count < args.steps:
         t0 = time.time()
         lam = lam_at(learner.step_count)
-        batch = collect(env, learner.net, device, nyugyoku_lambda=lam)
+        batch = collect(env, learner.net, device, nyugyoku_lambda=lam, nyugyoku_mode=args.nyugyoku_mode)
         t1 = time.time()
         finished = env.pop_finished()
         info = learner.update(batch)
@@ -200,6 +202,7 @@ def main() -> None:
                "nyugyoku_lambda": lam, "nyugyoku_rate": float(ent.mean()),
                "nyugyoku_w": int((res > 0).sum()), "nyugyoku_l": int((res < 0).sum()),
                "nyugyoku_d": int((res == 0).sum()),
+               "king_advance_hist": np.bincount(batch["advance"].ravel(), minlength=9).tolist(),
                "collect_sec": t1 - t0, "update_sec": t2 - t1}
         log.write(json.dumps(rec) + "\n")
         log.flush()
