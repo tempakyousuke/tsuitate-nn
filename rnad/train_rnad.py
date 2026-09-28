@@ -24,7 +24,7 @@ import torch
 import tsuitate_rl
 from export_weights import write as write_weights
 from model import PolicyValueNet
-from rnad import RNaDConfig, RNaDLearner, collect, play_match
+from rnad import RNaDConfig, RNaDLearner, cfg_diff, collect, play_match
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -39,13 +39,25 @@ def pick_device(name: str) -> torch.device:
     return torch.device("cpu")
 
 
-def load_net(path: str, channels: int, blocks: int) -> PolicyValueNet:
+def load_net(path: str, channels: int, blocks: int, which: str = "target") -> PolicyValueNet:
+    """模倣学習（train_bc.py）の checkpoint か、R-NaD（train_rnad.py）の checkpoint から読む。
+    R-NaD の checkpoint は `which`（既定はターゲットネット = 書き出す重みと同じ）を読む"""
     if path == "none":
         return PolicyValueNet(channels, blocks)
     ck = torch.load(path, map_location="cpu")
+    if "config" not in ck:
+        raise SystemExit(f"{path} にネットの形（config）が無い（古い R-NaD の checkpoint）。"
+                         "--channels/--blocks を合わせて load_net を直接使うこと")
     net = PolicyValueNet(ck["config"]["channels"], ck["config"]["blocks"], ck["config"]["planes"])
-    net.load_state_dict(ck["state_dict"] if "state_dict" in ck else ck["net"])
+    net.load_state_dict(ck["state_dict"] if "state_dict" in ck else ck[which])
     return net
+
+
+def save_checkpoint(learner, path: pathlib.Path) -> None:
+    """書きかけで止められても前の checkpoint が壊れないよう、別名に書いてから置き換える"""
+    tmp = path.with_suffix(".tmp")
+    torch.save(learner.state_dict(), tmp)
+    tmp.replace(path)
 
 
 def main() -> None:
@@ -73,6 +85,9 @@ def main() -> None:
     ap.add_argument("--channels", type=int, default=64)
     ap.add_argument("--blocks", type=int, default=6)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--override-config", action="store_true",
+                    help="再開時に checkpoint と違う設定（学習率・β など）を使うことを許す。"
+                         "指定しないと設定の食い違いは停止する")
     ap.add_argument("--device", default="auto")
     args = ap.parse_args()
 
@@ -83,14 +98,35 @@ def main() -> None:
 
     cfg = RNaDConfig(eta=args.eta, beta=args.beta, lr=args.lr, schedule_sizes=(args.schedule,),
                      schedule_repeats=(1,))
-    learner = RNaDLearner(load_net(args.init, args.channels, args.blocks), cfg, device)
-    anchor = load_net(args.anchor, args.channels, args.blocks).to(device).eval()
+    if args.eval_games % 2:
+        raise SystemExit("--eval-games は偶数にする（先後を同数にするため）")
     ck_path = out / "checkpoint.pt"
-    if ck_path.exists():
-        learner.load_state_dict(torch.load(ck_path, map_location=device))
+    ck = torch.load(ck_path, map_location=device) if ck_path.exists() else None
+    if ck is not None and "config" in ck:
+        # 再開: ネットの形は checkpoint から（--init には依存しない）
+        init_net = PolicyValueNet(ck["config"]["channels"], ck["config"]["blocks"], ck["config"]["planes"])
+    else:
+        init_net = load_net(args.init, args.channels, args.blocks)
+    learner = RNaDLearner(init_net, cfg, device)
+    anchor = load_net(args.anchor, args.channels, args.blocks).to(device).eval()
+    eval_gen = torch.Generator(device=device)
+    eval_gen.manual_seed(args.seed + 20_000)
+    record = {"args": vars(args), "rnad": dict(cfg.__dict__), "net": learner.net.config}
+    if ck is not None:
+        diff = cfg_diff(ck["cfg"], cfg)
+        if diff and not args.override_config:
+            raise SystemExit(f"checkpoint と設定が違う: {diff}（(保存, 今)）。"
+                             "意図した変更なら --override-config を付ける")
+        learner.load_state_dict(ck)
+        if diff:
+            learner.apply_cfg(cfg)
+            print(f"再開時に設定を上書き: {diff}")
         print(f"再開: step {learner.step_count}")
-    (out / "config.json").write_text(json.dumps({"args": vars(args), "rnad": cfg.__dict__,
-                                                 "net": learner.net.config}, indent=2))
+        record["resumed_from_step"] = learner.step_count
+        record["overridden"] = {k: list(v) for k, v in diff.items()}
+        (out / f"config_resume_{learner.step_count}.json").write_text(json.dumps(record, indent=2))
+    else:
+        (out / "config.json").write_text(json.dumps(record, indent=2))
 
     env = tsuitate_rl.VecEnv(args.batch, seed=args.seed, auto_reset=False)
     eval_env = tsuitate_rl.VecEnv(args.eval_games, seed=args.seed + 10_000, auto_reset=False)
@@ -101,7 +137,7 @@ def main() -> None:
         # （ターゲットだけだと現在のネットの劣化が隠れる。2026-09-28 の β=2 で実際に隠れた）
         for which, net in (("target", learner.target), ("current", learner.net)):
             t0 = time.time()
-            w, l, d = play_match(eval_env, net, anchor, device)
+            w, l, d = play_match(eval_env, net, anchor, device, eval_gen)
             eval_env.pop_finished()
             n = w + l + d
             rate = (w + 0.5 * d) / n
@@ -137,13 +173,10 @@ def main() -> None:
         if step % args.eval_every == 0:
             evaluate(step)
         if step % args.checkpoint_every == 0 or step % args.export_every == 0:
-            # 書きかけで止められても前の checkpoint が壊れないよう、別名に書いてから置き換える
-            tmp = ck_path.with_suffix(".tmp")
-            torch.save(learner.state_dict(), tmp)
-            tmp.replace(ck_path)
+            save_checkpoint(learner, ck_path)
         if step % args.export_every == 0 or step == args.steps:
             write_weights(learner.target, out / f"policy_{step}.bin")
-    torch.save(learner.state_dict(), ck_path)
+    save_checkpoint(learner, ck_path)
 
 
 if __name__ == "__main__":

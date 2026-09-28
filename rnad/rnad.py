@@ -273,9 +273,12 @@ class RNaDLearner:
                 "v_target_mean": float(vt.mean()), "s_abs_mean": float(s.abs().mean())}
 
     def state_dict(self):
+        """再開に要る全部: 4つのネット・optimizer・step・設定・ネットの形・乱数状態"""
         return {"net": self.net.state_dict(), "target": self.target.state_dict(),
                 "prev": self.prev.state_dict(), "prev_": self.prev_.state_dict(),
-                "opt": self.opt.state_dict(), "step": self.step_count, "cfg": self.cfg.__dict__}
+                "opt": self.opt.state_dict(), "step": self.step_count,
+                "cfg": dict(self.cfg.__dict__), "config": dict(self.net.config),
+                "rng": rng_state(self.device)}
 
     def load_state_dict(self, d):
         self.net.load_state_dict(d["net"])
@@ -284,25 +287,64 @@ class RNaDLearner:
         self.prev_.load_state_dict(d["prev_"])
         self.opt.load_state_dict(d["opt"])
         self.step_count = d["step"]
+        if "rng" in d:
+            set_rng_state(d["rng"], self.device)
+
+    def apply_cfg(self, cfg: RNaDConfig):
+        """設定を差し替える（再開時に明示的に上書きするとき。optimizer の学習率も合わせる）"""
+        self.cfg = cfg
+        for g in self.opt.param_groups:
+            g["lr"] = cfg.lr
+        self.schedule = EntropySchedule(cfg.schedule_sizes, cfg.schedule_repeats)
+
+
+def cfg_diff(saved: dict, cfg: RNaDConfig) -> dict:
+    """checkpoint の設定と今の設定の差（tuple / list の違いは無視する）"""
+    now = cfg.__dict__
+    norm = lambda v: list(v) if isinstance(v, (tuple, list)) else v  # noqa: E731
+    return {k: (saved.get(k), now[k]) for k in now if norm(saved.get(k)) != norm(now[k])}
+
+
+def rng_state(device) -> dict:
+    st = {"cpu": torch.get_rng_state()}
+    if device.type == "cuda":
+        st["cuda"] = torch.cuda.get_rng_state_all()
+    elif device.type == "mps":
+        st["mps"] = torch.mps.get_rng_state()
+    return st
+
+
+def set_rng_state(st: dict, device) -> None:
+    # 乱数状態は CPU の ByteTensor で渡す（torch.load(map_location=device) で運ばれていても戻す）
+    torch.set_rng_state(st["cpu"].cpu())
+    if device.type == "cuda" and "cuda" in st:
+        torch.cuda.set_rng_state_all([s.cpu() for s in st["cuda"]])
+    elif device.type == "mps" and "mps" in st:
+        torch.mps.set_rng_state(st["mps"].cpu())
 
 
 # ---------------------------------------------------------------- 自己対局
 
 
 @torch.no_grad()
-def sample_actions(net, obs, mask, device):
+def sample_actions(net, obs, mask, device, generator=None):
     """マスク内の softmax からサンプリングし (行動, その確率) を返す。
 
     サンプリングはデバイス上で行い、戻すのは選んだ手と確率だけ（[局数, 11259] の確率を
     CPU へ運んでサンプリングすると、GPU では自己対局の律速になる。2026-09-28 実測で L4 の
-    1更新 20 秒のうち 15 秒が自己対局）
+    1更新 20 秒のうち 15 秒が自己対局）。
+
+    観測は **fp16 に丸めてから**使う（学習用に fp16 で保存するので、行動時と学習時で同じ入力に
+    する。丸めない版は未更新でも π_a/μ_a が 0.998〜1.004 にずれた。2026-09-28 codex 指摘）。
+    `generator` を渡すとその乱数列でサンプリングする（評価を学習の乱数列から切り離す）
     """
-    logits, _ = net(torch.from_numpy(obs).to(device, non_blocking=True))
+    x = torch.from_numpy(obs).to(device, non_blocking=True).half().float()
+    logits, _ = net(x)
     legal = torch.from_numpy(mask).to(device, non_blocking=True)
     masked = logits.float().masked_fill(~legal, float("-inf"))
     # Gumbel-max（softmax からのサンプリングと同じ分布）。torch.multinomial は MPS で
     # 確率 0 の手（マスク外）を選ぶことがあったので使わない（2026-09-28 実測）
-    u = torch.rand_like(masked).clamp_(1e-20, 1.0)
+    u = torch.rand(masked.shape, device=masked.device, generator=generator).clamp_(1e-20, 1.0)
     action = (masked - torch.log(-torch.log(u))).argmax(-1)
     prob = masked.softmax(-1).gather(1, action[:, None]).squeeze(1)
     return action.cpu(), prob.cpu()
@@ -350,11 +392,14 @@ def collect(env, net, device, max_steps=260):
 
 
 @torch.no_grad()
-def play_match(env, net_a, net_b, device):
+def play_match(env, net_a, net_b, device, generator=None):
     """net_a と net_b を env（auto_reset=False）の全局で1局ずつ対戦させる。
-    偶数番の局は net_a が先手。net_a から見た (勝, 負, 分) を返す"""
+    偶数番の局は net_a が先手（局数は偶数 = 先後が同数）。net_a から見た (勝, 負, 分) を返す。
+    `generator` を渡すと学習の乱数列を消費しない"""
     env.reset()
     B = env.num_envs
+    if B % 2:
+        raise ValueError(f"評価の局数 {B} は偶数にする（先後を同数にするため）")
     a_color = np.array([i % 2 for i in range(B)])  # 0 = 先手
     wins = losses = draws = 0
     while True:
@@ -366,7 +411,7 @@ def play_match(env, net_a, net_b, device):
         for net, sel in ((net_a, pl == a_color), (net_b, pl != a_color)):
             idx = np.flatnonzero(alive & sel)
             if len(idx):
-                actions[idx] = sample_actions(net, obs[idx], mask[idx], device)[0].numpy()
+                actions[idx] = sample_actions(net, obs[idx], mask[idx], device, generator)[0].numpy()
         rew, done = env.step(actions)
         for i in np.flatnonzero(done):
             r = rew[i, a_color[i]]
