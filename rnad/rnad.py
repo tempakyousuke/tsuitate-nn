@@ -350,11 +350,22 @@ def sample_actions(net, obs, mask, device, generator=None):
     return action.cpu(), prob.cpu()
 
 
-def collect(env, net, device, max_steps=260):
+# 観測の自玉のプレーン（tsuitate-bot の rl::encode の ROLES 順で玉は 7 番目）。盤は手番側を
+# 先手向きに正規化しているので、行 0〜2（正規化後の段 1〜3）が常に敵陣
+KING_PLANE = 7
+
+
+def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0):
     """`env`（auto_reset=False の VecEnv）の全局を1局ずつ最後まで自己対局し、学習用に並べる。
 
     戻り値の obs / legal / action / mu_a / t / b は有効なステップだけを平らにしたもの、
-    valid / player / reward は [T, B] の格子（v-trace 用）。
+    valid / player / reward は [T, B] の格子（v-trace 用）。entered / outcome は [B, 2]
+    （各局・各側が入玉したか、終局の勝敗 ±1/0）。
+
+    `nyugyoku_lambda` > 0 なら**入玉ボーナス**（docs/rl-deepnash-design.md の「報酬を変えた
+    スタイル特化モデル」）: 玉が敵陣3段目以内に**初めて入った**側に +λ、相手に −λ（ゼロ和）。
+    入ったかどうかはその側が次に観測したときの自玉の位置（自駒なので観測にある情報）で判定し、
+    報酬はその側の直前の着手（= 玉を入れた手）に付ける
     """
     env.reset()
     B = env.num_envs
@@ -362,19 +373,33 @@ def collect(env, net, device, max_steps=260):
     valid = torch.zeros(max_steps, B, dtype=torch.bool)
     player = torch.zeros(max_steps, B, dtype=torch.long)
     reward = torch.zeros(max_steps, B, 2)
+    entered = np.zeros((B, 2), dtype=bool)
+    last_act = np.full((B, 2), -1, dtype=np.int64)
+    outcome = np.zeros((B, 2), dtype=np.float32)
     for t in range(max_steps):
         alive = env.alive()
         if not alive.any():
             break
         obs, mask, pl = env.observe()
         idx = np.flatnonzero(alive)
+        in_camp = obs[idx, KING_PLANE, 0:3, :].any(axis=(1, 2))
+        for i, b in enumerate(idx):
+            p = int(pl[b])
+            if in_camp[i] and not entered[b, p]:
+                entered[b, p] = True
+                if nyugyoku_lambda > 0 and last_act[b, p] >= 0:
+                    reward[last_act[b, p], b, p] += nyugyoku_lambda
+                    reward[last_act[b, p], b, 1 - p] -= nyugyoku_lambda
+            last_act[b, p] = t
         a, mu = sample_actions(net, obs[idx], mask[idx], device)
         actions = np.full(B, -1, dtype=np.int64)
         actions[idx] = a.numpy()
-        rew, _done = env.step(actions)
+        rew, done = env.step(actions)
         valid[t, idx] = True
         player[t, idx] = torch.from_numpy(pl[idx].astype(np.int64))
-        reward[t] = torch.from_numpy(rew)
+        # ボーナスは過去の時刻へ足すので、この時刻の報酬は上書きでなく加算
+        reward[t] += torch.from_numpy(rew)
+        outcome[done] = rew[done]
         obs_l.append(torch.from_numpy(obs[idx]).half())
         legal_l.append(torch.from_numpy(mask[idx]))
         act_l.append(a)
@@ -388,6 +413,7 @@ def collect(env, net, device, max_steps=260):
         "obs": torch.cat(obs_l), "legal": torch.cat(legal_l), "action": torch.cat(act_l),
         "mu_a": torch.cat(mu_l), "t": torch.cat(t_l), "b": torch.cat(b_l),
         "valid": valid[:T], "player": player[:T], "reward": reward[:T],
+        "entered": entered, "outcome": outcome,
     }
 
 

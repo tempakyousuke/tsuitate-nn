@@ -45,12 +45,39 @@ def load_net(path: str, channels: int, blocks: int, which: str = "target") -> Po
     if path == "none":
         return PolicyValueNet(channels, blocks)
     ck = torch.load(path, map_location="cpu")
-    if "config" not in ck:
-        raise SystemExit(f"{path} にネットの形（config）が無い（古い R-NaD の checkpoint）。"
-                         "--channels/--blocks を合わせて load_net を直接使うこと")
-    net = PolicyValueNet(ck["config"]["channels"], ck["config"]["blocks"], ck["config"]["planes"])
+    if "config" in ck:
+        net = PolicyValueNet(ck["config"]["channels"], ck["config"]["blocks"], ck["config"]["planes"])
+    elif "net" in ck:
+        # ネットの形を持たない古い R-NaD の checkpoint（2026-09-28 以前）は引数の形で読む
+        net = PolicyValueNet(channels, blocks)
+    else:
+        raise SystemExit(f"{path} は checkpoint として読めない")
     net.load_state_dict(ck["state_dict"] if "state_dict" in ck else ck[which])
     return net
+
+
+def parse_lambda_schedule(spec: str, schedule: int):
+    """入玉ボーナスの λ の予定 "1.0:800,0.5:400,0" → 更新回数 step で使う λ を返す関数。
+    区間の長さは正則化方策の差し替え間隔の倍数に限る（各区間は固定したゲームで収束させる前提）"""
+    if not spec:
+        return lambda step: 0.0
+    parts = []
+    for item in spec.split(","):
+        lam, _, n = item.partition(":")
+        parts.append((float(lam), int(n) if n else None))
+    for lam, n in parts[:-1]:
+        if n is None or n % schedule:
+            raise SystemExit(f"λ の区間 {lam}:{n} は --schedule {schedule} の倍数の長さにする")
+    if parts[-1][1] is not None:
+        raise SystemExit("λ の予定の最後は長さなし（以後ずっとその値）にする")
+
+    def at(step):
+        for lam, n in parts:
+            if n is None or step < n:
+                return lam
+            step -= n
+        return parts[-1][0]
+    return at
 
 
 def save_checkpoint(learner, path: pathlib.Path) -> None:
@@ -88,6 +115,9 @@ def main() -> None:
     ap.add_argument("--override-config", action="store_true",
                     help="再開時に checkpoint と違う設定（学習率・β など）を使うことを許す。"
                          "指定しないと設定の食い違いは停止する")
+    ap.add_argument("--nyugyoku", default="",
+                    help="入玉ボーナスの λ の予定（例 '1.0:800,0.5:400,0.25:400,0'。空 = 使わない）。"
+                         "区間は更新回数で、正則化方策の差し替え間隔の倍数")
     ap.add_argument("--device", default="auto")
     args = ap.parse_args()
 
@@ -98,6 +128,7 @@ def main() -> None:
 
     cfg = RNaDConfig(eta=args.eta, beta=args.beta, lr=args.lr, schedule_sizes=(args.schedule,),
                      schedule_repeats=(1,))
+    lam_at = parse_lambda_schedule(args.nyugyoku, args.schedule)
     if args.eval_games % 2:
         raise SystemExit("--eval-games は偶数にする（先後を同数にするため）")
     ck_path = out / "checkpoint.pt"
@@ -152,7 +183,8 @@ def main() -> None:
         evaluate(0)
     while learner.step_count < args.steps:
         t0 = time.time()
-        batch = collect(env, learner.net, device)
+        lam = lam_at(learner.step_count)
+        batch = collect(env, learner.net, device, nyugyoku_lambda=lam)
         t1 = time.time()
         finished = env.pop_finished()
         info = learner.update(batch)
@@ -160,15 +192,21 @@ def main() -> None:
         step = learner.step_count
         reasons = Counter(f["reason"] for f in finished)
         fouls = [sum(f["fouls"]) / 2 for f in finished]
+        ent = batch["entered"]
+        res = batch["outcome"][ent]
         rec = {"step": step, **info, "games": len(finished),
                "plies": float(np.mean([f["plies"] for f in finished])),
                "fouls_per_side": float(np.mean(fouls)), "reasons": dict(reasons),
+               "nyugyoku_lambda": lam, "nyugyoku_rate": float(ent.mean()),
+               "nyugyoku_w": int((res > 0).sum()), "nyugyoku_l": int((res < 0).sum()),
+               "nyugyoku_d": int((res == 0).sum()),
                "collect_sec": t1 - t0, "update_sec": t2 - t1}
         log.write(json.dumps(rec) + "\n")
         log.flush()
         print(f"step {step}: 標本 {info['samples']} 手数 {rec['plies']:.0f} 反則/側 "
               f"{rec['fouls_per_side']:.2f} loss_v {info['loss_v']:.3f} nerd {info['loss_nerd']:.3f} "
               f"α {info['alpha']:.2f}{' [正則化更新]' if info['reg_update'] else ''} "
+              f"入玉 {rec['nyugyoku_rate']:.1%}(λ {lam}) "
               f"({t1 - t0:.1f}s + {t2 - t1:.1f}s)", flush=True)
         if step % args.eval_every == 0:
             evaluate(step)
