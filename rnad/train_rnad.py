@@ -24,7 +24,7 @@ import torch
 import tsuitate_rl
 from export_weights import write as write_weights
 from model import PolicyValueNet
-from rnad import RNaDConfig, RNaDLearner, cfg_diff, collect, play_match
+from rnad import PRECISIONS, RNaDConfig, RNaDLearner, cfg_diff, collect, play_match, set_precision
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -121,8 +121,11 @@ def main() -> None:
     ap.add_argument("--nyugyoku-mode", choices=["enter", "graded"], default="enter",
                     help="enter = 敵陣への初進入で λ / graded = 前進 3・4・5・6 段の初到達ごとに λ/4")
     ap.add_argument("--device", default="auto")
+    ap.add_argument("--precision", choices=PRECISIONS, default="default",
+                    help="ネットの計算精度（rnad.set_precision。GPU では tf32 で1更新 −23%）")
     args = ap.parse_args()
 
+    set_precision(args.precision)
     torch.manual_seed(args.seed)
     device = pick_device(args.device)
     out = pathlib.Path(args.out)

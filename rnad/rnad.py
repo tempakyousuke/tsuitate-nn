@@ -25,6 +25,48 @@ import torch
 import torch.nn.functional as F
 
 
+# ---------------------------------------------------------------- 計算精度
+
+PRECISIONS = ("default", "fp32", "tf32", "bf16")
+_AMP_DTYPE = None
+
+
+def set_precision(mode: str) -> None:
+    """ネットの順伝播・逆伝播の精度（プロセス全体）。CUDA（Ampere 以降）でだけ意味がある。
+
+    default = PyTorch の既定のまま。**torch 2.14 の L4 では fp32 と出力がビット一致した**
+              （cudnn.allow_tf32 は True と読めるのに畳み込みも TF32 になっていない。2026-10-01 実測）
+    fp32    = TF32 を全部切る（比較用の厳密な基準）
+    tf32    = 畳み込み・全結合とも TF32 を明示的に許す
+    bf16    = TF32 に加えて順伝播を bf16 の autocast で回す。出力（ロジット・価値）は float32 へ
+              戻すので、log softmax・v-trace・損失は float32 のまま
+
+    L4・30,000更新の checkpoint・256局/更新での実測（rnad/bench_precision.py、2026-10-01）:
+        default 自己対局 3.07s + 更新 5.25s = 8.32s
+        tf32    2.94s + 3.49s = 6.43s（−23%）。|π/μ−1| 最大 2.6e-6、更新量の fp32 とのコサイン 0.9996
+        bf16    3.34s + 2.37s = 5.71s（−31%）。ただし |π/μ−1| 最大 0.089、log π の差 平均 0.059、
+                更新量のコサイン 0.992 と数値のずれが桁違いに大きい
+    """
+    global _AMP_DTYPE
+    if mode not in PRECISIONS:
+        raise ValueError(f"precision {mode}（{PRECISIONS} のどれか）")
+    if mode != "default":
+        torch.backends.cuda.matmul.allow_tf32 = mode != "fp32"
+        torch.backends.cudnn.allow_tf32 = mode != "fp32"
+    _AMP_DTYPE = torch.bfloat16 if mode == "bf16" else None
+
+
+def forward(net, x: torch.Tensor):
+    """`net(x)` を `set_precision` の精度で回し、(ロジット, 価値) を float32 で返す"""
+    if _AMP_DTYPE is None:
+        return net(x)
+    if x.device.type != "cuda":
+        raise RuntimeError("bf16 は CUDA でだけ使う")
+    with torch.autocast("cuda", dtype=_AMP_DTYPE):
+        logits, v = net(x)
+    return logits.float(), v.float()
+
+
 # ---------------------------------------------------------------- 方策の基本演算
 
 
@@ -191,8 +233,8 @@ class RNaDLearner:
 
     def _lpr_mix(self, obs, legal, alpha):
         """正則化方策の対数確率（2つの前の版の α 混合）"""
-        lp_prev = legal_log_policy(self.prev(obs)[0], legal)
-        lp_prev_ = legal_log_policy(self.prev_(obs)[0], legal)
+        lp_prev = legal_log_policy(forward(self.prev, obs)[0], legal)
+        lp_prev_ = legal_log_policy(forward(self.prev_, obs)[0], legal)
         return alpha * lp_prev + (1 - alpha) * lp_prev_
 
     def update(self, batch):
@@ -215,13 +257,13 @@ class RNaDLearner:
                 obs = obs_all[sl].to(dev, torch.float32)
                 legal = legal_all[sl].to(dev)
                 act = action_all[sl].to(dev)
-                logits, _ = self.net(obs)
+                logits, _ = forward(self.net, obs)
                 log_pi = legal_log_policy(logits, legal)
                 pi = log_pi.exp() * legal
                 lpr = log_pi - self._lpr_mix(obs, legal, alpha)
                 pi_a[sl] = pi.gather(1, act[:, None]).squeeze(1).cpu()
                 ent[sl] = (pi * lpr).sum(-1).cpu()
-                v_tgt[sl] = self.target(obs)[1].cpu()
+                v_tgt[sl] = forward(self.target, obs)[1].cpu()
 
         def grid(x):
             g = torch.zeros(T, B)
@@ -249,7 +291,7 @@ class RNaDLearner:
             obs = obs_all[sl].to(dev, torch.float32)
             legal = legal_all[sl].to(dev)
             act = action_all[sl].to(dev)
-            logits, v = self.net(obs)
+            logits, v = forward(self.net, obs)
             with torch.no_grad():
                 lpr = legal_log_policy(logits, legal) - self._lpr_mix(obs, legal, alpha)
             lv, ln = loss_terms(logits, v, legal, act, player_flat[sl].to(dev), lpr,
@@ -268,8 +310,13 @@ class RNaDLearner:
                 self.prev_.load_state_dict(self.prev.state_dict())
                 self.prev.load_state_dict(self.target.state_dict())
         self.step_count += 1
+        # 集めた直後に1回更新するので π_a/μ_a は本来 1。ずれは行動時と学習時の数値誤差
+        # （バッチの形で変わるカーネル・精度）で、v-trace の重要度比へそのまま入る
+        ratio = pi_a / batch["mu_a"]
         return {"loss_v": tot_v, "loss_nerd": tot_nerd, "alpha": alpha,
                 "reg_update": bool(update_reg), "samples": n,
+                "ratio_dev_mean": float((ratio - 1).abs().mean()),
+                "ratio_dev_max": float((ratio - 1).abs().max()),
                 "v_target_mean": float(vt.mean()), "s_abs_mean": float(s.abs().mean())}
 
     def state_dict(self):
@@ -339,7 +386,7 @@ def sample_actions(net, obs, mask, device, generator=None):
     `generator` を渡すとその乱数列でサンプリングする（評価を学習の乱数列から切り離す）
     """
     x = torch.from_numpy(obs).to(device, non_blocking=True).half().float()
-    logits, _ = net(x)
+    logits, _ = forward(net, x)
     legal = torch.from_numpy(mask).to(device, non_blocking=True)
     masked = logits.float().masked_fill(~legal, float("-inf"))
     # Gumbel-max（softmax からのサンプリングと同じ分布）。torch.multinomial は MPS で
