@@ -34,25 +34,30 @@ _AMP_DTYPE = None
 def set_precision(mode: str) -> None:
     """ネットの順伝播・逆伝播の精度（プロセス全体）。CUDA（Ampere 以降）でだけ意味がある。
 
-    default = PyTorch の既定のまま。**torch 2.14 の L4 では fp32 と出力がビット一致した**
-              （cudnn.allow_tf32 は True と読めるのに畳み込みも TF32 になっていない。2026-10-01 実測）
+    default = PyTorch の既定（**畳み込みは TF32・全結合は FP32**。畳み込みだけのこのネットは
+              既定のままでほぼ TF32 で回っている）
     fp32    = TF32 を全部切る（比較用の厳密な基準）
-    tf32    = 畳み込み・全結合とも TF32 を明示的に許す
+    tf32    = 全結合も TF32 にする（価値の頭の 2層だけなので差は小さい）
     bf16    = TF32 に加えて順伝播を bf16 の autocast で回す。出力（ロジット・価値）は float32 へ
               戻すので、log softmax・v-trace・損失は float32 のまま
 
     L4・30,000更新の checkpoint・256局/更新での実測（rnad/bench_precision.py、2026-10-01）:
-        default 自己対局 3.07s + 更新 5.25s = 8.32s
-        tf32    2.94s + 3.49s = 6.43s（−23%）。|π/μ−1| 最大 2.6e-6、更新量の fp32 とのコサイン 0.9996
-        bf16    3.34s + 2.37s = 5.71s（−31%）。ただし |π/μ−1| 最大 0.089、log π の差 平均 0.059、
+        fp32    自己対局 3.29s + 更新 5.20s = 8.49s
+        tf32    2.94s + 3.49s = 6.43s。|π/μ−1| 最大 2.6e-6、更新量の fp32 とのコサイン 0.9996
+        bf16    3.34s + 2.37s = 5.71s。ただし |π/μ−1| 最大 0.089、log π の差 平均 0.059、
                 更新量のコサイン 0.992 と数値のずれが桁違いに大きい
+    default は学習ログで比べた（同じ VM・同じ設定、200 / 130 更新の平均）: default（29,801〜30,000）
+    更新 3.714s ± 0.12、tf32（30,006〜）更新 3.717s = **差なし**（既定で畳み込みが TF32 のため）。
+    速くするなら bf16 だが、上の数値のずれがあるので錨への勝率でペア比較してから
+    （ベンチの初版は fp32 の直後に default を測り、default が TF32 を戻さなかったので
+    default = fp32 と誤って見えた。今は default で既定値へ戻す）
     """
     global _AMP_DTYPE
     if mode not in PRECISIONS:
         raise ValueError(f"precision {mode}（{PRECISIONS} のどれか）")
-    if mode != "default":
-        torch.backends.cuda.matmul.allow_tf32 = mode != "fp32"
-        torch.backends.cudnn.allow_tf32 = mode != "fp32"
+    # default は PyTorch の既定値へ戻す（同じプロセスで順に切り替えるベンチで前の設定が残らないように）
+    torch.backends.cuda.matmul.allow_tf32 = mode in ("tf32", "bf16")
+    torch.backends.cudnn.allow_tf32 = mode != "fp32"
     _AMP_DTYPE = torch.bfloat16 if mode == "bf16" else None
 
 

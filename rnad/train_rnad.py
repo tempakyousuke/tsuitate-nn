@@ -122,7 +122,7 @@ def main() -> None:
                     help="enter = 敵陣への初進入で λ / graded = 前進 3・4・5・6 段の初到達ごとに λ/4")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--precision", choices=PRECISIONS, default="default",
-                    help="ネットの計算精度（rnad.set_precision。GPU では tf32 で1更新 −23%）")
+                    help="ネットの計算精度（rnad.set_precision。default でも畳み込みは TF32 = tf32 と速さは同じ）")
     args = ap.parse_args()
 
     set_precision(args.precision)
