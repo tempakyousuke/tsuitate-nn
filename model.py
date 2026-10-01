@@ -9,11 +9,10 @@
 import torch
 from torch import nn
 
-# tsuitate-bot の value_features.rs::VALUE_FEATURES + APPROACH_STATE_FEATURES
-# + TRANSITION_FEATURES + APPROACH_TRANSITION_FEATURES と一致させること
-# （16 + 8 + 6 + 5 = 35。接近特徴量 22→29、紐の2列で31、
-#   予防的な紐（V3）の4列を足して 35、2026-07-26）
-INPUT_DIM = 35
+# tsuitate-bot の value_features.rs の現行出力（state 16 + transition 6 = 22）と一致させること。
+# 接近特徴量＋紐（2026-07-25〜26 の 35 次元の実験）は不採用で終了し、2026-08-21 の
+# データ刷新で本番構成へ戻した（train.py の STATE_FEATURE_NAMES の注を参照）
+INPUT_DIM = 22
 
 
 class ValueNet(nn.Module):

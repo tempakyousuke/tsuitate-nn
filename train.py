@@ -58,16 +58,11 @@ STATE_FEATURE_NAMES = [
     "my_max_exchange_loss",
     "opp_max_exchange_loss",
     "ply_progress",
-    # 接近特徴量（2026-07-25 追加。value_features.rs::APPROACH_STATE_FEATURE_NAMES）
-    "my_prey_proximity",
-    "opp_prey_proximity",
-    "my_king_siege",
-    "opp_king_siege",
-    # 予防的な紐（2026-07-26。docs/yaneuraou-lessons.md の V3）
-    "my_linked_value",
-    "my_unlinked_value",
-    "opp_linked_value",
-    "opp_unlinked_value",
+    # 注: 接近特徴量＋紐（2026-07-25〜26 の実験）は**不採用で終了**（アリーナ中立、
+    # tsuitate-bot の docs/yaneuraou-lessons.md）。採用済みの本番構成は
+    # 16 state + 6 transition = 22 次元（value_features.rs の現行出力と一致）。
+    # 2026-08-21 のデータ刷新時に、このリストが実験状態のまま残っていて
+    # 現行 CSV と不一致になっていたのを本番構成へ戻した
 ]
 TRANSITION_FEATURE_NAMES = [
     "moved_piece_value",
@@ -76,12 +71,6 @@ TRANSITION_FEATURE_NAMES = [
     "captured_value",
     "net_capture_then_recapture",
     "gives_check",
-    # 接近特徴量（value_features.rs::APPROACH_TRANSITION_FEATURE_NAMES）
-    "king_approach",
-    "prey_approach",
-    "king_closeness_after",
-    "moved_piece_support_margin",
-    "supported_prey_approach",
 ]
 EXPECTED_FEATURE_NAMES = STATE_FEATURE_NAMES + TRANSITION_FEATURE_NAMES
 

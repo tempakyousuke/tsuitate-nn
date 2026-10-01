@@ -6,3 +6,5 @@ data/*.csv
 data/rl_records/
 out_rnad/
 *.egg-info/
+# 学習の実験出力（シード別のスイープ）
+out_*/
