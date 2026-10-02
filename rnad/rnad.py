@@ -409,7 +409,8 @@ KING_PLANE = 7
 GRADED_MILESTONES = (3, 4, 5, 6)
 
 
-def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode="enter"):
+def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode="enter",
+            nyugyoku_zero_sum=True):
     """`env`（auto_reset=False の VecEnv）の全局を1局ずつ最後まで自己対局し、学習用に並べる。
 
     戻り値の obs / legal / action / mu_a / t / b は有効なステップだけを平らにしたもの、
@@ -426,6 +427,11 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
     ならなかった（arm C、2026-09-28）ので、毎局のように起きる「最初の数段の前進」から信号を届ける。
     ポテンシャル型ではない（最適方策を変える = 入玉を好むモデルにする）のは意図どおり。
     戻り値の `advance` は各局・各側の玉の最大前進段数 [B, 2]
+
+    `nyugyoku_zero_sum=False` は**非ゼロ和**: 相手から −λ を引かない（前進した側に +λ だけ）。
+    ゼロ和だと自己対局の両側が「前進する」と「前進させない」を同じ重みで学び、λ=1.0 を 800更新
+    続けても入玉率が 2.2% で横ばいだった（arm D、2026-10-03）。非ゼロ和なら前進を止める理由は
+    勝敗だけになる。R-NaD の収束保証（ゼロ和2人ゲームが前提）は外れる
     """
     env.reset()
     B = env.num_envs
@@ -462,7 +468,8 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
                 advance[b, p] = adv_now[i]
             if bonus > 0 and last_act[b, p] >= 0:
                 reward[last_act[b, p], b, p] += bonus
-                reward[last_act[b, p], b, 1 - p] -= bonus
+                if nyugyoku_zero_sum:
+                    reward[last_act[b, p], b, 1 - p] -= bonus
             last_act[b, p] = t
         a, mu = sample_actions(net, obs[idx], mask[idx], device)
         actions = np.full(B, -1, dtype=np.int64)
