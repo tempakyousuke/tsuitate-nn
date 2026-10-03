@@ -268,11 +268,14 @@ def main() -> None:
         finished = env.pop_finished() if env is not None else []
         league_finished = league_env.pop_finished() if league_env is not None else []
         league_rec = league.record(league_finished) if league_env is not None else {}
-        info = learner.update(batch)
+        # ボーナス込みの終局報酬は最大 1 + λ（入玉は節目の合計で λ、固めは占有率 ≤ 1 なので λ）。
+        # 報酬と η をこの倍率で縮めて価値の頭（tanh）の範囲に収める（issue #4）
+        reward_scale = 1.0 + lam + guard_lam
+        info = learner.update(batch, reward_scale=reward_scale)
         t2 = time.time()
         step = learner.step_count
         rec = {"step": step, **info, "games": len(finished),
-               "nyugyoku_lambda": lam, "nyugyoku_sum": args.nyugyoku_sum,
+               "nyugyoku_lambda": lam, "nyugyoku_sum": args.nyugyoku_sum, "reward_scale": reward_scale,
                "collect_sec": t1 - t0, "update_sec": t2 - t1}
         if args.guard:
             # 玉の周りの固めの監視値（guard.summarize）。自己対局とリーグの局は分けて出す

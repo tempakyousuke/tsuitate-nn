@@ -18,7 +18,7 @@
 
 import copy
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
@@ -242,9 +242,21 @@ class RNaDLearner:
         lp_prev_ = legal_log_policy(forward(self.prev_, obs)[0], legal)
         return alpha * lp_prev + (1 - alpha) * lp_prev_
 
-    def update(self, batch):
-        """batch（`collect` の戻り値）で1回更新する。ログ用の dict を返す"""
+    def update(self, batch, reward_scale=1.0):
+        """batch（`collect` の戻り値）で1回更新する。ログ用の dict を返す。
+
+        `reward_scale` > 1 なら**報酬と η を同じ倍率で縮める**（issue #4）。スタイル特化のボーナス込みの
+        終局報酬は ±1 を超え、価値の頭（tanh、−1〜1）が勝ち側で上限に張り付く。報酬だけを縮めると
+        正則化（η · log(π/π_reg)）が相対的に強く効くので、η も同じ倍率で割って釣り合いを保つ
+        （= 報酬・正則化・価値をまとめて単位を変えただけで、学習する方策の目的は変わらない）。
+        呼び出し側は「1 + ボーナスの最大値」（入玉の λ + 固めの λ）を渡す。保存する設定（`self.cfg`）の
+        η は縮める前の値のまま"""
         cfg, dev = self.cfg, self.device
+        if reward_scale != 1.0:
+            if reward_scale < 1.0:
+                raise ValueError(f"reward_scale {reward_scale} は 1 以上")
+            cfg = replace(cfg, eta=cfg.eta / reward_scale)
+            batch = {**batch, "reward": batch["reward"] / reward_scale}
         alpha, update_reg = self.schedule(self.step_count)
         obs_all = batch["obs"]
         legal_all = batch["legal"]
