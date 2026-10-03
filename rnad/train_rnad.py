@@ -177,6 +177,8 @@ def main() -> None:
     else:
         (out / "config.json").write_text(json.dumps(record, indent=2))
 
+    if not 0.0 <= args.league_frac <= 1.0:
+        raise SystemExit(f"--league-frac {args.league_frac} は 0〜1 にする")
     league = None
     n_league = 0
     if args.league:
@@ -185,7 +187,8 @@ def main() -> None:
         league_path = out / "league.json"
         if league_path.exists():
             league.load_state_dict(json.loads(league_path.read_text()))
-        n_league = int(round(args.batch * args.league_frac / 2)) * 2
+        # 2局単位に丸める。round は偶数丸めなので、奇数の batch で frac=1 だと batch を超えうる
+        n_league = min(int(round(args.batch * args.league_frac / 2)) * 2, args.batch // 2 * 2)
     n_self = args.batch - n_league
     env = tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False) if n_self else None
     eval_env = tsuitate_rl.VecEnv(args.eval_games, seed=args.seed + 10_000, auto_reset=False)
@@ -237,29 +240,36 @@ def main() -> None:
         info = learner.update(batch)
         t2 = time.time()
         step = learner.step_count
-        reasons = Counter(f["reason"] for f in finished)
-        fouls = [sum(f["fouls"]) / 2 for f in finished]
-        # 入玉・前進の集計は自己対局の局だけ（リーグの局は学習側の玉しか観測しないので混ぜると薄まる）
-        ent = batch["entered"][:n_self]
-        res = batch["outcome"][:n_self][ent]
         rec = {"step": step, **info, "games": len(finished),
-               "plies": float(np.mean([f["plies"] for f in finished])),
-               "fouls_per_side": float(np.mean(fouls)), "reasons": dict(reasons),
-               "nyugyoku_lambda": lam, "nyugyoku_sum": args.nyugyoku_sum, "nyugyoku_rate": float(ent.mean()),
-               "nyugyoku_w": int((res > 0).sum()), "nyugyoku_l": int((res < 0).sum()),
-               "nyugyoku_d": int((res == 0).sum()),
-               "king_advance_hist": np.bincount(batch["advance"][:n_self].ravel(), minlength=9).tolist(),
+               "nyugyoku_lambda": lam, "nyugyoku_sum": args.nyugyoku_sum,
                "collect_sec": t1 - t0, "update_sec": t2 - t1}
+        # 手数・反則・終局理由・入玉・前進の集計は自己対局の局だけ（リーグの局は学習側の玉しか
+        # 観測しないので混ぜると薄まる）。リーグを入れる前後でこれらの数字は単純には比べられない。
+        # --league-frac 1 で自己対局が無いときは出さない（空の平均は NaN になり、厳密な JSON でなくなる）
+        if finished:
+            ent = batch["entered"][:n_self]
+            res = batch["outcome"][:n_self][ent]
+            rec.update({
+                "plies": float(np.mean([f["plies"] for f in finished])),
+                "fouls_per_side": float(np.mean([sum(f["fouls"]) / 2 for f in finished])),
+                "reasons": dict(Counter(f["reason"] for f in finished)),
+                "nyugyoku_rate": float(ent.mean()),
+                "nyugyoku_w": int((res > 0).sum()), "nyugyoku_l": int((res < 0).sum()),
+                "nyugyoku_d": int((res == 0).sum()),
+                "king_advance_hist": np.bincount(batch["advance"][:n_self].ravel(), minlength=9).tolist(),
+            })
         if league is not None:
             # league_games = この更新の相手ごとの (勝, 負, 分)、league = 窓の勝率と次の配分の重み
             rec["league_games"] = league_rec
             rec["league"] = league.summary()
         log.write(json.dumps(rec) + "\n")
         log.flush()
-        print(f"step {step}: 標本 {info['samples']} 手数 {rec['plies']:.0f} 反則/側 "
-              f"{rec['fouls_per_side']:.2f} loss_v {info['loss_v']:.3f} nerd {info['loss_nerd']:.3f} "
+        selfplay = (f"手数 {rec['plies']:.0f} 反則/側 {rec['fouls_per_side']:.2f} " if finished else "")
+        nyugyoku = f"入玉 {rec['nyugyoku_rate']:.1%}" if finished else "入玉 -"
+        print(f"step {step}: 標本 {info['samples']} {selfplay}"
+              f"loss_v {info['loss_v']:.3f} nerd {info['loss_nerd']:.3f} "
               f"α {info['alpha']:.2f}{' [正則化更新]' if info['reg_update'] else ''} "
-              f"入玉 {rec['nyugyoku_rate']:.1%}(λ {lam}) "
+              f"{nyugyoku}(λ {lam}) "
               f"({t1 - t0:.1f}s + {t2 - t1:.1f}s)", flush=True)
         if league is not None and step % 10 == 0:
             print("  リーグ（勝率/重み）: " + "  ".join(
