@@ -184,6 +184,14 @@ def main() -> None:
     if args.league:
         league = League([n.strip() for n in args.league.split(",") if n.strip()],
                         window=args.league_window, power=args.league_power)
+        # 相手を全部ここで一度作ってみる。tsuitate_rl が古いビルドだと新しい凍結版を知らず、
+        # その相手が初めて配られた更新で落ちる（2026-10-03 に rl_v23 で実際に落ちた）
+        for name in league.names:
+            try:
+                tsuitate_rl.VecEnv(2, opponent=name, seed=0, auto_reset=False)
+            except ValueError as e:
+                raise SystemExit(f"リーグの相手 {name} を作れない: {e}。tsuitate-bot を更新して "
+                                 "tsuitate_rl を作り直す（maturin develop）") from e
         league_path = out / "league.json"
         if league_path.exists():
             league.load_state_dict(json.loads(league_path.read_text()))
@@ -221,22 +229,21 @@ def main() -> None:
         t0 = time.time()
         lam = lam_at(learner.step_count)
         envs = [env] if env is not None else []
-        league_envs = []
-        if league is not None:
+        league_env = None
+        if league is not None and n_league:
+            # リーグの局は1つの env にまとめる（局番号 g の局は opponents[g % len] と指す。相手ごとに
+            # env を分けると相手の推論が直列になる）。相手ごとの局数は偶数なので先後がそろう
             rng = np.random.default_rng(args.seed * 1_000_003 + learner.step_count)
-            for i, (name, k) in enumerate(league.allocate(n_league, rng).items()):
-                if k:
-                    seed = (args.seed * 1_000_003 + learner.step_count) * 64 + i
-                    league_envs.append((name, tsuitate_rl.VecEnv(k, opponent=name, seed=seed, auto_reset=False)))
-        batch = collect(MultiEnv(envs + [e for _, e in league_envs]), learner.net, device,
+            opponents = [name for name, k in league.allocate(n_league, rng).items() for _ in range(k)]
+            league_env = tsuitate_rl.VecEnv(n_league, opponents=opponents,
+                                            seed=args.seed * 1_000_003 + learner.step_count, auto_reset=False)
+            envs.append(league_env)
+        batch = collect(MultiEnv(envs), learner.net, device,
                         nyugyoku_lambda=lam, nyugyoku_mode=args.nyugyoku_mode,
                         nyugyoku_zero_sum=args.nyugyoku_sum == "zero")
         t1 = time.time()
         finished = env.pop_finished() if env is not None else []
-        league_rec = {}
-        for name, e in league_envs:
-            w, l, d = league.record(name, e.pop_finished())
-            league_rec[name] = [w, l, d]
+        league_rec = league.record(league_env.pop_finished()) if league_env is not None else {}
         info = learner.update(batch)
         t2 = time.time()
         step = learner.step_count

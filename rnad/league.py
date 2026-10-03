@@ -6,7 +6,8 @@
 
 - 勝率は相手ごとに直近 `window` 局の得点（勝 1・分 0.5・負 0）の平均を、事前の 1勝1敗で均したもの
   （まだ当たっていない相手は 0.5 から始まる）
-- 局数は先後をそろえるため2局単位で配る（評価モードの VecEnv は偶数番の局で学習側が先手）
+- 局数は先後をそろえるため2局単位で配る（評価モードの VecEnv は偶数番の局で学習側が先手）。
+  配った局は `VecEnv(opponents=[...])` の1つの env にまとめて回す（相手ごとの env だと推論が直列になる）
 - 相手を固定した局は相手の手番が記録に現れないので、学習には学習側の手だけが効く
   （相手を固定した最善応答の学習。R-NaD の自己対局の収束保証の外）
 """
@@ -42,18 +43,23 @@ class League:
         pairs = rng.multinomial(n_games // 2, self.weights())
         return {n: int(k) * 2 for n, k in zip(self.names, pairs)}
 
-    def record(self, name, finished):
-        """評価モードの env の pop_finished() を取り込み、その相手との (勝, 負, 分) を返す"""
-        w = l = d = 0
+    def record(self, finished):
+        """評価モードの env の pop_finished() を取り込み、相手ごとの [勝, 負, 分] を返す
+        （どの相手との局かは各局の `opponent`。リーグの外の相手の局は数えない）"""
+        out = {}
         for f in finished:
+            name = f["opponent"]
+            if name not in self.scores:
+                continue
+            wld = out.setdefault(name, [0, 0, 0])
             if f["winner"] is None:
-                score, d = 0.5, d + 1
+                score, wld[2] = 0.5, wld[2] + 1
             elif f["winner"] == f["learner"]:
-                score, w = 1.0, w + 1
+                score, wld[0] = 1.0, wld[0] + 1
             else:
-                score, l = 0.0, l + 1
+                score, wld[1] = 0.0, wld[1] + 1
             self.scores[name].append(score)
-        return w, l, d
+        return out
 
     def summary(self):
         ws = self.weights()
