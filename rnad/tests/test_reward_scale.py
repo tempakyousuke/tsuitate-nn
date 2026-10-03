@@ -4,6 +4,7 @@
 
 - 各局・各側の報酬の合計を「1 + 入玉の λ + 固めの λ」で割ると −1〜1 に収まる
   （入玉: ゼロ和・非ゼロ和、固め、両方。価値の頭は tanh なので、収まらないと勝ち側が上限に張り付く）
+- reward_scale を固定する元になる λ の予定の最大
 - update(batch, reward_scale=s) は「報酬を s で割り、η を s で割った設定」での update と完全に同じ
 """
 
@@ -30,9 +31,10 @@ def net():
 
 def returns(nyu=0.0, zero_sum=True, guard=0.0):
     kw = {"guard_bonus": guard} if guard else {}
-    env = tsuitate_rl.VecEnv(16, seed=4, auto_reset=False, **kw)
+    env = tsuitate_rl.VecEnv(32, seed=4, auto_reset=False, **kw)
+    model = net()
     torch.manual_seed(3)
-    batch = collect(env, net(), DEV, nyugyoku_lambda=nyu, nyugyoku_mode="graded",
+    batch = collect(env, model, DEV, nyugyoku_lambda=nyu, nyugyoku_mode="graded",
                     nyugyoku_zero_sum=zero_sum)
     return batch, batch["reward"].sum(dim=0)  # [B, 2] 各局・各側の合計
 
@@ -40,6 +42,8 @@ def returns(nyu=0.0, zero_sum=True, guard=0.0):
 def check_bounds():
     for nyu, zero_sum, guard in ((4.0, True, 0.0), (4.0, False, 0.0), (0.0, True, 0.5), (4.0, False, 0.5)):
         _, ret = returns(nyu, zero_sum, guard)
+        # 縮める必要のある報酬（合計が 1 を超える局・側）を実際に含んでいること（無ければ検査が空振りする）
+        assert ret.abs().max() > 1.0, (nyu, zero_sum, guard, float(ret.abs().max()))
         scale = 1.0 + nyu + guard
         scaled = ret / scale
         assert scaled.abs().max() <= 1.0 + 1e-6, (nyu, zero_sum, guard, float(ret.abs().max()))
@@ -78,6 +82,19 @@ def check_update_equivalence():
     print("OK: update(reward_scale=s) は報酬と η を s で割った update と同じ")
 
 
+def check_schedule_max():
+    """reward_scale は λ の予定全体の最大で固定する（区切りごとに変えない）。その最大値の取り出し"""
+    from train_rnad import parse_lambda_schedule
+    at, mx = parse_lambda_schedule("1.0:800,0.5:400,0.25:400,0", 200)
+    assert mx == 1.0 and at(0) == 1.0 and at(900) == 0.5 and at(5000) == 0.0
+    at, mx = parse_lambda_schedule("0.5:400,2.0", 200)
+    assert mx == 2.0 and at(0) == 0.5 and at(400) == 2.0
+    at, mx = parse_lambda_schedule("", 200)
+    assert mx == 0.0 and at(10) == 0.0
+    print("OK: λ の予定の最大（reward_scale を予定全体で固定する元）")
+
+
 if __name__ == "__main__":
+    check_schedule_max()
     check_bounds()
     check_update_equivalence()

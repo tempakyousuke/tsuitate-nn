@@ -62,10 +62,11 @@ def load_net(path: str, channels: int, blocks: int, which: str = "target") -> Po
 
 
 def parse_lambda_schedule(spec: str, schedule: int):
-    """入玉ボーナスの λ の予定 "1.0:800,0.5:400,0" → 更新回数 step で使う λ を返す関数。
-    区間の長さは正則化方策の差し替え間隔の倍数に限る（各区間は固定したゲームで収束させる前提）"""
+    """ボーナスの λ の予定 "1.0:800,0.5:400,0" → (更新回数 step で使う λ を返す関数, 予定中の λ の最大)。
+    区間の長さは正則化方策の差し替え間隔の倍数に限る（各区間は固定したゲームで収束させる前提）。
+    最大値は報酬の縮め方（reward_scale）を予定全体で固定するのに使う"""
     if not spec:
-        return lambda step: 0.0
+        return (lambda step: 0.0), 0.0
     parts = []
     for item in spec.split(","):
         lam, _, n = item.partition(":")
@@ -82,7 +83,7 @@ def parse_lambda_schedule(spec: str, schedule: int):
                 return lam
             step -= n
         return parts[-1][0]
-    return at
+    return at, max(lam for lam, _ in parts)
 
 
 def save_checkpoint(learner, path: pathlib.Path) -> None:
@@ -156,8 +157,15 @@ def main() -> None:
 
     cfg = RNaDConfig(eta=args.eta, beta=args.beta, lr=args.lr, schedule_sizes=(args.schedule,),
                      schedule_repeats=(1,))
-    lam_at = parse_lambda_schedule(args.nyugyoku, args.schedule)
-    guard_at = parse_lambda_schedule(args.guard, args.schedule)
+    lam_at, lam_max = parse_lambda_schedule(args.nyugyoku, args.schedule)
+    guard_at, guard_max = parse_lambda_schedule(args.guard, args.schedule)
+    # ボーナス込みの終局報酬は最大 1 + λ（入玉は節目の合計で λ、固めは占有率 ≤ 1 なので λ）。
+    # 報酬と η をこの倍率で縮めて価値の頭（tanh）の範囲に収める（issue #4）。**予定全体で固定する**:
+    # 区切りごとに変えると価値の目標の単位がそのたびに変わり、ゆっくり追従するターゲットネットの v
+    # （target_avg=0.001、合わせ直すのに約1,000更新）が区間の大半で古い単位のままになる。
+    # 固定でも報酬と η にそろって掛かるので、各区間の勝敗・ボーナス・正則化の比率は変わらない。
+    # loss_v は 1/s²、v_target_mean・s_abs_mean は 1/s の単位になる（s の違う run は log の reward_scale で換算）
+    reward_scale = 1.0 + lam_max + guard_max
 
     def env_kwargs(guard_lam):
         # --guard を使わないときは引数を渡さない（guard_bonus の無い古い tsuitate_rl でも動くように）
@@ -268,9 +276,6 @@ def main() -> None:
         finished = env.pop_finished() if env is not None else []
         league_finished = league_env.pop_finished() if league_env is not None else []
         league_rec = league.record(league_finished) if league_env is not None else {}
-        # ボーナス込みの終局報酬は最大 1 + λ（入玉は節目の合計で λ、固めは占有率 ≤ 1 なので λ）。
-        # 報酬と η をこの倍率で縮めて価値の頭（tanh）の範囲に収める（issue #4）
-        reward_scale = 1.0 + lam + guard_lam
         info = learner.update(batch, reward_scale=reward_scale)
         t2 = time.time()
         step = learner.step_count
