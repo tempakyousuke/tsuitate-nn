@@ -9,6 +9,8 @@ R-NaD の損失で1ステップ。学習の進み具合は**錨（既定は模�
 学習が進んでいる。区切りでターゲットネットの重みを Rust 用に書き出すので、CI の arena
 （`rl_policy:release:...`）でも測れる。
 
+防御特化（玉の周りの固め）は `--guard λ --league <本命> --league-frac 1`（rnad/README.md）。
+
 記録: <out>/log.jsonl（更新ごと・評価ごとに1行）、<out>/checkpoint.pt、<out>/policy_<step>.bin
 """
 
@@ -23,6 +25,7 @@ import torch
 
 import tsuitate_rl
 from export_weights import write as write_weights
+from guard import summarize as summarize_guard
 from model import PolicyValueNet
 from league import League
 from rnad import (PRECISIONS, MultiEnv, RNaDConfig, RNaDLearner, cfg_diff, collect, play_match,
@@ -125,6 +128,13 @@ def main() -> None:
     ap.add_argument("--nyugyoku-sum", choices=["zero", "own"], default="zero",
                     help="zero = 前進した側に +λ・相手に −λ（ゼロ和）/ own = 前進した側に +λ だけ"
                          "（非ゼロ和。R-NaD の収束保証は外れる）")
+    ap.add_argument("--guard", default="",
+                    help="玉の周りの固めのボーナスの λ の予定（書式は --nyugyoku と同じ。空 = 使わない）。"
+                         "終局の報酬に λ × 対局を通した自玉の周りの占有率の平均を両者それぞれ足す"
+                         "（非ゼロ和。tsuitate_rl.VecEnv の guard_bonus）。相手を固定する "
+                         "--league ... --league-frac 1 と組み合わせる想定")
+    ap.add_argument("--guard-radius", type=int, choices=[1, 2], default=1,
+                    help="占有率を数える自玉からの距離（1 = 8近傍 / 2 = 24マス）")
     ap.add_argument("--league", default="",
                     help="リーグ学習の相手（カンマ区切り。tsuitate-bot の strategy::make の名前、例 "
                          "'rl_v15,rl_v16,rl_policy:/path/policy.bin'）。空 = 自己対局だけ")
@@ -147,6 +157,11 @@ def main() -> None:
     cfg = RNaDConfig(eta=args.eta, beta=args.beta, lr=args.lr, schedule_sizes=(args.schedule,),
                      schedule_repeats=(1,))
     lam_at = parse_lambda_schedule(args.nyugyoku, args.schedule)
+    guard_at = parse_lambda_schedule(args.guard, args.schedule)
+
+    def env_kwargs(guard_lam):
+        # --guard を使わないときは引数を渡さない（guard_bonus の無い古い tsuitate_rl でも動くように）
+        return {"guard_bonus": guard_lam, "guard_radius": args.guard_radius} if args.guard else {}
     if args.eval_games % 2:
         raise SystemExit("--eval-games は偶数にする（先後を同数にするため）")
     ck_path = out / "checkpoint.pt"
@@ -198,7 +213,10 @@ def main() -> None:
         # 2局単位に丸める。round は偶数丸めなので、奇数の batch で frac=1 だと batch を超えうる
         n_league = min(int(round(args.batch * args.league_frac / 2)) * 2, args.batch // 2 * 2)
     n_self = args.batch - n_league
-    env = tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False) if n_self else None
+    # 自己対局の env は guard_bonus を作るときに決めるので、λ が変わったら作り直す（下のループ）
+    env_guard = guard_at(learner.step_count)
+    env = (tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False, **env_kwargs(env_guard))
+           if n_self else None)
     eval_env = tsuitate_rl.VecEnv(args.eval_games, seed=args.seed + 10_000, auto_reset=False)
     log = open(out / "log.jsonl", "a")
 
@@ -228,6 +246,10 @@ def main() -> None:
     while learner.step_count < args.steps:
         t0 = time.time()
         lam = lam_at(learner.step_count)
+        guard_lam = guard_at(learner.step_count)
+        if env is not None and guard_lam != env_guard:
+            env = tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False, **env_kwargs(guard_lam))
+            env_guard = guard_lam
         envs = [env] if env is not None else []
         league_env = None
         if league is not None and n_league:
@@ -236,20 +258,31 @@ def main() -> None:
             rng = np.random.default_rng(args.seed * 1_000_003 + learner.step_count)
             opponents = [name for name, k in league.allocate(n_league, rng).items() for _ in range(k)]
             league_env = tsuitate_rl.VecEnv(n_league, opponents=opponents,
-                                            seed=args.seed * 1_000_003 + learner.step_count, auto_reset=False)
+                                            seed=args.seed * 1_000_003 + learner.step_count, auto_reset=False,
+                                            **env_kwargs(guard_lam))
             envs.append(league_env)
         batch = collect(MultiEnv(envs), learner.net, device,
                         nyugyoku_lambda=lam, nyugyoku_mode=args.nyugyoku_mode,
                         nyugyoku_zero_sum=args.nyugyoku_sum == "zero")
         t1 = time.time()
         finished = env.pop_finished() if env is not None else []
-        league_rec = league.record(league_env.pop_finished()) if league_env is not None else {}
+        league_finished = league_env.pop_finished() if league_env is not None else []
+        league_rec = league.record(league_finished) if league_env is not None else {}
         info = learner.update(batch)
         t2 = time.time()
         step = learner.step_count
         rec = {"step": step, **info, "games": len(finished),
                "nyugyoku_lambda": lam, "nyugyoku_sum": args.nyugyoku_sum,
                "collect_sec": t1 - t0, "update_sec": t2 - t1}
+        if args.guard:
+            # 玉の周りの固めの監視値（guard.summarize）。自己対局とリーグの局は分けて出す
+            # （リーグの局は相手側の反則数 opp_fouls が見える = この戦法の狙いどおりか）
+            rec["guard_lambda"] = guard_lam
+            rec["guard_radius"] = args.guard_radius
+            if finished:
+                rec["guard_self"] = summarize_guard(finished, args.guard_radius)
+            if league_finished:
+                rec["guard_league"] = summarize_guard(league_finished, args.guard_radius)
         # 手数・反則・終局理由・入玉・前進の集計は自己対局の局だけ（リーグの局は学習側の玉しか
         # 観測しないので混ぜると薄まる）。リーグを入れる前後でこれらの数字は単純には比べられない。
         # --league-frac 1 で自己対局が無いときは出さない（空の平均は NaN になり、厳密な JSON でなくなる）
@@ -278,6 +311,14 @@ def main() -> None:
               f"α {info['alpha']:.2f}{' [正則化更新]' if info['reg_update'] else ''} "
               f"{nyugyoku}(λ {lam}) "
               f"({t1 - t0:.1f}s + {t2 - t1:.1f}s)", flush=True)
+        if args.guard and step % 10 == 0:
+            g = rec.get("guard_league") or rec.get("guard_self") or {}
+            key = f"guard_r{args.guard_radius}"
+            if g:
+                print(f"  固め（λ {guard_lam}）: 占有率 {g[key]:.3f} 玉の近くへの打ち {g['near_drops']:.2f} "
+                      f"検知 {g['near_drop_fouls']:.2f} 反則 {g['fouls']:.2f}"
+                      + (f" / 相手 占有率 {g['opp_' + key]:.3f} 反則 {g['opp_fouls']:.2f}"
+                         if "opp_fouls" in g else ""), flush=True)
         if league is not None and step % 10 == 0:
             print("  リーグ（勝率/重み）: " + "  ".join(
                 f"{n} {s['wr']:.2f}/{s['weight']:.2f}" for n, s in rec["league"].items()), flush=True)
