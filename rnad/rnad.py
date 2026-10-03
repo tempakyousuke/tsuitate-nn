@@ -409,6 +409,48 @@ KING_PLANE = 7
 GRADED_MILESTONES = (3, 4, 5, 6)
 
 
+class MultiEnv:
+    """複数の VecEnv（auto_reset=False）を1つの VecEnv に見せる（局の並びは渡した順につなげる）。
+
+    リーグ学習で、自己対局の env と相手ごとの評価モードの env を `collect` に一度に渡すためのもの。
+    1回の `observe` で全 env の局面を集めるので、ネットの推論は全局まとめて1回になる
+    （env ごとに `collect` を回すと、相手の数だけ手番のループが直列になる）。
+    評価モードの env は学習側の手番だけを返し、相手の手は `step` の中で指し進める。報酬は
+    [先手, 後手] の両方が入るが、相手側の手番は記録に現れないので学習には学習側の列だけが効く
+    """
+
+    def __init__(self, envs):
+        self.envs = list(envs)
+        self.sizes = [e.num_envs for e in self.envs]
+        self.offsets = np.cumsum([0] + self.sizes)
+        self.num_envs = int(self.offsets[-1])
+
+    def _split(self, x):
+        return [x[self.offsets[i]:self.offsets[i + 1]] for i in range(len(self.envs))]
+
+    def reset(self):
+        for e in self.envs:
+            e.reset()
+
+    def alive(self):
+        return np.concatenate([e.alive() for e in self.envs])
+
+    def observe(self):
+        parts = [e.observe() for e in self.envs]
+        return tuple(np.concatenate([p[j] for p in parts]) for j in range(3))
+
+    def step(self, actions):
+        rews, dones = [], []
+        for e, a in zip(self.envs, self._split(actions)):
+            if (a >= 0).any():
+                r, d = e.step(a)
+            else:  # この env の局は全部終わっている
+                r, d = np.zeros((e.num_envs, 2), np.float32), np.zeros(e.num_envs, bool)
+            rews.append(r)
+            dones.append(d)
+        return np.concatenate(rews), np.concatenate(dones)
+
+
 def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode="enter",
             nyugyoku_zero_sum=True):
     """`env`（auto_reset=False の VecEnv）の全局を1局ずつ最後まで自己対局し、学習用に並べる。
