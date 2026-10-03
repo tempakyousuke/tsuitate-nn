@@ -18,7 +18,7 @@
 
 import copy
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
@@ -242,9 +242,25 @@ class RNaDLearner:
         lp_prev_ = legal_log_policy(forward(self.prev_, obs)[0], legal)
         return alpha * lp_prev + (1 - alpha) * lp_prev_
 
-    def update(self, batch):
-        """batch（`collect` の戻り値）で1回更新する。ログ用の dict を返す"""
+    def update(self, batch, reward_scale=1.0):
+        """batch（`collect` の戻り値）で1回更新する。ログ用の dict を返す。
+
+        `reward_scale` > 1 なら**報酬と η を同じ倍率で縮める**（issue #4）。スタイル特化のボーナス込みの
+        終局報酬は ±1 を超え、価値の頭（tanh、−1〜1）が勝ち側で上限に張り付く。報酬だけを縮めると
+        正則化（η · log(π/π_reg)）が相対的に強く効くので、η も同じ倍率で割って釣り合いを保つ
+        （= 報酬・正則化・価値をまとめて単位を変えただけで、学習する方策の目的は変わらない）。
+        呼び出し側は「1 + ボーナスの最大値」（λ の予定全体での入玉の λ の最大 + 固めの λ の最大）を、
+        **予定全体で固定して**渡す（区切りごとに変えると価値の目標の単位が変わり、ゆっくり追従する
+        ターゲットネットの v が古い単位のまま残る）。保存する設定（`self.cfg`）の η は縮める前の値のまま。
+
+        既存の checkpoint（s=1 で学んだもの）から s>1 で再開すると、Adam の2次モーメント（b2=0.999）が
+        古い勾配の大きさのままなので、最初の約1,000更新は実効の学習率が最大で 1/s 程度まで下がる"""
         cfg, dev = self.cfg, self.device
+        if reward_scale != 1.0:
+            if reward_scale < 1.0:
+                raise ValueError(f"reward_scale {reward_scale} は 1 以上")
+            cfg = replace(cfg, eta=cfg.eta / reward_scale)
+            batch = {**batch, "reward": batch["reward"] / reward_scale}
         alpha, update_reg = self.schedule(self.step_count)
         obs_all = batch["obs"]
         legal_all = batch["legal"]
