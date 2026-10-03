@@ -25,9 +25,11 @@ from rnad import MultiEnv, collect  # noqa: E402
 def check_league():
     lg = League(["a", "b", "c"], window=8, power=2.0)
     assert np.allclose(lg.weights(), 1 / 3)  # 未対局は全員 0.5
-    lg.record("a", [{"winner": 0, "learner": 0}] * 8)  # a には全勝
-    lg.record("b", [{"winner": 1, "learner": 0}] * 8)  # b には全敗
-    lg.record("c", [{"winner": None, "learner": 0}] * 8)  # c とは全分け
+    got = lg.record([{"opponent": "a", "winner": 0, "learner": 0}] * 8  # a には全勝
+                    + [{"opponent": "b", "winner": 1, "learner": 0}] * 8  # b には全敗
+                    + [{"opponent": "c", "winner": None, "learner": 0}] * 8  # c とは全分け
+                    + [{"opponent": "外", "winner": 0, "learner": 0}])  # リーグの外は数えない
+    assert got == {"a": [8, 0, 0], "b": [0, 8, 0], "c": [0, 0, 8]}, got
     w = dict(zip(lg.names, lg.weights()))
     assert w["b"] > w["c"] > w["a"], w
     rng = np.random.default_rng(0)
@@ -61,7 +63,7 @@ def check_single_env_identity():
 def check_mixed():
     dev = torch.device("cpu")
     selfplay = tsuitate_rl.VecEnv(4, seed=5, auto_reset=False)
-    vs = tsuitate_rl.VecEnv(6, opponent="heuristic", seed=7, auto_reset=False)
+    vs = tsuitate_rl.VecEnv(6, opponents=["heuristic"] * 6, seed=7, auto_reset=False)
     batch = collect(MultiEnv([selfplay, vs]), net(), dev)
     # collect は最初に reset するので、色は終わった後（auto_reset=False なので終局した局のまま）に取る
     colors = vs.learner_colors().astype(np.int64)
