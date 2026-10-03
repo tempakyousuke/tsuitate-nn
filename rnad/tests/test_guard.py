@@ -4,7 +4,7 @@
     .venv/bin/python rnad/tests/test_guard.py
 
 - 自己対局: 同じ乱数で λ=0 と λ>0 を回すと対局は同じで、局ごとの報酬の差 = λ × 両側の占有率の平均
-- 相手固定（heuristic）: 学習側の列の報酬 = 勝敗 + λ × 学習側の占有率の平均
+- 相手固定（heuristic。`opponent=` と、リーグが使う `opponents=[...]` の両方）: 学習側の列の報酬 = 勝敗 + λ × 学習側の占有率の平均
 - summarize: 自己対局は両側を学習側として数え、相手固定の局は相手側を分ける
 """
 
@@ -49,10 +49,9 @@ def check_selfplay():
     print(f"OK: 自己対局 {n}局で報酬の差 = λ × 占有率（平均 {want.mean() / LAM:.3f}）")
 
 
-def check_versus():
+def check_versus(**opp):
     n = 6
-    env = tsuitate_rl.VecEnv(n, opponent="heuristic", seed=2, auto_reset=False,
-                             guard_bonus=LAM, guard_radius=2)
+    env = tsuitate_rl.VecEnv(n, seed=2, auto_reset=False, guard_bonus=LAM, guard_radius=2, **opp)
     batch, fin = run(env, wrap=True)
     # 学習側の色は終局記録から取る（collect の reset で局番号が変わるので、事前の learner_colors は使わない）
     total = batch["reward"].sum(dim=0)
@@ -63,7 +62,7 @@ def check_versus():
         result = 0.0 if f["winner"] is None else (1.0 if f["winner"] == me else -1.0)
         want = result + LAM * f["guard_r2"][me]
         assert abs(float(got[me]) - want) < 1e-5, (b, float(got[me]), want)
-    print(f"OK: heuristic 相手 {n}局で学習側の報酬 = 勝敗 + λ × 学習側の占有率（半径2）")
+    print(f"OK: heuristic 相手 {n}局（{next(iter(opp))}=）で学習側の報酬 = 勝敗 + λ × 学習側の占有率（半径2）")
 
 
 def check_summarize():
@@ -83,4 +82,6 @@ def check_summarize():
 if __name__ == "__main__":
     check_summarize()
     check_selfplay()
-    check_versus()
+    check_versus(opponent="heuristic")
+    # リーグ学習（train_rnad.py）が使う、相手を局ごとに並べる形
+    check_versus(opponents=["heuristic"] * 6)
