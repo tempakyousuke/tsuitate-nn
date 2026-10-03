@@ -120,6 +120,9 @@ def main() -> None:
                          "区間は更新回数で、正則化方策の差し替え間隔の倍数")
     ap.add_argument("--nyugyoku-mode", choices=["enter", "graded"], default="enter",
                     help="enter = 敵陣への初進入で λ / graded = 前進 3・4・5・6 段の初到達ごとに λ/4")
+    ap.add_argument("--nyugyoku-sum", choices=["zero", "own"], default="zero",
+                    help="zero = 前進した側に +λ・相手に −λ（ゼロ和）/ own = 前進した側に +λ だけ"
+                         "（非ゼロ和。R-NaD の収束保証は外れる）")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--precision", choices=PRECISIONS, default="default",
                     help="ネットの計算精度（rnad.set_precision。default でも畳み込みは TF32 = tf32 と速さは同じ）")
@@ -189,7 +192,8 @@ def main() -> None:
     while learner.step_count < args.steps:
         t0 = time.time()
         lam = lam_at(learner.step_count)
-        batch = collect(env, learner.net, device, nyugyoku_lambda=lam, nyugyoku_mode=args.nyugyoku_mode)
+        batch = collect(env, learner.net, device, nyugyoku_lambda=lam, nyugyoku_mode=args.nyugyoku_mode,
+                        nyugyoku_zero_sum=args.nyugyoku_sum == "zero")
         t1 = time.time()
         finished = env.pop_finished()
         info = learner.update(batch)
@@ -202,7 +206,7 @@ def main() -> None:
         rec = {"step": step, **info, "games": len(finished),
                "plies": float(np.mean([f["plies"] for f in finished])),
                "fouls_per_side": float(np.mean(fouls)), "reasons": dict(reasons),
-               "nyugyoku_lambda": lam, "nyugyoku_rate": float(ent.mean()),
+               "nyugyoku_lambda": lam, "nyugyoku_sum": args.nyugyoku_sum, "nyugyoku_rate": float(ent.mean()),
                "nyugyoku_w": int((res > 0).sum()), "nyugyoku_l": int((res < 0).sum()),
                "nyugyoku_d": int((res == 0).sum()),
                "king_advance_hist": np.bincount(batch["advance"].ravel(), minlength=9).tolist(),
