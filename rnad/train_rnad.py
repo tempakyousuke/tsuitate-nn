@@ -10,6 +10,7 @@ R-NaD の損失で1ステップ。学習の進み具合は**錨（既定は模�
 （`rl_policy:release:...`）でも測れる。
 
 防御特化（玉の周りの固め）は `--guard λ --league <本命> --league-frac 1`（rnad/README.md）。
+速攻特化（決着の速さ）は `--speed λ`（自己対局＋リーグ。rnad/README.md）。
 
 記録: <out>/log.jsonl（更新ごと・評価ごとに1行）、<out>/checkpoint.pt、<out>/policy_<step>.bin
 """
@@ -26,6 +27,7 @@ import torch
 import tsuitate_rl
 from export_weights import write as write_weights
 from guard import summarize as summarize_guard
+from speed import summarize as summarize_speed
 from model import PolicyValueNet
 from league import League
 from rnad import (PRECISIONS, MultiEnv, RNaDConfig, RNaDLearner, cfg_diff, collect, play_match,
@@ -136,6 +138,15 @@ def main() -> None:
                          "--league ... --league-frac 1 と組み合わせる想定")
     ap.add_argument("--guard-radius", type=int, choices=[1, 2], default=1,
                     help="占有率を数える自玉からの距離（1 = 8近傍 / 2 = 24マス）")
+    ap.add_argument("--speed", default="",
+                    help="決着の速さのボーナスの λ の予定（書式は --nyugyoku と同じ。空 = 使わない）。"
+                         "勝った側に λ × max(0, (H − 手数) / H) を足す（tsuitate_rl.VecEnv の speed_bonus。"
+                         "手数は受理手の数、引き分けには付かない）")
+    ap.add_argument("--speed-horizon", type=int, default=200,
+                    help="速さの基準の手数 H（既定 200 = 手数上限。縮めると手数の差が効きやすくなる）")
+    ap.add_argument("--speed-sum", choices=["own", "zero"], default="own",
+                    help="own = 勝った側だけに足す（非ゼロ和）/ zero = 負けた側から同じ額を引く（ゼロ和。"
+                         "負けそうな側に「手数を延ばせ」という動機ができる）")
     ap.add_argument("--league", default="",
                     help="リーグ学習の相手（カンマ区切り。tsuitate-bot の strategy::make の名前、例 "
                          "'rl_v15,rl_v16,rl_policy:/path/policy.bin'）。空 = 自己対局だけ")
@@ -159,17 +170,26 @@ def main() -> None:
                      schedule_repeats=(1,))
     lam_at, lam_max = parse_lambda_schedule(args.nyugyoku, args.schedule)
     guard_at, guard_max = parse_lambda_schedule(args.guard, args.schedule)
-    # ボーナス込みの終局報酬は最大 1 + λ（入玉は節目の合計で λ、固めは占有率 ≤ 1 なので λ）。
+    speed_at, speed_max = parse_lambda_schedule(args.speed, args.schedule)
+    # ボーナス込みの終局報酬は最大 1 + λ（入玉は節目の合計で λ、固めは占有率 ≤ 1 なので λ、
+    # 速攻は速さの係数 ≤ 1 なので λ。zero でも負けた側は −1 − λ まで）。
     # 報酬と η をこの倍率で縮めて価値の頭（tanh）の範囲に収める（issue #4）。**予定全体で固定する**:
     # 区切りごとに変えると価値の目標の単位がそのたびに変わり、ゆっくり追従するターゲットネットの v
     # （target_avg=0.001、合わせ直すのに約1,000更新）が区間の大半で古い単位のままになる。
     # 固定でも報酬と η にそろって掛かるので、各区間の勝敗・ボーナス・正則化の比率は変わらない。
     # loss_v は 1/s²、v_target_mean・s_abs_mean は 1/s の単位になる（s の違う run は log の reward_scale で換算）
-    reward_scale = 1.0 + lam_max + guard_max
+    reward_scale = 1.0 + lam_max + guard_max + speed_max
+    if args.speed_horizon < 1:
+        raise SystemExit("--speed-horizon は 1 以上")
 
-    def env_kwargs(guard_lam):
-        # --guard を使わないときは引数を渡さない（guard_bonus の無い古い tsuitate_rl でも動くように）
-        return {"guard_bonus": guard_lam, "guard_radius": args.guard_radius} if args.guard else {}
+    def env_kwargs(guard_lam, speed_lam):
+        # 使わないボーナスの引数は渡さない（guard_bonus / speed_bonus の無い古い tsuitate_rl でも動くように）
+        kw = {}
+        if args.guard:
+            kw.update(guard_bonus=guard_lam, guard_radius=args.guard_radius)
+        if args.speed:
+            kw.update(speed_bonus=speed_lam, speed_horizon=args.speed_horizon, speed_sum=args.speed_sum)
+        return kw
     if args.eval_games % 2:
         raise SystemExit("--eval-games は偶数にする（先後を同数にするため）")
     ck_path = out / "checkpoint.pt"
@@ -221,9 +241,9 @@ def main() -> None:
         # 2局単位に丸める。round は偶数丸めなので、奇数の batch で frac=1 だと batch を超えうる
         n_league = min(int(round(args.batch * args.league_frac / 2)) * 2, args.batch // 2 * 2)
     n_self = args.batch - n_league
-    # 自己対局の env は guard_bonus を作るときに決めるので、λ が変わったら作り直す（下のループ）
-    env_guard = guard_at(learner.step_count)
-    env = (tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False, **env_kwargs(env_guard))
+    # 自己対局の env はボーナスの λ を作るときに決めるので、λ が変わったら作り直す（下のループ）
+    env_bonus = (guard_at(learner.step_count), speed_at(learner.step_count))
+    env = (tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False, **env_kwargs(*env_bonus))
            if n_self else None)
     eval_env = tsuitate_rl.VecEnv(args.eval_games, seed=args.seed + 10_000, auto_reset=False)
     log = open(out / "log.jsonl", "a")
@@ -255,9 +275,11 @@ def main() -> None:
         t0 = time.time()
         lam = lam_at(learner.step_count)
         guard_lam = guard_at(learner.step_count)
-        if env is not None and guard_lam != env_guard:
-            env = tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False, **env_kwargs(guard_lam))
-            env_guard = guard_lam
+        speed_lam = speed_at(learner.step_count)
+        if env is not None and (guard_lam, speed_lam) != env_bonus:
+            env = tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False,
+                                     **env_kwargs(guard_lam, speed_lam))
+            env_bonus = (guard_lam, speed_lam)
         envs = [env] if env is not None else []
         league_env = None
         if league is not None and n_league:
@@ -267,7 +289,7 @@ def main() -> None:
             opponents = [name for name, k in league.allocate(n_league, rng).items() for _ in range(k)]
             league_env = tsuitate_rl.VecEnv(n_league, opponents=opponents,
                                             seed=args.seed * 1_000_003 + learner.step_count, auto_reset=False,
-                                            **env_kwargs(guard_lam))
+                                            **env_kwargs(guard_lam, speed_lam))
             envs.append(league_env)
         batch = collect(MultiEnv(envs), learner.net, device,
                         nyugyoku_lambda=lam, nyugyoku_mode=args.nyugyoku_mode,
@@ -291,6 +313,15 @@ def main() -> None:
                 rec["guard_self"] = summarize_guard(finished, args.guard_radius)
             if league_finished:
                 rec["guard_league"] = summarize_guard(league_finished, args.guard_radius)
+        if args.speed:
+            # 決着の速さの監視値（speed.summarize）。自己対局とリーグの局は分けて出す
+            rec["speed_lambda"] = speed_lam
+            rec["speed_horizon"] = args.speed_horizon
+            rec["speed_sum"] = args.speed_sum
+            if finished:
+                rec["speed_self"] = summarize_speed(finished, args.speed_horizon)
+            if league_finished:
+                rec["speed_league"] = summarize_speed(league_finished, args.speed_horizon)
         # 手数・反則・終局理由・入玉・前進の集計は自己対局の局だけ（リーグの局は学習側の玉しか
         # 観測しないので混ぜると薄まる）。リーグを入れる前後でこれらの数字は単純には比べられない。
         # --league-frac 1 で自己対局が無いときは出さない（空の平均は NaN になり、厳密な JSON でなくなる）
@@ -327,6 +358,15 @@ def main() -> None:
                       f"検知 {g['near_drop_fouls']:.2f} 反則 {g['fouls']:.2f}"
                       + (f" / 相手 占有率 {g['opp_' + key]:.3f} 反則 {g['opp_fouls']:.2f}"
                          if "opp_fouls" in g else ""), flush=True)
+        if args.speed and step % 10 == 0:
+            parts = []
+            for label, key in (("自己対局", "speed_self"), ("リーグ", "speed_league")):
+                sp = rec.get(key) or {}
+                if "win_plies" in sp:
+                    parts.append(f"{label} 勝ち局 {sp['win_plies']:.0f}手 速さ {sp['win_speed']:.3f} "
+                                 f"詰み {sp['win_mate']:.0%}")
+            if parts:
+                print(f"  速攻（λ {speed_lam}）: " + " / ".join(parts), flush=True)
         if league is not None and step % 10 == 0:
             print("  リーグ（勝率/重み）: " + "  ".join(
                 f"{n} {s['wr']:.2f}/{s['weight']:.2f}" for n, s in rec["league"].items()), flush=True)

@@ -98,10 +98,34 @@ ARENA_MATCH_SEED=20260927 cargo run --release --bin arena -- 100 "rl_policy:<pol
   落ちない。占有率だけ上がって勝率が崩れるなら λ が大きすぎる（ただ固めるだけのモデル）
 - 計算の都合: 相手（`rl_policy:`）の手番は Rust 側で1手ずつ推論するので、自己対局より1局が重い
 
-### ボーナス込みの報酬の縮め方（入玉・防御特化に共通、issue #4）
+## 速攻特化（決着の速さ）モデル
+tsuitate-bot の `docs/rl-deepnash-design.md` の速攻特化の案（tsuitate-bot PR #65 の `VecEnv(speed_bonus=...)`）。
+
+```sh
+# tsuitate-bot の main（PR #65 以降）の rl-env を入れ直してから
+.venv/bin/python rnad/tests/test_speed.py                      # 報酬の配り方と集計の検査
+.venv/bin/python rnad/train_rnad.py   --init <本線の checkpoint.pt> --anchor <本線の checkpoint.pt> --out out_rnad/speed   --speed 2.0 --speed-horizon 120 --league rl_v15,...,rl_v24 --league-frac 0.5 --steps <更新回数>
+```
+
+- **報酬** = 勝敗(±1) + 勝った側に λ × max(0, (H − 手数) / H)。手数は受理手の数で、引き分けには付かない。
+  `--speed-sum own`（既定）は勝った側だけ（非ゼロ和）、`zero` は負けた側から同じ額を引く（負けそうな側に
+  「手数を延ばせ」という動機ができるので既定にしない）
+- `--speed` は `--nyugyoku` と同じ書式の λ の予定。`--speed-horizon` を縮めると手数の差が効きやすい
+  （H=120 なら 50手で 0.58・100手で 0.17）
+- 防御特化と違い、自己対局でも両側が速攻を目指すだけなので、**自己対局＋リーグ**で回せる
+- **監視**: `log.jsonl` の `speed_self`（自己対局の局）/ `speed_league`（相手固定の局）。10更新ごとに画面にも出す
+
+  | キー | 中身 |
+  | --- | --- |
+  | `win_plies` / `win_speed` | 学習側の勝ち局の平均手数と速さの係数の平均 |
+  | `win_mate` | 学習側の勝ち局のうち詰みで終わった割合（残りは相手の反則負けなど） |
+  | `loss_plies` | 学習側の負け局の平均手数（相手固定の局だけ） |
+  | `wins` / `losses` / `draws` | 局数（自己対局は決着した局をすべて学習側の勝ちとして数える） |
+
+### ボーナス込みの報酬の縮め方（入玉・防御・速攻特化に共通、issue #4）
 
 - 価値の頭は tanh（−1〜1）なので、ボーナス込みの終局報酬（最大 1 + λ）と η を同じ倍率
-  s = 1 + 入玉の λ の最大 + 固めの λ の最大 で割ってから学習する（`RNaDLearner.update(reward_scale=s)`）。
+  s = 1 + 入玉の λ の最大 + 固めの λ の最大 + 速攻の λ の最大 で割ってから学習する（`RNaDLearner.update(reward_scale=s)`）。
   s は **λ の予定全体で固定**（区切りごとに変えると価値の単位が変わり、ターゲットネットの v が追いつかない）。
   ボーナスなし（本線）は s = 1 で従来と同一
 - **ログの比較**: `loss_v` は 1/s²、`v_target_mean`・`s_abs_mean` は 1/s の単位になる。s の違う run 同士は
