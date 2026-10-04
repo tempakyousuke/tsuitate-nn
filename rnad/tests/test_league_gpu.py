@@ -20,7 +20,7 @@ sys.path.insert(0, str(HERE.parent))
 import tsuitate_rl  # noqa: E402
 from export_weights import read, tiny_net, write  # noqa: E402
 from model import PolicyValueNet  # noqa: E402
-from rnad import MultiEnv, collect  # noqa: E402
+from rnad import MultiEnv, OpponentPool, collect  # noqa: E402
 
 DEV = torch.device("cpu")
 ROOT = HERE.parent.parent
@@ -59,6 +59,29 @@ def check_roundtrip():
         print("（本線の checkpoint_55000.pt / policy_55000.bin が無いので実物での突き合わせは省略）")
 
 
+def check_pool():
+    """OpponentPool の積み重ねた推論が、相手ごとに推論した結果と一致し、サンプルはマスク内に収まる"""
+    nets = {f"n{i}": tiny_net(10 + i) for i in range(3)}
+    pool = OpponentPool(nets)
+    env = tsuitate_rl.VecEnv(7, seed=8, auto_reset=False)
+    obs, mask, _ = env.observe()
+    groups = {"n0": np.array([0, 1, 2]), "n2": np.array([3, 4, 5, 6])}  # n1 は局なし（埋めるだけ）
+    m = 4
+    x = torch.zeros((3, m, *obs.shape[1:]))
+    for name, bs in groups.items():
+        x[pool.index[name], :len(bs)] = torch.from_numpy(obs[bs]).half().float()
+    with torch.no_grad():
+        stacked = pool.forward(pool.params, pool.buffers, x)
+        for name, bs in groups.items():
+            want = nets[name].eval()(torch.from_numpy(obs[bs]).half().float())[0]
+            got = stacked[pool.index[name], :len(bs)]
+            assert float((got - want).abs().max()) < 1e-4, name
+    acts = pool.sample(groups, obs, mask, DEV)
+    for name, bs in groups.items():
+        assert all(mask[b, a] for b, a in zip(bs, acts[name])), "マスク外の手を選んだ"
+    print("OK: OpponentPool の積み重ねた推論 = 相手ごとの推論、サンプルはマスク内")
+
+
 def check_collect_opponents():
     torch.manual_seed(0)
     learner = PolicyValueNet(8, 1).eval()
@@ -69,7 +92,7 @@ def check_collect_opponents():
     games = [("opp", i % 2) for i in range(6)]
     torch.manual_seed(2)
     batch = collect(MultiEnv([selfplay, league]), learner, DEV,
-                    opponents=[None] * 4 + games, opp_nets={"opp": opp})
+                    opponents=[None] * 4 + games, opp_nets=OpponentPool({"opp": opp}))
     fin = sorted(league.pop_finished(), key=lambda f: f["game_no"])
     assert len(fin) == 6
     valid, player, reward = batch["valid"], batch["player"], batch["reward"]
@@ -92,4 +115,5 @@ def check_collect_opponents():
 
 if __name__ == "__main__":
     check_roundtrip()
+    check_pool()
     check_collect_opponents()

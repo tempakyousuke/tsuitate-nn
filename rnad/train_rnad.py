@@ -31,8 +31,8 @@ from guard import summarize as summarize_guard
 from speed import summarize as summarize_speed
 from model import PolicyValueNet
 from league import League
-from rnad import (PRECISIONS, MultiEnv, RNaDConfig, RNaDLearner, cfg_diff, collect, play_match,
-                  set_precision)
+from rnad import (PRECISIONS, MultiEnv, OpponentPool, RNaDConfig, RNaDLearner, cfg_diff, collect,
+                  play_match, set_precision)
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -245,6 +245,8 @@ def main() -> None:
                     raise SystemExit(f"リーグの相手 {name} の重み {path} が無い（--league-device gpu は "
                                      "凍結版 rl_* と rl_policy:<パス> だけ）")
                 opp_nets[name] = read_weights(path).to(device).eval()
+            # 全相手を1回の推論で指させる（相手ごとに推論すると相手の数だけ直列になり速くならない）
+            opp_nets = OpponentPool(opp_nets)
         else:
             # 相手を全部ここで一度作ってみる。tsuitate_rl が古いビルドだと新しい凍結版を知らず、
             # その相手が初めて配られた更新で落ちる（2026-10-03 に rl_v23 で実際に落ちた）
