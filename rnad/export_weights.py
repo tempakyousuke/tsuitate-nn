@@ -64,6 +64,50 @@ def write(net: PolicyValueNet, path: pathlib.Path) -> None:
             f.write(t.numpy().astype("<f4").tobytes())
 
 
+def read(path) -> PolicyValueNet:
+    """`write` の逆: TSRLPV01 の重み（凍結版の `models/rl_*.bin` や `policy_<step>.bin`）を
+    `PolicyValueNet` へ読む。BatchNorm は畳み込みへ畳み込まれているので、各 BatchNorm を恒等
+    （平均 0・分散 1−eps・係数 1）にして畳み込み後のバイアスだけを持たせる。eval モードで
+    書き出し元と同じ出力になる（リーグの相手を GPU で指させるために使う。学習には使わない）"""
+    data = pathlib.Path(path).read_bytes()
+    if data[:8] != MAGIC:
+        raise ValueError(f"{path} は方策ネットの重みではない（magic 不一致）")
+    hlen = struct.unpack("<I", data[8:12])[0]
+    header = json.loads(data[12:12 + hlen])
+    off = 12 + hlen
+    ts = {}
+    for t in header["tensors"]:
+        n = int(np.prod(t["shape"]))
+        ts[t["name"]] = torch.from_numpy(
+            np.frombuffer(data, dtype="<f4", count=n, offset=off).copy()).reshape(t["shape"])
+        off += 4 * n
+    if off != len(data):
+        raise ValueError(f"{path} の長さがヘッダと合わない")
+    net = PolicyValueNet(header["channels"], header["blocks"], header["planes"])
+
+    def put(conv, bn, w, b):
+        conv.weight.copy_(w.reshape(conv.weight.shape))
+        bn.running_mean.zero_()
+        bn.running_var.fill_(1.0 - bn.eps)
+        bn.weight.fill_(1.0)
+        bn.bias.copy_(b)
+
+    with torch.no_grad():
+        put(net.stem, net.stem_bn, ts["stem.w"], ts["stem.b"])
+        for i, blk in enumerate(net.blocks):
+            put(blk.c1, blk.b1, ts[f"block{i}.c1.w"], ts[f"block{i}.c1.b"])
+            put(blk.c2, blk.b2, ts[f"block{i}.c2.w"], ts[f"block{i}.c2.b"])
+        put(net.p1, net.p1_bn, ts["p1.w"], ts["p1.b"])
+        net.p2.weight.copy_(ts["p2.w"].reshape(net.p2.weight.shape))
+        net.p2.bias.copy_(ts["p2.b"])
+        put(net.v1, net.v1_bn, ts["v1.w"], ts["v1.b"])
+        net.v_fc1.weight.copy_(ts["v_fc1.w"])
+        net.v_fc1.bias.copy_(ts["v_fc1.b"])
+        net.v_fc2.weight.copy_(ts["v_fc2.w"])
+        net.v_fc2.bias.copy_(ts["v_fc2.b"])
+    return net.eval()
+
+
 def write_test_vector(net: PolicyValueNet, path: pathlib.Path, n: int = 3, seed: int = 0) -> None:
     net.eval()
     g = torch.Generator().manual_seed(seed)

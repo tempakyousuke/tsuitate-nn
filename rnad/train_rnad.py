@@ -25,13 +25,14 @@ import numpy as np
 import torch
 
 import tsuitate_rl
+from export_weights import read as read_weights
 from export_weights import write as write_weights
 from guard import summarize as summarize_guard
 from speed import summarize as summarize_speed
 from model import PolicyValueNet
 from league import League
-from rnad import (PRECISIONS, MultiEnv, RNaDConfig, RNaDLearner, cfg_diff, collect, play_match,
-                  set_precision)
+from rnad import (PRECISIONS, MultiEnv, OpponentPool, RNaDConfig, RNaDLearner, cfg_diff, collect,
+                  play_match, set_precision)
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -155,6 +156,13 @@ def main() -> None:
     ap.add_argument("--league-window", type=int, default=512, help="相手ごとの勝率を数える直近の局数")
     ap.add_argument("--league-power", type=float, default=2.0,
                     help="相手の重み ∝ (1 − 勝率)^power。大きいほど苦手な相手へ寄せる")
+    ap.add_argument("--league-device", choices=["rust", "gpu"], default="rust",
+                    help="リーグの相手の手番をどこで指すか。rust = tsuitate_rl の評価モード（凍結版を CPU で"
+                         "1手ずつ推論。相手10体・128局で収集 約8秒）/ gpu = 相手の重みを PyTorch へ読んで学習中の"
+                         "ネットと同じ device でまとめて推論する（凍結版 rl_* と rl_policy:<パス> だけ。"
+                         "相手の行動マスクは環境の今のマスク = 新マスクになる）")
+    ap.add_argument("--frozen-models", default=str(ROOT.parent / "tsuitate-bot" / "models"),
+                    help="--league-device gpu で凍結版の重み（<名前>.bin）を探すディレクトリ")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--precision", choices=PRECISIONS, default="default",
                     help="ネットの計算精度（rnad.set_precision。default でも畳み込みは TF32 = tf32 と速さは同じ）")
@@ -227,14 +235,27 @@ def main() -> None:
     if args.league:
         league = League([n.strip() for n in args.league.split(",") if n.strip()],
                         window=args.league_window, power=args.league_power)
-        # 相手を全部ここで一度作ってみる。tsuitate_rl が古いビルドだと新しい凍結版を知らず、
-        # その相手が初めて配られた更新で落ちる（2026-10-03 に rl_v23 で実際に落ちた）
-        for name in league.names:
-            try:
-                tsuitate_rl.VecEnv(2, opponent=name, seed=0, auto_reset=False)
-            except ValueError as e:
-                raise SystemExit(f"リーグの相手 {name} を作れない: {e}。tsuitate-bot を更新して "
-                                 "tsuitate_rl を作り直す（maturin develop）") from e
+        if args.league_device == "gpu":
+            # 相手の重みを PyTorch へ読む（凍結版は --frozen-models/<名前>.bin、rl_policy:<パス> はそのパス）
+            opp_nets = {}
+            for name in league.names:
+                path = (name[len("rl_policy:"):] if name.startswith("rl_policy:")
+                        else pathlib.Path(args.frozen_models) / f"{name}.bin")
+                if not pathlib.Path(path).exists():
+                    raise SystemExit(f"リーグの相手 {name} の重み {path} が無い（--league-device gpu は "
+                                     "凍結版 rl_* と rl_policy:<パス> だけ）")
+                opp_nets[name] = read_weights(path).to(device).eval()
+            # 全相手を1回の推論で指させる（相手ごとに推論すると相手の数だけ直列になり速くならない）
+            opp_nets = OpponentPool(opp_nets)
+        else:
+            # 相手を全部ここで一度作ってみる。tsuitate_rl が古いビルドだと新しい凍結版を知らず、
+            # その相手が初めて配られた更新で落ちる（2026-10-03 に rl_v23 で実際に落ちた）
+            for name in league.names:
+                try:
+                    tsuitate_rl.VecEnv(2, opponent=name, seed=0, auto_reset=False)
+                except ValueError as e:
+                    raise SystemExit(f"リーグの相手 {name} を作れない: {e}。tsuitate-bot を更新して "
+                                     "tsuitate_rl を作り直す（maturin develop）") from e
         league_path = out / "league.json"
         if league_path.exists():
             league.load_state_dict(json.loads(league_path.read_text()))
@@ -282,7 +303,17 @@ def main() -> None:
             env_bonus = (guard_lam, speed_lam)
         envs = [env] if env is not None else []
         league_env = None
-        if league is not None and n_league:
+        league_games = None  # --league-device gpu のときの局ごとの (相手, 学習側の色)
+        if league is not None and n_league and args.league_device == "gpu":
+            # 自己対局モードの env で、相手の手番だけ相手のネットに指させる（collect の opponents）。
+            # 色は局ごとに交互（相手ごとの局数は偶数なので先後がそろう）
+            rng = np.random.default_rng(args.seed * 1_000_003 + learner.step_count)
+            names = [name for name, k in league.allocate(n_league, rng).items() for _ in range(k)]
+            league_games = [(name, i % 2) for i, name in enumerate(names)]
+            league_env = tsuitate_rl.VecEnv(n_league, seed=args.seed * 1_000_003 + learner.step_count,
+                                            auto_reset=False, **env_kwargs(guard_lam, speed_lam))
+            envs.append(league_env)
+        elif league is not None and n_league:
             # リーグの局は1つの env にまとめる（局番号 g の局は opponents[g % len] と指す。相手ごとに
             # env を分けると相手の推論が直列になる）。相手ごとの局数は偶数なので先後がそろう
             rng = np.random.default_rng(args.seed * 1_000_003 + learner.step_count)
@@ -293,10 +324,19 @@ def main() -> None:
             envs.append(league_env)
         batch = collect(MultiEnv(envs), learner.net, device,
                         nyugyoku_lambda=lam, nyugyoku_mode=args.nyugyoku_mode,
-                        nyugyoku_zero_sum=args.nyugyoku_sum == "zero")
+                        nyugyoku_zero_sum=args.nyugyoku_sum == "zero",
+                        opponents=(None if league_games is None else [None] * n_self + league_games),
+                        opp_nets=(opp_nets if league_games is not None else None))
         t1 = time.time()
         finished = env.pop_finished() if env is not None else []
         league_finished = league_env.pop_finished() if league_env is not None else []
+        if league_games is not None:
+            # 自己対局モードの env なので、どの相手・どちらの色の局かはこちらで付ける
+            # （並びの位置 = 局番号の順。collect は最初に reset するので局番号は 0 からではない）
+            league_finished = sorted(league_finished, key=lambda f: f["game_no"])
+            assert len(league_finished) == len(league_games), (len(league_finished), len(league_games))
+            for f, (name, color) in zip(league_finished, league_games):
+                f["opponent"], f["learner"] = name, color
         league_rec = league.record(league_finished) if league_env is not None else {}
         info = learner.update(batch, reward_scale=reward_scale)
         t2 = time.time()
