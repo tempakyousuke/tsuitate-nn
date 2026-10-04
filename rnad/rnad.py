@@ -472,7 +472,7 @@ class MultiEnv:
 
 
 def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode="enter",
-            nyugyoku_zero_sum=True):
+            nyugyoku_zero_sum=True, opponents=None, opp_nets=None):
     """`env`（auto_reset=False の VecEnv）の全局を1局ずつ最後まで自己対局し、学習用に並べる。
 
     戻り値の obs / legal / action / mu_a / t / b は有効なステップだけを平らにしたもの、
@@ -494,6 +494,14 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
     ゼロ和だと自己対局の両側が「前進する」と「前進させない」を同じ重みで学び、λ=1.0 を 800更新
     続けても入玉率が 2.2% で横ばいだった（arm D、2026-10-03）。非ゼロ和なら前進を止める理由は
     勝敗だけになる。R-NaD の収束保証（ゼロ和2人ゲームが前提）は外れる
+
+    `opponents`（長さ B、局ごとに None か (相手の名前, 学習側の色 0/1)）を渡すと、その局は
+    **相手を固定した局**になる（リーグの相手を GPU で指させる。`env` は自己対局モードのまま）:
+    相手の手番は `opp_nets[名前]` が同じくサンプリングで指し、**記録しない**（valid にならない）。
+    相手の手番で入った報酬（相手の手で終局した局の勝敗・ボーナス）は学習側の直前の手番へ足す
+    （Rust の評価モード `VecEnv(opponents=...)` で相手の手が学習側の step の中で進むのと同じ帰属）。
+    入玉ボーナスも学習側だけを数える。None の局は従来どおりの自己対局で、`opponents` を渡さなければ
+    結果も乱数の消費も従来と同じ
     """
     env.reset()
     B = env.num_envs
@@ -511,7 +519,20 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
             break
         obs, mask, pl = env.observe()
         idx = np.flatnonzero(alive)
+        all_idx = idx
+        opp_by = {}
+        if opponents is not None:
+            # 相手を固定した局で相手の手番のもの → 相手のネットごとに束ねる（記録しない）
+            mine = []
+            for b in all_idx:
+                o = opponents[b]
+                if o is not None and int(pl[b]) != o[1]:
+                    opp_by.setdefault(o[0], []).append(b)
+                else:
+                    mine.append(b)
+            idx = np.array(mine, dtype=np.int64)
         # 自玉の段（正規化後の行 0〜8。玉が無い = 取られた局面は -1）→ 前進段数 = 8 − 行
+        # （学習側の手番だけ。相手の玉の前進はボーナスに数えない）
         king_rows = obs[idx, KING_PLANE].any(axis=2)
         has_king = king_rows.any(axis=1)
         row = np.where(has_king, king_rows.argmax(axis=1), 8)
@@ -533,15 +554,30 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
                 if nyugyoku_zero_sum:
                     reward[last_act[b, p], b, 1 - p] -= bonus
             last_act[b, p] = t
-        a, mu = sample_actions(net, obs[idx], mask[idx], device)
         actions = np.full(B, -1, dtype=np.int64)
-        actions[idx] = a.numpy()
+        if len(idx):
+            a, mu = sample_actions(net, obs[idx], mask[idx], device)
+            actions[idx] = a.numpy()
+        for name, bs in opp_by.items():
+            bs = np.array(bs, dtype=np.int64)
+            actions[bs] = sample_actions(opp_nets[name], obs[bs], mask[bs], device)[0].numpy()
         rew, done = env.step(actions)
         valid[t, idx] = True
         player[t, idx] = torch.from_numpy(pl[idx].astype(np.int64))
         # ボーナスは過去の時刻へ足すので、この時刻の報酬は上書きでなく加算
-        reward[t] += torch.from_numpy(rew)
+        if opponents is None:
+            reward[t] += torch.from_numpy(rew)
+        else:
+            for b in all_idx:
+                o = opponents[b]
+                if o is None:
+                    reward[t, b] += torch.from_numpy(rew[b])
+                elif last_act[b, o[1]] >= 0 and rew[b, o[1]] != 0:
+                    # 学習側の列だけを、学習側の直前の手番（この時刻の手番なら t）へ
+                    reward[last_act[b, o[1]], b, o[1]] += float(rew[b, o[1]])
         outcome[done] = rew[done]
+        if not len(idx):
+            continue
         obs_l.append(torch.from_numpy(obs[idx]).half())
         legal_l.append(torch.from_numpy(mask[idx]))
         act_l.append(a)
