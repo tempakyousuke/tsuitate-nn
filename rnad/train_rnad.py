@@ -132,6 +132,9 @@ def main() -> None:
     ap.add_argument("--nyugyoku-sum", choices=["zero", "own"], default="zero",
                     help="zero = 前進した側に +λ・相手に −λ（ゼロ和）/ own = 前進した側に +λ だけ"
                          "（非ゼロ和。R-NaD の収束保証は外れる）")
+    ap.add_argument("--nyugyoku-cond", choices=["any", "win"], default="any",
+                    help="any = 節目に着くたびに付ける（勝敗によらない）/ win = その局に勝ったときだけ付ける"
+                         "（固め・速攻のボーナスとは併用できない）")
     ap.add_argument("--guard", default="",
                     help="玉の周りの固めのボーナスの λ の予定（書式は --nyugyoku と同じ。空 = 使わない）。"
                          "終局の報酬に λ × 対局を通した自玉の周りの占有率の平均を両者それぞれ足す"
@@ -187,6 +190,8 @@ def main() -> None:
     # 固定でも報酬と η にそろって掛かるので、各区間の勝敗・ボーナス・正則化の比率は変わらない。
     # loss_v は 1/s²、v_target_mean・s_abs_mean は 1/s の単位になる（s の違う run は log の reward_scale で換算）
     reward_scale = 1.0 + lam_max + guard_max + speed_max
+    if args.nyugyoku_cond == "win" and (args.guard or args.speed):
+        raise SystemExit("--nyugyoku-cond win は勝ち負けを終局の報酬の符号で見るので、--guard / --speed と併用できない")
     if args.speed_horizon < 1:
         raise SystemExit("--speed-horizon は 1 以上")
 
@@ -325,6 +330,7 @@ def main() -> None:
         batch = collect(MultiEnv(envs), learner.net, device,
                         nyugyoku_lambda=lam, nyugyoku_mode=args.nyugyoku_mode,
                         nyugyoku_zero_sum=args.nyugyoku_sum == "zero",
+                        nyugyoku_win_only=args.nyugyoku_cond == "win",
                         opponents=(None if league_games is None else [None] * n_self + league_games),
                         opp_nets=(opp_nets if league_games is not None else None))
         t1 = time.time()
@@ -342,7 +348,7 @@ def main() -> None:
         t2 = time.time()
         step = learner.step_count
         rec = {"step": step, **info, "games": len(finished),
-               "nyugyoku_lambda": lam, "nyugyoku_sum": args.nyugyoku_sum, "reward_scale": reward_scale,
+               "nyugyoku_lambda": lam, "nyugyoku_sum": args.nyugyoku_sum, "nyugyoku_cond": args.nyugyoku_cond, "reward_scale": reward_scale,
                "collect_sec": t1 - t0, "update_sec": t2 - t1}
         if args.guard:
             # 玉の周りの固めの監視値（guard.summarize）。自己対局とリーグの局は分けて出す

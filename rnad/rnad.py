@@ -519,7 +519,7 @@ class MultiEnv:
 
 
 def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode="enter",
-            nyugyoku_zero_sum=True, opponents=None, opp_nets=None):
+            nyugyoku_zero_sum=True, opponents=None, opp_nets=None, nyugyoku_win_only=False):
     """`env`（auto_reset=False の VecEnv）の全局を1局ずつ最後まで自己対局し、学習用に並べる。
 
     戻り値の obs / legal / action / mu_a / t / b は有効なステップだけを平らにしたもの、
@@ -542,6 +542,12 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
     続けても入玉率が 2.2% で横ばいだった（arm D、2026-10-03）。非ゼロ和なら前進を止める理由は
     勝敗だけになる。R-NaD の収束保証（ゼロ和2人ゲームが前提）は外れる
 
+    `nyugyoku_win_only=True` は**勝った局でだけ**入玉ボーナスを付ける: 節目に着いた時点では付けずに覚えておき、
+    終局でその側が勝っていれば、節目に着いた手番へ同じ額を足す（負け・引き分けの局では付かない）。
+    前進するたびに付ける形は「負けても玉を前に出せば得」になり、λ=4→2→1 と下げても入玉率 13〜15% のまま
+    強さが戻らなかった（2026-10-06）。勝ちを条件にすると、入玉の指し方と強さが同じ向きにそろう。
+    勝ち負けは終局の報酬の符号で見るので、固め・速攻のボーナス（負けた側にも正の値が乗りうる）とは併用しない
+
     `opponents`（長さ B、局ごとに None か (相手の名前, 学習側の色 0/1)）を渡すと、その局は
     **相手を固定した局**になる（リーグの相手を GPU で指させる。`env` は自己対局モードのまま）:
     相手の手番は `opp_nets[名前]` が同じくサンプリングで指し、**記録しない**（valid にならない）。
@@ -560,6 +566,7 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
     advance = np.zeros((B, 2), dtype=np.int64)
     last_act = np.full((B, 2), -1, dtype=np.int64)
     outcome = np.zeros((B, 2), dtype=np.float32)
+    pending = []  # nyugyoku_win_only のとき、終局まで保留する (時刻, 局, 側, ボーナス)
     for t in range(max_steps):
         alive = env.alive()
         if not alive.any():
@@ -597,9 +604,12 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
                     bonus += nyugyoku_lambda / len(GRADED_MILESTONES) * len(newly)
                 advance[b, p] = adv_now[i]
             if bonus > 0 and last_act[b, p] >= 0:
-                reward[last_act[b, p], b, p] += bonus
-                if nyugyoku_zero_sum:
-                    reward[last_act[b, p], b, 1 - p] -= bonus
+                if nyugyoku_win_only:
+                    pending.append((last_act[b, p], b, p, bonus))
+                else:
+                    reward[last_act[b, p], b, p] += bonus
+                    if nyugyoku_zero_sum:
+                        reward[last_act[b, p], b, 1 - p] -= bonus
             last_act[b, p] = t
         actions = np.full(B, -1, dtype=np.int64)
         if len(idx):
@@ -638,6 +648,11 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
         b_l.append(torch.from_numpy(idx))
     else:
         raise RuntimeError(f"{max_steps} 手で終わらない局がある")
+    for t0, b, p, bonus in pending:
+        if outcome[b, p] > 0:  # その側が勝った局だけ
+            reward[t0, b, p] += bonus
+            if nyugyoku_zero_sum:
+                reward[t0, b, 1 - p] -= bonus
     T = t + 1
     return {
         "obs": torch.cat(obs_l), "legal": torch.cat(legal_l), "action": torch.cat(act_l),
