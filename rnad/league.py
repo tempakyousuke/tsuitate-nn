@@ -4,6 +4,11 @@
 `strategy::make` が作れる名前）との対局に回す。相手ごとの勝率を学習中の対局から数え続け、
 **負けやすい相手ほど多く当てる**（重み ∝ (1 − 勝率)^power）。苦手が克服されれば自然に別の相手へ移る。
 
+`weighting="even"` は**勝率が五分前後の相手ほど多く当てる**（重み ∝ (勝率 × (1 − 勝率))^power。AlphaStar の
+PFSP の var 版）。歯が立たない相手（勝率 0.2 前後）とも楽に勝てる相手とも当たる回数が減り、勝ち負けが
+どちらにも転ぶ相手に集中する。入玉特化は hard だと勝率 0.18 の速攻特化 v2 に配分の約2割が回り、
+負け続けて学べることが少ないまま強さが横ばいだった（2026-10-07）
+
 - 勝率は相手ごとに直近 `window` 局の得点（勝 1・分 0.5・負 0）の平均を、事前の 1勝1敗で均したもの
   （まだ当たっていない相手は 0.5 から始まる）
 - 局数は先後をそろえるため2局単位で配る（評価モードの VecEnv は偶数番の局で学習側が先手）。
@@ -18,7 +23,10 @@ import numpy as np
 
 
 class League:
-    def __init__(self, names, window=512, power=2.0):
+    def __init__(self, names, window=512, power=2.0, weighting="hard"):
+        if weighting not in ("hard", "even"):
+            raise ValueError(f"weighting は hard か even（{weighting}）")
+        self.weighting = weighting
         if not names:
             raise ValueError("リーグの相手が空")
         self.names = list(names)
@@ -31,7 +39,10 @@ class League:
         return (sum(s) + 1.0) / (len(s) + 2.0)
 
     def weights(self):
-        w = np.array([(1.0 - self.win_rate(n)) ** self.power for n in self.names])
+        if self.weighting == "even":
+            w = np.array([(self.win_rate(n) * (1.0 - self.win_rate(n))) ** self.power for n in self.names])
+        else:
+            w = np.array([(1.0 - self.win_rate(n)) ** self.power for n in self.names])
         # 全部に勝ち切っても配分が消えないよう、わずかに底上げする
         w = w + 1e-3
         return w / w.sum()
@@ -67,7 +78,7 @@ class League:
                 for n, w in zip(self.names, ws)}
 
     def state_dict(self):
-        return {"names": self.names, "window": self.window, "power": self.power,
+        return {"names": self.names, "window": self.window, "power": self.power, "weighting": self.weighting,
                 "scores": {n: list(s) for n, s in self.scores.items()}}
 
     def load_state_dict(self, d):

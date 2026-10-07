@@ -41,6 +41,22 @@ def check_league():
     assert lg2.summary() == lg.summary()
     print("OK: League の重み・配分・保存")
 
+    # even: 五分の相手が一番重く、全勝・全敗の相手は軽い
+    ev = League(["a", "b", "c"], window=8, power=1.0, weighting="even")
+    ev.record([{"opponent": "a", "winner": 0, "learner": 0}] * 8
+              + [{"opponent": "b", "winner": 1, "learner": 0}] * 8
+              + [{"opponent": "c", "winner": 0, "learner": 0}] * 4 + [{"opponent": "c", "winner": 1, "learner": 0}] * 4)
+    w = dict(zip(ev.names, ev.weights()))
+    assert w["c"] > w["a"] and w["c"] > w["b"], w
+    assert abs(w["a"] - w["b"]) < 1e-9, w  # 勝率 p と 1−p は同じ重み
+    try:
+        League(["a"], weighting="x")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("未知の weighting が通った")
+    print("OK: even は五分の相手が一番重い")
+
 
 def net():
     torch.manual_seed(0)

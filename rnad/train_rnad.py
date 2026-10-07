@@ -158,7 +158,10 @@ def main() -> None:
                     help="1回の更新の局のうちリーグの相手に回す割合（残りは自己対局）")
     ap.add_argument("--league-window", type=int, default=512, help="相手ごとの勝率を数える直近の局数")
     ap.add_argument("--league-power", type=float, default=2.0,
-                    help="相手の重み ∝ (1 − 勝率)^power。大きいほど苦手な相手へ寄せる")
+                    help="相手の重み ∝ (1 − 勝率)^power（hard）/ (勝率 × (1 − 勝率))^power（even）。"
+                         "大きいほど寄せ方が強い")
+    ap.add_argument("--league-weighting", choices=["hard", "even"], default="hard",
+                    help="hard = 負けやすい相手ほど多く当てる / even = 勝率が五分前後の相手ほど多く当てる")
     ap.add_argument("--league-device", choices=["rust", "gpu"], default="rust",
                     help="リーグの相手の手番をどこで指すか。rust = tsuitate_rl の評価モード（凍結版を CPU で"
                          "1手ずつ推論。相手10体・128局で収集 約8秒）/ gpu = 相手の重みを PyTorch へ読んで学習中の"
@@ -239,7 +242,8 @@ def main() -> None:
     n_league = 0
     if args.league:
         league = League([n.strip() for n in args.league.split(",") if n.strip()],
-                        window=args.league_window, power=args.league_power)
+                        window=args.league_window, power=args.league_power,
+                        weighting=args.league_weighting)
         if args.league_device == "gpu":
             # 相手の重みを PyTorch へ読む（凍結版は --frozen-models/<名前>.bin、rl_policy:<パス> はそのパス）
             opp_nets = {}
