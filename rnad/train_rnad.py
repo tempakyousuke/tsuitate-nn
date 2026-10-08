@@ -27,6 +27,7 @@ import torch
 import tsuitate_rl
 from export_weights import read as read_weights
 from export_weights import write as write_weights
+from guard import apply_win_bonus as apply_guard_win_bonus
 from guard import summarize as summarize_guard
 from speed import summarize as summarize_speed
 from model import PolicyValueNet
@@ -142,6 +143,9 @@ def main() -> None:
                          "--league ... --league-frac 1 と組み合わせる想定")
     ap.add_argument("--guard-radius", type=int, choices=[1, 2], default=1,
                     help="占有率を数える自玉からの距離（1 = 8近傍 / 2 = 24マス）")
+    ap.add_argument("--guard-cond", choices=["any", "win"], default="any",
+                    help="any = 勝敗によらず両者に付ける（tsuitate_rl の guard_bonus）/ win = 勝った局でだけ、"
+                         "勝った側に付ける（env にはボーナスを渡さず、終局の記録から学習側で足す）")
     ap.add_argument("--speed", default="",
                     help="決着の速さのボーナスの λ の予定（書式は --nyugyoku と同じ。空 = 使わない）。"
                          "勝った側に λ × max(0, (H − 手数) / H) を足す（tsuitate_rl.VecEnv の speed_bonus。"
@@ -202,7 +206,8 @@ def main() -> None:
         # 使わないボーナスの引数は渡さない（guard_bonus / speed_bonus の無い古い tsuitate_rl でも動くように）
         kw = {}
         if args.guard:
-            kw.update(guard_bonus=guard_lam, guard_radius=args.guard_radius)
+            # 勝ち限定は env ではボーナスを付けず、終局の記録から勝った側だけに足す（apply_guard_win_bonus）
+            kw.update(guard_bonus=(guard_lam if args.guard_cond == "any" else 0.0), guard_radius=args.guard_radius)
         if args.speed:
             kw.update(speed_bonus=speed_lam, speed_horizon=args.speed_horizon, speed_sum=args.speed_sum)
         return kw
@@ -348,11 +353,13 @@ def main() -> None:
             for f, (name, color) in zip(league_finished, league_games):
                 f["opponent"], f["learner"] = name, color
         league_rec = league.record(league_finished) if league_env is not None else {}
+        if args.guard and args.guard_cond == "win" and guard_lam:
+            apply_guard_win_bonus(batch, [(0, finished), (n_self, league_finished)], guard_lam, args.guard_radius)
         info = learner.update(batch, reward_scale=reward_scale)
         t2 = time.time()
         step = learner.step_count
         rec = {"step": step, **info, "games": len(finished),
-               "nyugyoku_lambda": lam, "nyugyoku_sum": args.nyugyoku_sum, "nyugyoku_cond": args.nyugyoku_cond, "reward_scale": reward_scale,
+               "nyugyoku_lambda": lam, "nyugyoku_sum": args.nyugyoku_sum, "nyugyoku_cond": args.nyugyoku_cond, "guard_cond": args.guard_cond, "reward_scale": reward_scale,
                "collect_sec": t1 - t0, "update_sec": t2 - t1}
         if args.guard:
             # 玉の周りの固めの監視値（guard.summarize）。自己対局とリーグの局は分けて出す

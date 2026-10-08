@@ -43,3 +43,29 @@ def summarize(finished, radius=1):
         out[f"opp_{key}"] = sum(opp[key]) / len(opp[key])
         out["opp_fouls"] = sum(opp["fouls"]) / len(opp["fouls"])
     return {k: round(v, 4) for k, v in out.items()}
+
+
+def apply_win_bonus(batch, parts, lam, radius=1):
+    """**勝った局でだけ**固めのボーナスを付ける（`--guard-cond win`）。
+
+    env には guard_bonus=0 を渡して（ボーナスなしで）対局させ、終局後に `pop_finished()` の記録から
+    勝った側の占有率の平均 g を取り、その側の**最後の手番**へ λ × g を足す（Rust の guard_bonus が終局の
+    報酬に足すのと同じ位置。勝者は記録の winner で見るので、他のボーナスと併用しても判定はぶれない）。
+    負け・引き分けの局と、相手固定の局で相手が勝った局には付けない。
+    parts = [(batch の局の並びでの先頭の位置, その env の pop_finished())...]。足した局数を返す
+    """
+    key = f"guard_r{radius}"
+    valid, player, reward = batch["valid"], batch["player"], batch["reward"]
+    n = 0
+    for offset, finished in parts:
+        for j, f in enumerate(sorted(finished, key=lambda f: f["game_no"])):
+            w = f["winner"]
+            if w is None or (f.get("learner") is not None and w != f["learner"]):
+                continue
+            b = offset + j
+            steps = (valid[:, b] & (player[:, b] == w)).nonzero().squeeze(1)
+            if len(steps) == 0:
+                continue
+            reward[int(steps[-1]), b, w] += lam * float(f[key][w])
+            n += 1
+    return n
