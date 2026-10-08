@@ -16,7 +16,7 @@ import torch
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 import tsuitate_rl  # noqa: E402
-from guard import summarize  # noqa: E402
+from guard import apply_win_bonus, summarize  # noqa: E402
 from model import PolicyValueNet  # noqa: E402
 from rnad import MultiEnv, collect  # noqa: E402
 
@@ -65,6 +65,31 @@ def check_versus(**opp):
     print(f"OK: heuristic 相手 {n}局（{next(iter(opp))}=）で学習側の報酬 = 勝敗 + λ × 学習側の占有率（半径2）")
 
 
+def check_win_only():
+    """勝ち限定（apply_win_bonus）: 同じ対局で、勝った側の報酬の合計は Rust の guard_bonus（両者に付ける）と同じ、
+    負けた側・引き分けは勝敗だけ。自己対局と相手固定（opponents=）の両方"""
+    for kw, label in (({}, "自己対局"), ({"opponents": ["heuristic"] * 8}, "相手固定")):
+        n = 8 if not kw else 8
+        ref, fin_ref = run(tsuitate_rl.VecEnv(n, seed=4, auto_reset=False, guard_bonus=LAM, **kw), wrap=bool(kw))
+        win, fin = run(tsuitate_rl.VecEnv(n, seed=4, auto_reset=False, guard_bonus=0.0, **kw), wrap=bool(kw))
+        assert torch.equal(ref["action"], win["action"]), "ボーナスの付け方で対局が変わった"
+        added = apply_win_bonus(win, [(0, fin)], LAM, radius=1)
+        r_ref, r_win = ref["reward"].sum(dim=0), win["reward"].sum(dim=0)
+        winners = 0
+        for b, f in enumerate(fin):
+            w = f["winner"]
+            for side in (0, 1):
+                outcome = 0.0 if w is None else (1.0 if w == side else -1.0)
+                learner_side = f.get("learner") is None or f["learner"] == side
+                if w == side and learner_side:
+                    assert abs(float(r_win[b, side]) - float(r_ref[b, side])) < 1e-5, (label, b, side)
+                    winners += 1
+                elif learner_side:
+                    assert abs(float(r_win[b, side]) - outcome) < 1e-5, (label, b, side, float(r_win[b, side]))
+        assert winners == added and winners > 0, (winners, added)
+        print(f"OK: 勝ち限定（{label}）: 勝った {winners} 側だけ Rust の guard_bonus と同じ、負け・引き分けは勝敗だけ")
+
+
 def check_summarize():
     assert summarize([]) == {}
     common = {"near_drops": [1, 3], "near_drop_fouls": [0, 2], "near_captures": [1, 1]}
@@ -85,3 +110,4 @@ if __name__ == "__main__":
     check_versus(opponent="heuristic")
     # リーグ学習（train_rnad.py）が使う、相手を局ごとに並べる形
     check_versus(opponents=["heuristic"] * 6)
+    check_win_only()
