@@ -122,6 +122,8 @@ def main() -> None:
     ap.add_argument("--channels", type=int, default=64)
     ap.add_argument("--blocks", type=int, default=6)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--aux-truth", type=float, default=0.0,
+                    help="真実の盤面を予測する補助ヘッドの損失の重み（0 = 使わない。報酬・方策の目的は変えない）")
     ap.add_argument("--override-config", action="store_true",
                     help="再開時に checkpoint と違う設定（学習率・β など）を使うことを許す。"
                          "指定しないと設定の食い違いは停止する")
@@ -185,7 +187,7 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
 
     cfg = RNaDConfig(eta=args.eta, beta=args.beta, lr=args.lr, schedule_sizes=(args.schedule,),
-                     schedule_repeats=(1,))
+                     schedule_repeats=(1,), aux_truth=args.aux_truth)
     lam_at, lam_max = parse_lambda_schedule(args.nyugyoku, args.schedule)
     guard_at, guard_max = parse_lambda_schedule(args.guard, args.schedule)
     speed_at, speed_max = parse_lambda_schedule(args.speed, args.schedule)
@@ -341,7 +343,8 @@ def main() -> None:
                         nyugyoku_zero_sum=args.nyugyoku_sum == "zero",
                         nyugyoku_win_only=args.nyugyoku_cond == "win",
                         opponents=(None if league_games is None else [None] * n_self + league_games),
-                        opp_nets=(opp_nets if league_games is not None else None))
+                        opp_nets=(opp_nets if league_games is not None else None),
+                        truth=cfg.aux_truth > 0)
         t1 = time.time()
         finished = env.pop_finished() if env is not None else []
         league_finished = league_env.pop_finished() if league_env is not None else []
@@ -404,6 +407,7 @@ def main() -> None:
         nyugyoku = f"入玉 {rec['nyugyoku_rate']:.1%}" if finished else "入玉 -"
         print(f"step {step}: 標本 {info['samples']} {selfplay}"
               f"loss_v {info['loss_v']:.3f} nerd {info['loss_nerd']:.3f} "
+              + (f"aux {info['loss_aux']:.3f} " if "loss_aux" in info else "") +
               f"α {info['alpha']:.2f}{' [正則化更新]' if info['reg_update'] else ''} "
               f"{nyugyoku}(λ {lam}) "
               f"({t1 - t0:.1f}s + {t2 - t1:.1f}s)", flush=True)
