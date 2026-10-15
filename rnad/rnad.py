@@ -61,6 +61,28 @@ def set_precision(mode: str) -> None:
     _AMP_DTYPE = torch.bfloat16 if mode == "bf16" else None
 
 
+def forward_aux(net, aux, x: torch.Tensor):
+    """`forward` と同じだが、幹の出力を補助ヘッドにも通す: (ロジット, 価値, 補助のロジット [B, 81, 15])"""
+    if _AMP_DTYPE is None:
+        f = net.trunk(x)
+        logits, v = net.heads(f)
+        return logits, v, aux(f)
+    if x.device.type != "cuda":
+        raise RuntimeError("bf16 は CUDA でだけ使う")
+    with torch.autocast("cuda", dtype=_AMP_DTYPE):
+        f = net.trunk(x)
+        logits, v = net.heads(f)
+        a = aux(f)
+    return logits.float(), v.float(), a.float()
+
+
+def aux_truth_loss(aux_logits: torch.Tensor, truth: torch.Tensor) -> torch.Tensor:
+    """決定点ごとの補助損失 [B]: 自駒のマス（ラベル −1）を除いた交差エントロピーのマス平均"""
+    ce = F.cross_entropy(aux_logits.reshape(-1, aux_logits.shape[-1]), truth.reshape(-1),
+                         ignore_index=-1, reduction="none").view(truth.shape)
+    return ce.sum(1) / (truth >= 0).sum(1).clamp(min=1)
+
+
 def forward(net, x: torch.Tensor):
     """`net(x)` を `set_precision` の精度で回し、(ロジット, 価値) を float32 で返す"""
     if _AMP_DTYPE is None:
@@ -209,6 +231,9 @@ class RNaDConfig:
     schedule_sizes: tuple = (200,)
     schedule_repeats: tuple = (1,)
     chunk: int = 1024
+    # 真実の盤面を予測する補助ヘッドの損失の重み（0 = 使わない）。損失は1決定点あたりの
+    # 「自駒以外のマスの交差エントロピーの平均」の決定点平均（loss_v・nerd と同じく標本の平均の単位）
+    aux_truth: float = 0.0
 
 
 class RNaDLearner:
@@ -231,6 +256,15 @@ class RNaDLearner:
         self.opt = torch.optim.Adam(self.net.parameters(), lr=cfg.lr, betas=(0.0, 0.999), eps=1e-7)
         self.schedule = EntropySchedule(cfg.schedule_sizes, cfg.schedule_repeats)
         self.step_count = 0
+        # 補助ヘッドは使うときだけ作る（使わない run の checkpoint・乱数の消費は従来と同じ）
+        self.aux = None
+        self.aux_opt = None
+
+    def _ensure_aux(self):
+        if self.aux is None:
+            from model import TruthHead
+            self.aux = TruthHead(self.net.config["channels"]).to(self.device)
+            self.aux_opt = torch.optim.Adam(self.aux.parameters(), lr=self.cfg.lr, betas=(0.0, 0.999), eps=1e-7)
 
     def _chunks(self, n):
         for i in range(0, n, self.cfg.chunk):
@@ -306,21 +340,37 @@ class RNaDLearner:
         counts = [int((player_flat == 0).sum()), int((player_flat == 1).sum())]
 
         # 2回目: 勾配つきで損失を積む（チャンクごとに backward して勾配を足し合わせる）
+        use_aux = cfg.aux_truth > 0
+        if use_aux:
+            if "truth" not in batch:
+                raise ValueError("aux_truth > 0 には collect(..., truth=True) の batch が要る")
+            self._ensure_aux()
+            self.aux_opt.zero_grad(set_to_none=True)
         self.opt.zero_grad(set_to_none=True)
-        tot_v = tot_nerd = 0.0
+        tot_v = tot_nerd = tot_aux = 0.0
         for sl in self._chunks(n):
             obs = obs_all[sl].to(dev, torch.float32)
             legal = legal_all[sl].to(dev)
             act = action_all[sl].to(dev)
-            logits, v = forward(self.net, obs)
+            if use_aux:
+                logits, v, aux_logits = forward_aux(self.net, self.aux, obs)
+            else:
+                logits, v = forward(self.net, obs)
             with torch.no_grad():
                 lpr = legal_log_policy(logits, legal) - self._lpr_mix(obs, legal, alpha)
             lv, ln = loss_terms(logits, v, legal, act, player_flat[sl].to(dev), lpr,
                                 vt[sl].to(dev), s[sl].to(dev), counts, cfg.eta, cfg.beta, cfg.clip)
-            (lv + ln).backward()
+            loss = lv + ln
+            if use_aux:
+                la = aux_truth_loss(aux_logits, batch["truth"][sl].to(dev, torch.long)).sum() / n
+                loss = loss + cfg.aux_truth * la
+                tot_aux += la.item()
+            loss.backward()
             tot_v += lv.item()
             tot_nerd += ln.item()
         self.opt.step()
+        if use_aux:
+            self.aux_opt.step()
         with torch.no_grad():
             # 参照の optax.clip は更新量に掛かるが、lr=5e-5 では事実上効かないので省く
             for pt, p in zip(self.target.parameters(), self.net.parameters()):
@@ -334,11 +384,14 @@ class RNaDLearner:
         # 集めた直後に1回更新するので π_a/μ_a は本来 1。ずれは行動時と学習時の数値誤差
         # （バッチの形で変わるカーネル・精度）で、v-trace の重要度比へそのまま入る
         ratio = pi_a / batch["mu_a"]
-        return {"loss_v": tot_v, "loss_nerd": tot_nerd, "alpha": alpha,
+        out = {"loss_v": tot_v, "loss_nerd": tot_nerd, "alpha": alpha,
                 "reg_update": bool(update_reg), "samples": n,
                 "ratio_dev_mean": float((ratio - 1).abs().mean()),
                 "ratio_dev_max": float((ratio - 1).abs().max()),
                 "v_target_mean": float(vt.mean()), "s_abs_mean": float(s.abs().mean())}
+        if use_aux:
+            out["loss_aux"] = tot_aux  # 重みを掛ける前の値（決定点平均の交差エントロピー）
+        return out
 
     def state_dict(self):
         """再開に要る全部: 4つのネット・optimizer・step・設定・ネットの形・乱数状態"""
@@ -346,7 +399,9 @@ class RNaDLearner:
                 "prev": self.prev.state_dict(), "prev_": self.prev_.state_dict(),
                 "opt": self.opt.state_dict(), "step": self.step_count,
                 "cfg": dict(self.cfg.__dict__), "config": dict(self.net.config),
-                "rng": rng_state(self.device)}
+                "rng": rng_state(self.device),
+                **({"aux": self.aux.state_dict(), "aux_opt": self.aux_opt.state_dict()}
+                   if self.aux is not None else {})}
 
     def load_state_dict(self, d):
         self.net.load_state_dict(d["net"])
@@ -355,6 +410,10 @@ class RNaDLearner:
         self.prev_.load_state_dict(d["prev_"])
         self.opt.load_state_dict(d["opt"])
         self.step_count = d["step"]
+        if "aux" in d:
+            self._ensure_aux()
+            self.aux.load_state_dict(d["aux"])
+            self.aux_opt.load_state_dict(d["aux_opt"])
         if "rng" in d:
             set_rng_state(d["rng"], self.device)
 
@@ -363,14 +422,20 @@ class RNaDLearner:
         self.cfg = cfg
         for g in self.opt.param_groups:
             g["lr"] = cfg.lr
+        if self.aux_opt is not None:
+            for g in self.aux_opt.param_groups:
+                g["lr"] = cfg.lr
         self.schedule = EntropySchedule(cfg.schedule_sizes, cfg.schedule_repeats)
 
 
 def cfg_diff(saved: dict, cfg: RNaDConfig) -> dict:
-    """checkpoint の設定と今の設定の差（tuple / list の違いは無視する）"""
+    """checkpoint の設定と今の設定の差（tuple / list の違いは無視する）。
+    checkpoint に無い項目（後から足した設定）は既定値だったものとして比べる"""
     now = cfg.__dict__
+    default = RNaDConfig().__dict__
     norm = lambda v: list(v) if isinstance(v, (tuple, list)) else v  # noqa: E731
-    return {k: (saved.get(k), now[k]) for k in now if norm(saved.get(k)) != norm(now[k])}
+    return {k: (saved.get(k, default[k]), now[k]) for k in now
+            if norm(saved.get(k, default[k])) != norm(now[k])}
 
 
 def rng_state(device) -> dict:
@@ -506,6 +571,9 @@ class MultiEnv:
         parts = [e.observe() for e in self.envs]
         return tuple(np.concatenate([p[j] for p in parts]) for j in range(3))
 
+    def truth(self):
+        return np.concatenate([e.truth() for e in self.envs])
+
     def step(self, actions):
         rews, dones = [], []
         for e, a in zip(self.envs, self._split(actions)):
@@ -519,7 +587,7 @@ class MultiEnv:
 
 
 def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode="enter",
-            nyugyoku_zero_sum=True, opponents=None, opp_nets=None, nyugyoku_win_only=False):
+            nyugyoku_zero_sum=True, opponents=None, opp_nets=None, nyugyoku_win_only=False, truth=False):
     """`env`（auto_reset=False の VecEnv）の全局を1局ずつ最後まで自己対局し、学習用に並べる。
 
     戻り値の obs / legal / action / mu_a / t / b は有効なステップだけを平らにしたもの、
@@ -555,10 +623,13 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
     （Rust の評価モード `VecEnv(opponents=...)` で相手の手が学習側の step の中で進むのと同じ帰属）。
     入玉ボーナスも学習側だけを数える。None の局は従来どおりの自己対局で、`opponents` を渡さなければ
     結果も乱数の消費も従来と同じ
+
+    `truth=True` なら記録する各手番の**真実の盤面のラベル**（`VecEnv.truth()`、[N, 81] int8）を
+    `truth` に入れて返す（補助ヘッド用。乱数は消費しない）
     """
     env.reset()
     B = env.num_envs
-    obs_l, legal_l, act_l, mu_l, t_l, b_l = [], [], [], [], [], []
+    obs_l, legal_l, act_l, mu_l, t_l, b_l, truth_l = [], [], [], [], [], [], []
     valid = torch.zeros(max_steps, B, dtype=torch.bool)
     player = torch.zeros(max_steps, B, dtype=torch.long)
     reward = torch.zeros(max_steps, B, 2)
@@ -572,6 +643,7 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
         if not alive.any():
             break
         obs, mask, pl = env.observe()
+        tr = env.truth() if truth else None
         idx = np.flatnonzero(alive)
         all_idx = idx
         opp_by = {}
@@ -646,6 +718,8 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
         mu_l.append(mu)
         t_l.append(torch.full((len(idx),), t, dtype=torch.long))
         b_l.append(torch.from_numpy(idx))
+        if truth:
+            truth_l.append(torch.from_numpy(tr[idx]))
     else:
         raise RuntimeError(f"{max_steps} 手で終わらない局がある")
     for t0, b, p, bonus in pending:
@@ -654,7 +728,8 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
             if nyugyoku_zero_sum:
                 reward[t0, b, 1 - p] -= bonus
     T = t + 1
-    return {
+    extra = {"truth": torch.cat(truth_l)} if truth else {}
+    return {**extra,
         "obs": torch.cat(obs_l), "legal": torch.cat(legal_l), "action": torch.cat(act_l),
         "mu_a": torch.cat(mu_l), "t": torch.cat(t_l), "b": torch.cat(b_l),
         "valid": valid[:T], "player": player[:T], "reward": reward[:T],

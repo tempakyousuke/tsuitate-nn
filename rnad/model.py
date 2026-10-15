@@ -46,15 +46,44 @@ class PolicyValueNet(nn.Module):
         self.v_fc1 = nn.Linear(4 * 81, 128)
         self.v_fc2 = nn.Linear(128, 1)
 
-    def forward(self, x):
+    def trunk(self, x):
+        """幹（stem と残差ブロック）の出力 [B, channels, 9, 9]。補助ヘッドはここから読む"""
         x = torch.relu(self.stem_bn(self.stem(x)))
         for b in self.blocks:
             x = b(x)
+        return x
+
+    def forward(self, x):
+        return self.heads(self.trunk(x))
+
+    def heads(self, x):
+        """幹の出力 → (方策のロジット, 価値)"""
         p = torch.relu(self.p1_bn(self.p1(x)))
         logits = self.p2(p).flatten(1)  # [B, 139*81]、種類×81＋マス
         v = torch.relu(self.v1_bn(self.v1(x))).flatten(1)
         v = torch.tanh(self.v_fc2(torch.relu(self.v_fc1(v)))).squeeze(1)
         return logits, v
+
+
+NUM_TRUTH_CLASSES = 15
+
+
+class TruthHead(nn.Module):
+    """**真実の盤面を予測する補助ヘッド**（tsuitate-bot の docs/rl-deepnash-design.md「中盤の信号」の改善案1）。
+
+    幹の出力から、手番側から見た各マスの相手駒（空き + 駒種14 = 15クラス。ラベルは
+    `tsuitate_rl.VecEnv.truth()`）を予測する。学習の補助損失にだけ使い、**ネットの書き出しには入らない**
+    （`PolicyValueNet` の外に持つので、`export_weights`・Rust の推論・凍結版は変わらない）。
+    1×1 畳み込みはマスを区別しないので、マスごとのバイアス（事前）を足す
+    """
+
+    def __init__(self, channels: int = 64):
+        super().__init__()
+        self.conv = nn.Conv2d(channels, NUM_TRUTH_CLASSES, 1)
+        self.sq_bias = nn.Parameter(torch.zeros(81, NUM_TRUTH_CLASSES))
+
+    def forward(self, x):
+        return self.conv(x).flatten(2).transpose(1, 2) + self.sq_bias  # [B, 81, 15]
 
 
 def masked_logits(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
