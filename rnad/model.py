@@ -12,6 +12,9 @@ import torch
 import torch.nn as nn
 
 NUM_PLANES = 86
+# エンコーダ v2（tsuitate-bot の `rl::encode::NUM_PLANES_DEDUCED`）: v1 の 86枚の後ろに観測から確定する事実を5枚。
+# v2 の観測の前半は v1 と同じなので、v1 のネットは v2 の観測の先頭 86枚だけを読めばよい（trunk が切る）
+NUM_PLANES_DEDUCED = 91
 NUM_ACTION_KINDS = 139
 
 
@@ -47,7 +50,11 @@ class PolicyValueNet(nn.Module):
         self.v_fc2 = nn.Linear(128, 1)
 
     def trunk(self, x):
-        """幹（stem と残差ブロック）の出力 [B, channels, 9, 9]。補助ヘッドはここから読む"""
+        """幹（stem と残差ブロック）の出力 [B, channels, 9, 9]。補助ヘッドはここから読む。
+        入力のプレーンがネットより多いとき（v2 の観測を v1 のネットへ）は先頭だけを使う"""
+        planes = self.config["planes"]
+        if x.shape[1] > planes:
+            x = x[:, :planes]
         x = torch.relu(self.stem_bn(self.stem(x)))
         for b in self.blocks:
             x = b(x)

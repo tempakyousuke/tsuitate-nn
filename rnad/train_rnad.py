@@ -30,7 +30,7 @@ from export_weights import write as write_weights
 from guard import apply_win_bonus as apply_guard_win_bonus
 from guard import summarize as summarize_guard
 from speed import summarize as summarize_speed
-from model import PolicyValueNet
+from model import NUM_PLANES, PolicyValueNet
 from league import League
 from rnad import (PRECISIONS, MultiEnv, OpponentPool, RNaDConfig, RNaDLearner, cfg_diff, collect,
                   play_match, set_precision)
@@ -223,6 +223,10 @@ def main() -> None:
     else:
         init_net = load_net(args.init, args.channels, args.blocks)
     learner = RNaDLearner(init_net, cfg, device)
+    # 観測のプレーン数は学習するネットの形で決まる（v2 = 確定事実のプレーンつきの checkpoint は
+    # widen_planes.py で作る）。錨・リーグの相手が v1 のネットでも、v2 の観測の先頭が v1 なので読める
+    # （PolicyValueNet.trunk が切る）。v1 のときは引数を渡さない（planes の無い古い tsuitate_rl でも動くように）
+    obs_kw = {"planes": init_net.config["planes"]} if init_net.config["planes"] != NUM_PLANES else {}
     anchor = load_net(args.anchor, args.channels, args.blocks).to(device).eval()
     eval_gen = torch.Generator(device=device)
     eval_gen.manual_seed(args.seed + 20_000)
@@ -280,9 +284,9 @@ def main() -> None:
     n_self = args.batch - n_league
     # 自己対局の env はボーナスの λ を作るときに決めるので、λ が変わったら作り直す（下のループ）
     env_bonus = (guard_at(learner.step_count), speed_at(learner.step_count))
-    env = (tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False, **env_kwargs(*env_bonus))
+    env = (tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False, **env_kwargs(*env_bonus), **obs_kw)
            if n_self else None)
-    eval_env = tsuitate_rl.VecEnv(args.eval_games, seed=args.seed + 10_000, auto_reset=False)
+    eval_env = tsuitate_rl.VecEnv(args.eval_games, seed=args.seed + 10_000, auto_reset=False, **obs_kw)
     log = open(out / "log.jsonl", "a")
 
     def save_all():
@@ -315,7 +319,7 @@ def main() -> None:
         speed_lam = speed_at(learner.step_count)
         if env is not None and (guard_lam, speed_lam) != env_bonus:
             env = tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False,
-                                     **env_kwargs(guard_lam, speed_lam))
+                                     **env_kwargs(guard_lam, speed_lam), **obs_kw)
             env_bonus = (guard_lam, speed_lam)
         envs = [env] if env is not None else []
         league_env = None
@@ -327,7 +331,7 @@ def main() -> None:
             names = [name for name, k in league.allocate(n_league, rng).items() for _ in range(k)]
             league_games = [(name, i % 2) for i, name in enumerate(names)]
             league_env = tsuitate_rl.VecEnv(n_league, seed=args.seed * 1_000_003 + learner.step_count,
-                                            auto_reset=False, **env_kwargs(guard_lam, speed_lam))
+                                            auto_reset=False, **env_kwargs(guard_lam, speed_lam), **obs_kw)
             envs.append(league_env)
         elif league is not None and n_league:
             # リーグの局は1つの env にまとめる（局番号 g の局は opponents[g % len] と指す。相手ごとに
@@ -336,7 +340,7 @@ def main() -> None:
             opponents = [name for name, k in league.allocate(n_league, rng).items() for _ in range(k)]
             league_env = tsuitate_rl.VecEnv(n_league, opponents=opponents,
                                             seed=args.seed * 1_000_003 + learner.step_count, auto_reset=False,
-                                            **env_kwargs(guard_lam, speed_lam))
+                                            **env_kwargs(guard_lam, speed_lam), **obs_kw)
             envs.append(league_env)
         batch = collect(MultiEnv(envs), learner.net, device,
                         nyugyoku_lambda=lam, nyugyoku_mode=args.nyugyoku_mode,
