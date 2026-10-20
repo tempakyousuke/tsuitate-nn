@@ -12,8 +12,9 @@
     # 3) 腕ごとにまとめる（run のディレクトリ名の最後の `_s<seed>` を落とした名前を腕とみなす）
     python rnad/speedlab.py report lab/runs/* --threshold 300 --out lab/report.md
 
-**同じ対局条件（共通乱数）**: パネルの相手ごとに評価の env の seed と手の乱数の seed を固定するので、
-どの書き出しも同じ「相手 × 局番号」の組で測られる（ペアで比べられる）。
+**同じ対局条件（共通乱数）**: 手の乱数を (相手ごとの seed, 局番号, その局の何番目の手番か) だけで決める
+（`keyed_actions`）ので、どの書き出しも同じ「相手 × 局番号」の組で、方策が同じ手を選ぶ限り同じ局面を指す
+（ペアで比べたときの分散が減る）。
 
 パネルの相手の書き方:
 - `random`        … マスク内一様（方策の頭を 0 にしたネット。合法手から一様に選ぶ）
@@ -38,7 +39,7 @@ sys.path.insert(0, str(HERE))
 import tsuitate_rl  # noqa: E402
 from export_weights import read as read_weights  # noqa: E402
 from model import PolicyValueNet  # noqa: E402
-from rnad import play_match, sample_actions  # noqa: E402
+from rnad import play_match  # noqa: E402
 
 DEV = torch.device("cpu")
 EVAL_SEED = 777_000  # パネル評価の env の seed の基準（相手ごとに足す）
@@ -82,25 +83,57 @@ def stable_seed(*parts) -> int:
 
 
 @torch.no_grad()
+def keyed_actions(net, obs, mask, keys, salt):
+    """**局ごとに鍵を決めた** Gumbel-max のサンプリング（共通乱数）。keys = [(局の番号, その局の何番目の手番か)]。
+
+    一様乱数は (salt, 局, 手番) だけで決まり、バッチの並びや他の局の進み方に依らない。同じ局を2つの書き出しで
+    測ると、両者が同じ手を選ぶ限り同じ局面が続き、違いが出るのは方策が実際に違う手を選んだところからになる
+    （`sample_actions` は1バッチ分の乱数をまとめて引くので、どこかの局で反則が起きるだけで全局の乱数がずれる）"""
+    x = torch.from_numpy(obs).half().float()
+    logits, _ = net(x)
+    legal = torch.from_numpy(mask)
+    u = np.empty(mask.shape, dtype=np.float64)
+    for r, (g, k) in enumerate(keys):
+        u[r] = np.random.default_rng((salt, int(g), int(k))).random(mask.shape[1])
+    # Gumbel は float64 で作ってから float32 へ（u を先に float32 へ丸めると 1 に近い値が 1.0 になり、
+    # −log(−log 1) = +∞ がマスク外の −∞ と足されて NaN になる）
+    gumbel = torch.from_numpy(-np.log(-np.log(np.clip(u, 1e-300, None)))).float()
+    masked = logits.float().masked_fill(~legal, float("-inf"))
+    return (masked + gumbel).argmax(-1).numpy()
+
+
+@torch.no_grad()
 def play_vs(a_net, b: Member, games: int, seed: int, planes: int):
-    """a_net（PyTorch）と b を games 局（先後半々）。a から見た (勝, 負, 分)"""
-    gen = torch.Generator().manual_seed(seed)
+    """a_net（PyTorch）と b を games 局（偶数番の局で a が先手）。a から見た (勝, 負, 分)。
+    手は `keyed_actions`（局ごとの共通乱数）で選ぶので、同じ (b, games, seed) で測った書き出しどうしは局ごとに対になる"""
+    salt = seed
+    dec = np.zeros(games, dtype=np.int64)  # 局ごとの手番の数（反則で指し直した手番も数える）
     if b.net is not None:
         env = tsuitate_rl.VecEnv(games, seed=seed, auto_reset=False, **planes_kw(planes))
-        return play_match(env, a_net, b.net, DEV, gen)
-    # Rust の戦略が相手: 評価モード（偶数番の局で学習側が先手。相手の手番は env の中で進む）
-    env = tsuitate_rl.VecEnv(games, opponent=b.rust, seed=seed, auto_reset=False, **planes_kw(planes))
+        a_color = np.arange(games) % 2
+    else:
+        # Rust の戦略が相手: 評価モード（偶数番の局で学習側が先手。相手の手番は env の中で進む）
+        env = tsuitate_rl.VecEnv(games, opponent=b.rust, seed=seed, auto_reset=False, **planes_kw(planes))
+        a_color = None
     env.reset()
     w = l = d = 0
     while True:
         alive = env.alive()
         if not alive.any():
             break
-        obs, mask, _ = env.observe()
-        learner = env.learner_colors()
+        obs, mask, pl = env.observe()
         actions = np.full(games, -1, dtype=np.int64)
-        idx = np.flatnonzero(alive)
-        actions[idx] = sample_actions(a_net, obs[idx], mask[idx], DEV, gen)[0].numpy()
+        if a_color is None:
+            learner = env.learner_colors()
+            groups = [(a_net, np.flatnonzero(alive))]
+        else:
+            learner = a_color
+            groups = [(a_net, np.flatnonzero(alive & (pl == a_color))),
+                      (b.net, np.flatnonzero(alive & (pl != a_color)))]
+        for net, idx in groups:
+            if len(idx):
+                actions[idx] = keyed_actions(net, obs[idx], mask[idx], [(i, dec[i]) for i in idx], salt)
+        dec[alive] += 1
         rew, done = env.step(actions)
         for i in np.flatnonzero(done):
             r = rew[i, learner[i]]
