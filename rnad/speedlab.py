@@ -181,7 +181,7 @@ def fit_fixed(results, ratings, iters=100):
     """パネルの Elo を固定して、測られる側1体の Elo を最尤で求める。
     results = [(相手の名前, 勝, 負, 分)]。(Elo, 標準誤差) を返す。全勝・全敗でも発散しないよう、
     各相手に 0.5勝0.5敗の弱い事前を足す"""
-    r = 0.0
+    r = sum(ratings[name] for name, *_ in results) / len(results)  # 相手の平均から（0 からだと遠すぎて発散する）
     for _ in range(iters):
         g = h = 0.0
         for name, w, l, d in results:
@@ -191,7 +191,7 @@ def fit_fixed(results, ratings, iters=100):
             k = math.log(10) / 400
             g += k * (s - n * p)
             h += k * k * n * p * (1 - p)
-        step = g / max(h, 1e-12)
+        step = max(-200.0, min(200.0, g / max(h, 1e-12)))
         r += step
         if abs(step) < 1e-6:
             break
