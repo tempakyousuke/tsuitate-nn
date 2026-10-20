@@ -200,6 +200,12 @@ def main() -> None:
     ap.add_argument("--reuse", type=int, default=1,
                     help="1つの batch で続けて更新する回数（2 以上で標本を使い回す。2回目以降は π/μ ≠ 1 を"
                          "v-trace が補正する。正則化方策の差し替え間隔は更新回数で数える）")
+    ap.add_argument("--reset-adam", action="store_true",
+                    help="再開時に Adam の状態（モーメントと step）を捨てる。更新の式を途中で変える A/B は両腕に付ける"
+                         "（2次モーメントが古い勾配の大きさを b2 = 0.999 で何千更新も覚えているため）")
+    ap.add_argument("--lr-warmup", type=int, default=0,
+                    help="この実行の最初の N 更新で学習率を 0 から線形に上げる（--reset-adam の直後の2次モーメントは"
+                         "数回分の勾配だけから推定されて揺れるため）")
     ap.add_argument("--compact-legal", action="store_true",
                     help="batch の合法手のマスクを添字で持つ（768局で約 0.79GB → 約 11MB。更新の結果は同じ。"
                          "--pipeline で batch が2つ同時にあるときのメモリ対策）")
@@ -355,6 +361,16 @@ def main() -> None:
 
     if args.reuse < 1:
         raise SystemExit("--reuse は 1 以上")
+    if args.reset_adam:
+        learner.reset_optimizer_state()
+        print(f"Adam の状態を捨てた（step {learner.step_count} から）", flush=True)
+    warm_from = learner.step_count
+
+    def set_warmup_lr():
+        if args.lr_warmup > 0:
+            frac = min(1.0, (learner.step_count - warm_from + 1) / args.lr_warmup)
+            for g in learner.opt.param_groups:
+                g["lr"] = cfg.lr * frac
     pipe = None
     if args.pipeline:
         if league is not None or args.guard or args.speed or args.nyugyoku or cfg.aux_truth > 0:
@@ -370,7 +386,9 @@ def main() -> None:
         ema_path = out / "extra_ema.pt"
         saved = torch.load(ema_path, map_location=device) if ema_path.exists() else {}
         for tau in [float(x) for x in args.extra_ema.split(",") if x.strip()]:
-            net_ = copy.deepcopy(learner.net).eval()
+            # ターゲット（それまでの平均）から始める。現在のネットから始めると、学習の途中から付けたとき
+            # 平均が今の雑音から始まり、忘れるのに約 3/係数 更新かかる
+            net_ = copy.deepcopy(learner.target).eval()
             net_.requires_grad_(False)
             if str(tau) in saved:
                 net_.load_state_dict(saved[str(tau)])
@@ -454,6 +472,7 @@ def main() -> None:
         if args.guard and args.guard_cond == "win" and guard_lam:
             apply_guard_win_bonus(batch, [(0, finished), (n_self, league_finished)], guard_lam, args.guard_radius)
         for _ in range(args.reuse):
+            set_warmup_lr()
             info = learner.update(batch, reward_scale=reward_scale)
             update_extra_ema()
         t2 = time.time()

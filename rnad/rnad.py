@@ -402,6 +402,9 @@ class RNaDLearner:
 
         # 1回目: 勾配なしで v-trace の入力（π_a・Σπ·lpr・ターゲットの v）を作る
         pi_a = torch.zeros(n)
+        # 見張り（方策が決定的に固まっていないか。PG・1/μ の上限で NeuRD の「確率の低い手でも押し出しが消えない」
+        # 性質が弱まると、ここが先に動く）: 最善手の確率の平均・0.999 を超える決定点の数・エントロピーの和
+        top_sum = top_hi = ent_sum = 0.0
         ent = torch.zeros(n)
         v_tgt = torch.zeros(n)
         mix_cache = []  # packed のとき、チャンクごとの正則化方策の対数確率（詰めたもの。2回目で使い回す）
@@ -417,6 +420,10 @@ class RNaDLearner:
                 lpr = log_pi - mix
                 pi_a[sl] = pi.gather(1, act[:, None]).squeeze(1).cpu()
                 ent[sl] = (pi * lpr).sum(-1).cpu()
+                top = pi.max(1).values
+                top_sum += float(top.sum())
+                top_hi += float((top > 0.999).sum())
+                ent_sum += float(-(pi * log_pi).sum())
                 v_tgt[sl] = forward(self.target, obs)[1].cpu()
 
         def grid(x):
@@ -486,6 +493,7 @@ class RNaDLearner:
         # （バッチの形で変わるカーネル・精度）で、v-trace の重要度比へそのまま入る
         ratio = pi_a / batch["mu_a"]
         out = {"loss_v": tot_v, "loss_nerd": tot_nerd, "alpha": alpha,
+               "pi_top_mean": top_sum / n, "pi_top_gt_0999": top_hi / n, "entropy_mean": ent_sum / n,
                 "reg_update": bool(update_reg), "samples": n,
                 "ratio_dev_mean": float((ratio - 1).abs().mean()),
                 "ratio_dev_max": float((ratio - 1).abs().max()),
@@ -517,6 +525,14 @@ class RNaDLearner:
             self.aux_opt.load_state_dict(d["aux_opt"])
         if "rng" in d:
             set_rng_state(d["rng"], self.device)
+
+    def reset_optimizer_state(self):
+        """Adam の状態（1次・2次モーメントと step）を捨てる。**途中から更新の式を変える A/B の両腕で使う**:
+        checkpoint の2次モーメントは今の式の勾配（本線ではまれな手の 1/μ のスパイク）の大きさを覚えていて、
+        分散を減らす変更をすると実効の学習率が何千更新も小さいまま残る（b2 = 0.999。docs/rl-learning-speed.md）"""
+        self.opt.state.clear()
+        if self.aux_opt is not None:
+            self.aux_opt.state.clear()
 
     def apply_cfg(self, cfg: RNaDConfig):
         """設定を差し替える（再開時に明示的に上書きするとき。optimizer の学習率も合わせる）"""
