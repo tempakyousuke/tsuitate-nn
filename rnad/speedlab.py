@@ -60,16 +60,16 @@ def uniform_net(planes):
 class Member:
     """パネルの相手（または測られる側）。`net` があれば PyTorch で指し、無ければ Rust の戦略名"""
 
-    def __init__(self, spec, planes):
+    def __init__(self, spec, planes, device=DEV):
         name, _, path = spec.partition("=")
         self.name = name
         self.spec = spec
         self.net = None
         self.rust = None
         if path:
-            self.net = read_weights(path).eval()
+            self.net = read_weights(path).eval().to(device)
         elif name == "random":
-            self.net = uniform_net(planes)
+            self.net = uniform_net(planes).to(device)
         else:
             self.rust = name
 
@@ -82,28 +82,55 @@ def stable_seed(*parts) -> int:
     return h
 
 
+_M64 = (1 << 64) - 1
+
+
+def _i64(x):
+    """64 ビットの符号なし定数を torch の int64（2の補数）で表す"""
+    x &= _M64
+    return x - (1 << 64) if x >= (1 << 63) else x
+
+
+def _shr(z, k):
+    """int64 の論理右シフト（torch の >> は算術シフトなので上位を落とす）"""
+    return (z >> k) & ((1 << (64 - k)) - 1)
+
+
+def _splitmix(z):
+    z = z + _i64(0x9E3779B97F4A7C15)
+    z = (z ^ _shr(z, 30)) * _i64(0xBF58476D1CE4E5B9)
+    z = (z ^ _shr(z, 27)) * _i64(0x94D049BB133111EB)
+    return z ^ _shr(z, 31)
+
+
+def keyed_uniform(salt, games, decs, n_actions, device):
+    """(salt, 局, その局の何番目の手番か, 行動) だけで決まる (0, 1) の一様乱数 [行, n_actions]（splitmix64 のハッシュ。
+    CPU でも GPU でも同じ値）"""
+    g = torch.as_tensor(games, dtype=torch.int64, device=device)[:, None]
+    k = torch.as_tensor(decs, dtype=torch.int64, device=device)[:, None]
+    a = torch.arange(n_actions, dtype=torch.int64, device=device)[None, :]
+    z = _splitmix(_splitmix(_splitmix(torch.full_like(g, int(salt)) ^ g) ^ k) ^ a)
+    return (_shr(z, 11).double() + 0.5) / float(1 << 53)
+
+
 @torch.no_grad()
-def keyed_actions(net, obs, mask, keys, salt):
-    """**局ごとに鍵を決めた** Gumbel-max のサンプリング（共通乱数）。keys = [(局の番号, その局の何番目の手番か)]。
+def keyed_actions(net, obs, mask, games, decs, salt, device=DEV):
+    """**局ごとに鍵を決めた** Gumbel-max のサンプリング（共通乱数）。
 
     一様乱数は (salt, 局, 手番) だけで決まり、バッチの並びや他の局の進み方に依らない。同じ局を2つの書き出しで
     測ると、両者が同じ手を選ぶ限り同じ局面が続き、違いが出るのは方策が実際に違う手を選んだところからになる
     （`sample_actions` は1バッチ分の乱数をまとめて引くので、どこかの局で反則が起きるだけで全局の乱数がずれる）"""
-    x = torch.from_numpy(obs).half().float()
+    x = torch.from_numpy(obs).to(device).half().float()
     logits, _ = net(x)
-    legal = torch.from_numpy(mask)
-    u = np.empty(mask.shape, dtype=np.float64)
-    for r, (g, k) in enumerate(keys):
-        u[r] = np.random.default_rng((salt, int(g), int(k))).random(mask.shape[1])
-    # Gumbel は float64 で作ってから float32 へ（u を先に float32 へ丸めると 1 に近い値が 1.0 になり、
-    # −log(−log 1) = +∞ がマスク外の −∞ と足されて NaN になる）
-    gumbel = torch.from_numpy(-np.log(-np.log(np.clip(u, 1e-300, None)))).float()
+    legal = torch.from_numpy(mask).to(device)
+    u = keyed_uniform(salt, games, decs, mask.shape[1], device)
+    gumbel = (-torch.log(-torch.log(u))).float()
     masked = logits.float().masked_fill(~legal, float("-inf"))
-    return (masked + gumbel).argmax(-1).numpy()
+    return (masked + gumbel).argmax(-1).cpu().numpy()
 
 
 @torch.no_grad()
-def play_vs(a_net, b: Member, games: int, seed: int, planes: int, per_game: bool = False):
+def play_vs(a_net, b: Member, games: int, seed: int, planes: int, per_game: bool = False, device=DEV):
     """a_net（PyTorch）と b を games 局（偶数番の局で a が先手）。a から見た (勝, 負, 分)（per_game なら局番号ごとの
     結果 1 / 0 / −1 の配列）。
     手は `keyed_actions`（局ごとの共通乱数）で選ぶので、同じ (b, games, seed) で測った書き出しどうしは局ごとに対になる"""
@@ -133,7 +160,7 @@ def play_vs(a_net, b: Member, games: int, seed: int, planes: int, per_game: bool
                       (b.net, np.flatnonzero(alive & (pl != a_color)))]
         for net, idx in groups:
             if len(idx):
-                actions[idx] = keyed_actions(net, obs[idx], mask[idx], [(i, dec[i]) for i in idx], salt)
+                actions[idx] = keyed_actions(net, obs[idx], mask[idx], idx, dec[idx], salt, device)
         dec[alive] += 1
         rew, done = env.step(actions)
         for i in np.flatnonzero(done):

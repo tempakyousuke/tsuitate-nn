@@ -200,6 +200,13 @@ def main() -> None:
     ap.add_argument("--reuse", type=int, default=1,
                     help="1つの batch で続けて更新する回数（2 以上で標本を使い回す。2回目以降は π/μ ≠ 1 を"
                          "v-trace が補正する。正則化方策の差し替え間隔は更新回数で数える）")
+    ap.add_argument("--panel", default="",
+                    help="固定パネル（speedlab.py panel の JSON。レートを固定した凍結版など）で学習の途中を測る。"
+                         "結果は <out>/panel_eval.jsonl（speedlab.py report でそのまま学習曲線になる）。"
+                         "手の乱数は局ごとの鍵で決めるので、どの run・どの書き出しも同じ局の組で測られる")
+    ap.add_argument("--panel-every", type=int, default=500, help="パネルで測る間隔（更新回数。0 なら最初と最後だけ）")
+    ap.add_argument("--panel-games", type=int, default=256, help="パネルの相手1体あたりの局数（偶数）")
+    ap.add_argument("--panel-which", default="target", help="測るネット（target / current をカンマ区切り）")
     ap.add_argument("--reset-adam", action="store_true",
                     help="再開時に Adam の状態（モーメントと step）を捨てる。更新の式を途中で変える A/B は両腕に付ける"
                          "（2次モーメントが古い勾配の大きさを b2 = 0.999 で何千更新も覚えているため）")
@@ -402,10 +409,41 @@ def main() -> None:
                 for be, b in zip(net_.buffers(), learner.net.buffers()):
                     be.copy_(b)
 
+    panel = None
+    if args.panel:
+        import speedlab
+        panel = json.loads(pathlib.Path(args.panel).read_text())
+        if panel["planes"] != init_net.config["planes"]:
+            raise SystemExit(f"パネルの planes {panel['planes']} が学習するネット {init_net.config['planes']} と違う")
+        panel_members = [speedlab.Member(m, panel["planes"], device) for m in panel["members"]]
+        if args.panel_games % 2:
+            raise SystemExit("--panel-games は偶数（先後を同数にするため）")
+
+    def panel_eval(step):
+        """パネルの各相手と局ごとの結果を panel_eval.jsonl へ（speedlab.py eval と同じ形・同じ seed の決め方）"""
+        nets = {"target": learner.target, "current": learner.net}
+        with open(out / "panel_eval.jsonl", "a") as f:
+            for which in [w.strip() for w in args.panel_which.split(",") if w.strip()]:
+                t0 = time.time()
+                res = []
+                for m in panel_members:
+                    o = speedlab.play_vs(nets[which], m, args.panel_games, speedlab.EVAL_SEED + speedlab.stable_seed(m.name),
+                                         panel["planes"], per_game=True, device=device)
+                    w, l, d = int((o > 0).sum()), int((o < 0).sum()), int((o == 0).sum())
+                    res.append((m.name, w, l, d))
+                    f.write(json.dumps({"step": step, "which": which, "opponent": m.name, "w": w, "l": l, "d": d,
+                                        "games": args.panel_games, "outcomes": o.tolist()}) + "\n")
+                f.flush()
+                elo, se = speedlab.fit_fixed(res, panel["ratings"])
+                print(f"[panel] step {step} {which}: Elo {elo:.0f}±{se:.0f}（"
+                      + " ".join(f"{n} {w}-{l}-{d}" for n, w, l, d in res) + f"、{time.time() - t0:.0f}s）", flush=True)
+
     def crossed(step, every):
         """この反復（reuse 回の更新）で every の倍数をまたいだか（reuse=1 なら step % every == 0 と同じ）"""
         return every > 0 and step // every != (step - args.reuse) // every
 
+    if panel is not None and not (out / "panel_eval.jsonl").exists():
+        panel_eval(learner.step_count)  # 起点（再開でも最初の1回は測る）
     if learner.step_count == 0:
         if args.eval_every:
             evaluate(0)
@@ -551,6 +589,8 @@ def main() -> None:
                 f"{n} {s['wr']:.2f}/{s['weight']:.2f}" for n, s in rec["league"].items()), flush=True)
         if crossed(step, args.eval_every):
             evaluate(step)
+        if panel is not None and (crossed(step, args.panel_every) or step >= args.steps):
+            panel_eval(step)
         if crossed(step, args.checkpoint_every) or crossed(step, args.export_every):
             save_all()
         if crossed(step, args.export_every) or step >= args.steps:
