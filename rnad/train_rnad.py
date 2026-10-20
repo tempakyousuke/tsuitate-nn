@@ -311,6 +311,13 @@ def main() -> None:
         if diff:
             learner.apply_cfg(cfg)
             print(f"再開時に設定を上書き: {diff}")
+        else:
+            # 学習率は optimizer の状態として checkpoint に入るので、--lr-warmup / --lr-sched で下げた値のまま止めた run を
+            # そのフラグなしで再開すると、下がった学習率が黙って使われ続ける。設定の学習率へ戻す（フラグがあれば毎更新で上書き）
+            for opt_ in (learner.opt, learner.aux_opt):
+                if opt_ is not None:
+                    for g in opt_.param_groups:
+                        g["lr"] = cfg.lr
         print(f"再開: step {learner.step_count}")
         record["resumed_from_step"] = learner.step_count
         record["overridden"] = {k: list(v) for k, v in diff.items()}
@@ -363,7 +370,13 @@ def main() -> None:
     def save_all():
         save_checkpoint(learner, ck_path)
         if extra_ema:
-            torch.save({str(t): n.state_dict() for t, n in extra_ema.items()}, out / "extra_ema.pt")
+            tmp = out / "extra_ema.tmp"
+            torch.save({"step": learner.step_count, "nets": {str(t): n.state_dict() for t, n in extra_ema.items()}}, tmp)
+            tmp.replace(out / "extra_ema.pt")
+        if args.tail_avg:
+            tmp = out / "tail_avg.tmp"
+            torch.save({"step": learner.step_count, **tail}, tmp)
+            tmp.replace(out / "tail_avg.pt")
         if league is not None:
             (out / "league.json").write_text(json.dumps(league.state_dict()))
 
@@ -411,6 +424,10 @@ def main() -> None:
 
     # 段階の後半の一様な平均（--tail-avg）。α = 1 の区間（段階の後半）の更新後のネットを足し、区切りで書いて捨てる
     tail = {"sum": None, "n": 0}
+    if args.tail_avg and (out / "tail_avg.pt").exists():
+        saved_tail = torch.load(out / "tail_avg.pt", map_location="cpu")
+        if saved_tail.get("step") == learner.step_count:
+            tail.update(sum=saved_tail["sum"], n=saved_tail["n"])
 
     def update_tail(info):
         if not args.tail_avg:
@@ -418,13 +435,19 @@ def main() -> None:
         start, size = learner.schedule.position(learner.step_count - 1)
         if learner.step_count - 1 - start >= size // 2:
             with torch.no_grad():
-                vec = torch.nn.utils.parameters_to_vector(learner.net.parameters()).detach().double()
+                vec = torch.nn.utils.parameters_to_vector(learner.net.parameters()).detach().double().cpu()
                 tail["sum"] = vec if tail["sum"] is None else tail["sum"] + vec
                 tail["n"] += 1
         if info["reg_update"] and tail["n"]:
-            net_ = copy.deepcopy(learner.net).eval()
-            torch.nn.utils.vector_to_parameters((tail["sum"] / tail["n"]).float(), net_.parameters())
-            write_weights(net_, out / f"tail_{learner.step_count}.bin")
+            want = size - size // 2
+            if tail["n"] == want:
+                net_ = copy.deepcopy(learner.net).eval()
+                torch.nn.utils.vector_to_parameters((tail["sum"] / tail["n"]).float().to(device), net_.parameters())
+                write_weights(net_, out / f"tail_{learner.step_count}.bin")
+            else:
+                # 段階の途中で再開して和が引き継げなかった（後半の一部しか入っていない）ので書かない
+                print(f"[tail-avg] step {learner.step_count}: 後半 {want} 更新のうち {tail['n']} しか無いので書き出さない",
+                      flush=True)
             tail["sum"], tail["n"] = None, 0
     pipe = None
     if args.pipeline:
@@ -440,6 +463,8 @@ def main() -> None:
     if args.extra_ema:
         ema_path = out / "extra_ema.pt"
         saved = torch.load(ema_path, map_location=device) if ema_path.exists() else {}
+        # checkpoint と同じ時点に保存したものだけ使う（--extra-ema なしで回した区間をはさむと古い平均が残っている）
+        saved = saved.get("nets", {}) if saved.get("step") == learner.step_count else {}
         for tau in [float(x) for x in args.extra_ema.split(",") if x.strip()]:
             # ターゲット（それまでの平均）から始める。現在のネットから始めると、学習の途中から付けたとき
             # 平均が今の雑音から始まり、忘れるのに約 3/係数 更新かかる
@@ -566,7 +591,7 @@ def main() -> None:
         step = learner.step_count
         rec = {"step": step, **info, "games": len(finished),
                "nyugyoku_lambda": lam, "nyugyoku_sum": args.nyugyoku_sum, "nyugyoku_cond": args.nyugyoku_cond, "guard_cond": args.guard_cond, "reward_scale": reward_scale,
-               "collect_sec": t1 - t0, "update_sec": t2 - t1}
+               "collect_sec": t1 - t0, "update_sec": t2 - t1, "lr": learner.opt.param_groups[0]["lr"]}
         if pipe is not None:
             rec["collect_busy_sec"] = busy  # 別スレッドで集めるのにかかった時間（collect_sec は待った時間）
         if args.guard:

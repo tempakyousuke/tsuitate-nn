@@ -165,6 +165,8 @@ def parse_variant(spec):
     v = {"name": name, "clip": 10_000.0, "mucap": 0.0, "loss": "neurd"}
     for kv in filter(None, rest.split(",")):
         k, _, x = kv.partition("=")
+        if k not in ("clip", "mucap", "loss"):
+            raise SystemExit(f"変種の項 {k} は clip / mucap / loss のどれか")
         v[k] = x if k == "loss" else float(x)
     return v
 

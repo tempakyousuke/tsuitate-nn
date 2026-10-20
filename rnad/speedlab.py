@@ -336,7 +336,8 @@ def load_log(run: pathlib.Path):
         r = json.loads(line)
         if "eval" in r or "collect_sec" not in r:
             continue
-        games += r.get("games", 0) + r.get("league_games_n", 0)
+        league = r.get("league_games") or {}
+        games += r.get("games", 0) + sum(sum(v) if isinstance(v, (list, tuple)) else 0 for v in league.values())
         sec += r["collect_sec"] + r["update_sec"]
         cum[r["step"]] = (games, sec)
     return cum
@@ -368,10 +369,12 @@ def paired_section(arms, control, which, steps):
              "| 腕 | " + " | ".join(str(s) for s in steps if s) + " | step > 0 の全体 | 局ごとの相関 |",
              "| --- |" + " --- |" * (len([s for s in steps if s]) + 2)]
     ctrl = {seed_of(r): load_outcomes(r) for r, _, _ in arms[control]}
+    skipped = set()
     for arm, rs in sorted(arms.items()):
         if arm == control:
             continue
         per_step = {s: [] for s in steps if s}
+        per_step_seed = {}  # (step, seed) → 局ごとの差
         per_seed = {}
         corr_a, corr_b = [], []
         for run, _, _ in rs:
@@ -383,8 +386,13 @@ def paired_section(arms, control, which, steps):
                 if w != which or st == 0 or (st, w, opp) not in ctrl[sd]:
                     continue
                 c = ctrl[sd][(st, w, opp)]
+                if len(c) != len(o):
+                    # 局数が違うと局番号が対にならない（相手の seed や先後が局番号で決まる）
+                    skipped.add((arm, st, opp))
+                    continue
                 diff = ((o + 1) / 2 - (c + 1) / 2) * 100
                 per_step.setdefault(st, []).extend(diff.tolist())
+                per_step_seed.setdefault((st, sd), []).extend(diff.tolist())
                 per_seed.setdefault(sd, []).extend(diff.tolist())
                 corr_a.extend(o.tolist())
                 corr_b.extend(c.tolist())
@@ -393,7 +401,12 @@ def paired_section(arms, control, which, steps):
             if not s:
                 continue
             x = per_step.get(s, [])
-            cells.append(f"{np.mean(x):+.1f}±{np.std(x, ddof=1) / math.sqrt(len(x)):.1f}" if len(x) > 1 else "")
+            seed_means = [np.mean(v) for (st, _), v in per_step_seed.items() if st == s]
+            if len(seed_means) > 1:
+                # seed が複数あれば seed ごとの平均のばらつきから（局ごとの誤差だけでは seed の間の違いを見落とす）
+                cells.append(f"{np.mean(seed_means):+.1f}±{np.std(seed_means, ddof=1) / math.sqrt(len(seed_means)):.1f}")
+            else:
+                cells.append(f"{np.mean(x):+.1f}±{np.std(x, ddof=1) / math.sqrt(len(x)):.1f}" if len(x) > 1 else "")
         allx = [v for vs in per_seed.values() for v in vs]
         if len(per_seed) > 1:
             means = [np.mean(v) for v in per_seed.values()]
@@ -404,6 +417,10 @@ def paired_section(arms, control, which, steps):
             tot = "—"
         rho = f"{np.corrcoef(corr_a, corr_b)[0, 1]:.2f}" if len(corr_a) > 2 else "—"
         lines.append(f"| {arm} | " + " | ".join(cells) + f" | {tot} | {rho} |")
+    lines.append("")
+    lines.append("step ごとの ± は seed が2本以上なら seed ごとの平均の標準誤差、1本なら局ごとの標準誤差（その書き出しを固定したときの誤差）。")
+    if skipped:
+        lines.append(f"局数が対照と違うため比べなかった組: {len(skipped)}（腕・step・相手）")
     lines.append("")
     return lines
 
