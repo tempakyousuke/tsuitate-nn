@@ -32,8 +32,8 @@ from guard import summarize as summarize_guard
 from speed import summarize as summarize_speed
 from model import NUM_PLANES, PolicyValueNet
 from league import League
-from rnad import (PRECISIONS, MultiEnv, OpponentPool, RNaDConfig, RNaDLearner, cfg_diff, collect,
-                  play_match, set_precision)
+from rnad import (PRECISIONS, MultiEnv, OpponentPool, PipelinedCollector, RNaDConfig, RNaDLearner, cfg_diff,
+                  collect, play_match, set_precision)
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -48,11 +48,12 @@ def pick_device(name: str) -> torch.device:
     return torch.device("cpu")
 
 
-def load_net(path: str, channels: int, blocks: int, which: str = "target") -> PolicyValueNet:
+def load_net(path: str, channels: int, blocks: int, which: str = "target", planes: int = NUM_PLANES) -> PolicyValueNet:
     """模倣学習（train_bc.py）の checkpoint か、R-NaD（train_rnad.py）の checkpoint から読む。
-    R-NaD の checkpoint は `which`（既定はターゲットネット = 書き出す重みと同じ）を読む"""
+    R-NaD の checkpoint は `which`（既定はターゲットネット = 書き出す重みと同じ）を読む。
+    `none` は乱数初期化（入力のプレーン数は `planes`）"""
     if path == "none":
-        return PolicyValueNet(channels, blocks)
+        return PolicyValueNet(channels, blocks, planes)
     ck = torch.load(path, map_location="cpu")
     if "config" in ck:
         net = PolicyValueNet(ck["config"]["channels"], ck["config"]["blocks"], ck["config"]["planes"])
@@ -175,19 +176,42 @@ def main() -> None:
                          "相手の行動マスクは環境の今のマスク = 新マスクになる）")
     ap.add_argument("--frozen-models", default=str(ROOT.parent / "tsuitate-bot" / "models"),
                     help="--league-device gpu で凍結版の重み（<名前>.bin）を探すディレクトリ")
+    # ---- 学習の速さの実験（docs/rl-learning-speed.md）。どれも既定は従来と同じ
+    ap.add_argument("--packed", action="store_true",
+                    help="方策の計算を合法手に詰めて行う（数式は同じで速い。rnad.pack_legal）")
+    ap.add_argument("--target-avg", type=float, default=0.001,
+                    help="ターゲットネットの平均化係数（参照 0.001）")
+    ap.add_argument("--adam-b1", type=float, default=0.0, help="Adam の β1（参照 0）")
+    ap.add_argument("--c-vtrace", type=float, default=1.0,
+                    help="v-trace の c（参照 1.0）。1 未満は λ = c の λ-return（自己対局は集めた方策で更新するので"
+                         " π/μ ≈ 1）。目標の分散を減らす代わりに、価値の当たらない区間の信号を削る")
+    ap.add_argument("--pipeline", action="store_true",
+                    help="自己対局を別スレッドで集めて更新と重ねる（1更新遅れの方策で集める。rnad.PipelinedCollector）。"
+                         "自己対局だけ・ボーナスなし・補助ヘッドなしの設定に限る")
+    ap.add_argument("--reuse", type=int, default=1,
+                    help="1つの batch で続けて更新する回数（2 以上で標本を使い回す。2回目以降は π/μ ≠ 1 を"
+                         "v-trace が補正する。正則化方策の差し替え間隔は更新回数で数える）")
+    ap.add_argument("--export-current", action="store_true",
+                    help="書き出しの区切りで現在のネットも current_<step>.bin に書く（speedlab で測る）")
+    ap.add_argument("--threads", type=int, default=0, help="torch のスレッド数（0 = 既定）")
+    ap.add_argument("--planes", type=int, default=NUM_PLANES,
+                    help="--init none のときの入力のプレーン数（86 = v1 / 91 = v2 確定事実つき）")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--precision", choices=PRECISIONS, default="default",
                     help="ネットの計算精度（rnad.set_precision。default でも畳み込みは TF32 = tf32 と速さは同じ）")
     args = ap.parse_args()
 
     set_precision(args.precision)
+    if args.threads:
+        torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
     device = pick_device(args.device)
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
     cfg = RNaDConfig(eta=args.eta, beta=args.beta, lr=args.lr, schedule_sizes=(args.schedule,),
-                     schedule_repeats=(1,), aux_truth=args.aux_truth)
+                     schedule_repeats=(1,), aux_truth=args.aux_truth, target_avg=args.target_avg,
+                     adam_b1=args.adam_b1, c_vtrace=args.c_vtrace)
     lam_at, lam_max = parse_lambda_schedule(args.nyugyoku, args.schedule)
     guard_at, guard_max = parse_lambda_schedule(args.guard, args.schedule)
     speed_at, speed_max = parse_lambda_schedule(args.speed, args.schedule)
@@ -221,13 +245,13 @@ def main() -> None:
         # 再開: ネットの形は checkpoint から（--init には依存しない）
         init_net = PolicyValueNet(ck["config"]["channels"], ck["config"]["blocks"], ck["config"]["planes"])
     else:
-        init_net = load_net(args.init, args.channels, args.blocks)
-    learner = RNaDLearner(init_net, cfg, device)
+        init_net = load_net(args.init, args.channels, args.blocks, planes=args.planes)
+    learner = RNaDLearner(init_net, cfg, device, packed=args.packed)
     # 観測のプレーン数は学習するネットの形で決まる（v2 = 確定事実のプレーンつきの checkpoint は
     # widen_planes.py で作る）。錨・リーグの相手が v1 のネットでも、v2 の観測の先頭が v1 なので読める
     # （PolicyValueNet.trunk が切る）。v1 のときは引数を渡さない（planes の無い古い tsuitate_rl でも動くように）
     obs_kw = {"planes": init_net.config["planes"]} if init_net.config["planes"] != NUM_PLANES else {}
-    anchor = load_net(args.anchor, args.channels, args.blocks).to(device).eval()
+    anchor = load_net(args.anchor, args.channels, args.blocks, planes=init_net.config["planes"]).to(device).eval()
     eval_gen = torch.Generator(device=device)
     eval_gen.manual_seed(args.seed + 20_000)
     record = {"args": vars(args), "rnad": dict(cfg.__dict__), "net": learner.net.config}
@@ -310,8 +334,27 @@ def main() -> None:
             print(f"[eval] step {step} {which}: 錨に {w}勝{l}敗{d}分 = {rate:.3f}±{rec['ci95']:.3f}",
                   flush=True)
 
+    if args.reuse < 1:
+        raise SystemExit("--reuse は 1 以上")
+    pipe = None
+    if args.pipeline:
+        if league is not None or args.guard or args.speed or args.nyugyoku or cfg.aux_truth > 0:
+            raise SystemExit("--pipeline は自己対局だけ・ボーナスなし・補助ヘッドなしの設定で使う")
+        pipe = PipelinedCollector(
+            lambda: tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False, **obs_kw), device)
+        pipe.submit(learner.net)
+
+    def crossed(step, every):
+        """この反復（reuse 回の更新）で every の倍数をまたいだか（reuse=1 なら step % every == 0 と同じ）"""
+        return every > 0 and step // every != (step - args.reuse) // every
+
     if learner.step_count == 0:
-        evaluate(0)
+        if args.eval_every:
+            evaluate(0)
+        if args.export_current:
+            # 学習前の点（speedlab の曲線の起点）
+            write_weights(learner.target, out / "policy_0.bin")
+            write_weights(learner.net, out / "current_0.bin")
     while learner.step_count < args.steps:
         t0 = time.time()
         lam = lam_at(learner.step_count)
@@ -321,53 +364,64 @@ def main() -> None:
             env = tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False,
                                      **env_kwargs(guard_lam, speed_lam), **obs_kw)
             env_bonus = (guard_lam, speed_lam)
-        envs = [env] if env is not None else []
-        league_env = None
-        league_games = None  # --league-device gpu のときの局ごとの (相手, 学習側の色)
-        if league is not None and n_league and args.league_device == "gpu":
-            # 自己対局モードの env で、相手の手番だけ相手のネットに指させる（collect の opponents）。
-            # 色は局ごとに交互（相手ごとの局数は偶数なので先後がそろう）
-            rng = np.random.default_rng(args.seed * 1_000_003 + learner.step_count)
-            names = [name for name, k in league.allocate(n_league, rng).items() for _ in range(k)]
-            league_games = [(name, i % 2) for i, name in enumerate(names)]
-            league_env = tsuitate_rl.VecEnv(n_league, seed=args.seed * 1_000_003 + learner.step_count,
-                                            auto_reset=False, **env_kwargs(guard_lam, speed_lam), **obs_kw)
-            envs.append(league_env)
-        elif league is not None and n_league:
-            # リーグの局は1つの env にまとめる（局番号 g の局は opponents[g % len] と指す。相手ごとに
-            # env を分けると相手の推論が直列になる）。相手ごとの局数は偶数なので先後がそろう
-            rng = np.random.default_rng(args.seed * 1_000_003 + learner.step_count)
-            opponents = [name for name, k in league.allocate(n_league, rng).items() for _ in range(k)]
-            league_env = tsuitate_rl.VecEnv(n_league, opponents=opponents,
-                                            seed=args.seed * 1_000_003 + learner.step_count, auto_reset=False,
-                                            **env_kwargs(guard_lam, speed_lam), **obs_kw)
-            envs.append(league_env)
-        batch = collect(MultiEnv(envs), learner.net, device,
-                        nyugyoku_lambda=lam, nyugyoku_mode=args.nyugyoku_mode,
-                        nyugyoku_zero_sum=args.nyugyoku_sum == "zero",
-                        nyugyoku_win_only=args.nyugyoku_cond == "win",
-                        opponents=(None if league_games is None else [None] * n_self + league_games),
-                        opp_nets=(opp_nets if league_games is not None else None),
-                        truth=cfg.aux_truth > 0)
-        t1 = time.time()
-        finished = env.pop_finished() if env is not None else []
-        league_finished = league_env.pop_finished() if league_env is not None else []
-        if league_games is not None:
-            # 自己対局モードの env なので、どの相手・どちらの色の局かはこちらで付ける
-            # （並びの位置 = 局番号の順。collect は最初に reset するので局番号は 0 からではない）
-            league_finished = sorted(league_finished, key=lambda f: f["game_no"])
-            assert len(league_finished) == len(league_games), (len(league_finished), len(league_games))
-            for f, (name, color) in zip(league_finished, league_games):
-                f["opponent"], f["learner"] = name, color
+        if pipe is not None:
+            # 前の反復で頼んだ batch（1更新前のネットで集めたもの）を受け取り、今のネットで次を頼む
+            batch, finished, busy = pipe.result()
+            pipe.submit(learner.net)
+            league_env = None
+            league_finished = []
+            t1 = time.time()
+        else:
+            envs = [env] if env is not None else []
+            league_env = None
+            league_games = None  # --league-device gpu のときの局ごとの (相手, 学習側の色)
+            if league is not None and n_league and args.league_device == "gpu":
+                # 自己対局モードの env で、相手の手番だけ相手のネットに指させる（collect の opponents）。
+                # 色は局ごとに交互（相手ごとの局数は偶数なので先後がそろう）
+                rng = np.random.default_rng(args.seed * 1_000_003 + learner.step_count)
+                names = [name for name, k in league.allocate(n_league, rng).items() for _ in range(k)]
+                league_games = [(name, i % 2) for i, name in enumerate(names)]
+                league_env = tsuitate_rl.VecEnv(n_league, seed=args.seed * 1_000_003 + learner.step_count,
+                                                auto_reset=False, **env_kwargs(guard_lam, speed_lam), **obs_kw)
+                envs.append(league_env)
+            elif league is not None and n_league:
+                # リーグの局は1つの env にまとめる（局番号 g の局は opponents[g % len] と指す。相手ごとに
+                # env を分けると相手の推論が直列になる）。相手ごとの局数は偶数なので先後がそろう
+                rng = np.random.default_rng(args.seed * 1_000_003 + learner.step_count)
+                opponents = [name for name, k in league.allocate(n_league, rng).items() for _ in range(k)]
+                league_env = tsuitate_rl.VecEnv(n_league, opponents=opponents,
+                                                seed=args.seed * 1_000_003 + learner.step_count, auto_reset=False,
+                                                **env_kwargs(guard_lam, speed_lam), **obs_kw)
+                envs.append(league_env)
+            batch = collect(MultiEnv(envs), learner.net, device,
+                            nyugyoku_lambda=lam, nyugyoku_mode=args.nyugyoku_mode,
+                            nyugyoku_zero_sum=args.nyugyoku_sum == "zero",
+                            nyugyoku_win_only=args.nyugyoku_cond == "win",
+                            opponents=(None if league_games is None else [None] * n_self + league_games),
+                            opp_nets=(opp_nets if league_games is not None else None),
+                            truth=cfg.aux_truth > 0)
+            t1 = time.time()
+            finished = env.pop_finished() if env is not None else []
+            league_finished = league_env.pop_finished() if league_env is not None else []
+            if league_games is not None:
+                # 自己対局モードの env なので、どの相手・どちらの色の局かはこちらで付ける
+                # （並びの位置 = 局番号の順。collect は最初に reset するので局番号は 0 からではない）
+                league_finished = sorted(league_finished, key=lambda f: f["game_no"])
+                assert len(league_finished) == len(league_games), (len(league_finished), len(league_games))
+                for f, (name, color) in zip(league_finished, league_games):
+                    f["opponent"], f["learner"] = name, color
         league_rec = league.record(league_finished) if league_env is not None else {}
         if args.guard and args.guard_cond == "win" and guard_lam:
             apply_guard_win_bonus(batch, [(0, finished), (n_self, league_finished)], guard_lam, args.guard_radius)
-        info = learner.update(batch, reward_scale=reward_scale)
+        for _ in range(args.reuse):
+            info = learner.update(batch, reward_scale=reward_scale)
         t2 = time.time()
         step = learner.step_count
         rec = {"step": step, **info, "games": len(finished),
                "nyugyoku_lambda": lam, "nyugyoku_sum": args.nyugyoku_sum, "nyugyoku_cond": args.nyugyoku_cond, "guard_cond": args.guard_cond, "reward_scale": reward_scale,
                "collect_sec": t1 - t0, "update_sec": t2 - t1}
+        if pipe is not None:
+            rec["collect_busy_sec"] = busy  # 別スレッドで集めるのにかかった時間（collect_sec は待った時間）
         if args.guard:
             # 玉の周りの固めの監視値（guard.summarize）。自己対局とリーグの局は分けて出す
             # （リーグの局は相手側の反則数 opp_fouls が見える = この戦法の狙いどおりか）
@@ -415,7 +469,7 @@ def main() -> None:
               f"α {info['alpha']:.2f}{' [正則化更新]' if info['reg_update'] else ''} "
               f"{nyugyoku}(λ {lam}) "
               f"({t1 - t0:.1f}s + {t2 - t1:.1f}s)", flush=True)
-        if args.guard and step % 10 == 0:
+        if args.guard and crossed(step, 10):
             g = rec.get("guard_league") or rec.get("guard_self") or {}
             key = f"guard_r{args.guard_radius}"
             if g:
@@ -423,7 +477,7 @@ def main() -> None:
                       f"検知 {g['near_drop_fouls']:.2f} 反則 {g['fouls']:.2f}"
                       + (f" / 相手 占有率 {g['opp_' + key]:.3f} 反則 {g['opp_fouls']:.2f}"
                          if "opp_fouls" in g else ""), flush=True)
-        if args.speed and step % 10 == 0:
+        if args.speed and crossed(step, 10):
             parts = []
             for label, key in (("自己対局", "speed_self"), ("リーグ", "speed_league")):
                 sp = rec.get(key) or {}
@@ -432,15 +486,20 @@ def main() -> None:
                                  f"詰み {sp['win_mate']:.0%}")
             if parts:
                 print(f"  速攻（λ {speed_lam}）: " + " / ".join(parts), flush=True)
-        if league is not None and step % 10 == 0:
+        if league is not None and crossed(step, 10):
             print("  リーグ（勝率/重み）: " + "  ".join(
                 f"{n} {s['wr']:.2f}/{s['weight']:.2f}" for n, s in rec["league"].items()), flush=True)
-        if step % args.eval_every == 0:
+        if crossed(step, args.eval_every):
             evaluate(step)
-        if step % args.checkpoint_every == 0 or step % args.export_every == 0:
+        if crossed(step, args.checkpoint_every) or crossed(step, args.export_every):
             save_all()
-        if step % args.export_every == 0 or step == args.steps:
+        if crossed(step, args.export_every) or step >= args.steps:
             write_weights(learner.target, out / f"policy_{step}.bin")
+            if args.export_current:
+                write_weights(learner.net, out / f"current_{step}.bin")
+    if pipe is not None:
+        pipe.result()  # 最後に頼んだ batch は使わずに捨てる
+        pipe.close()
     save_all()
 
 

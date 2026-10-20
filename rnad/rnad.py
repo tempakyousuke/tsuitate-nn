@@ -18,6 +18,9 @@
 
 import copy
 import math
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -106,6 +109,28 @@ def legal_log_policy(logits: torch.Tensor, legal: torch.Tensor) -> torch.Tensor:
 def legal_policy(logits: torch.Tensor, legal: torch.Tensor) -> torch.Tensor:
     """マスク内の softmax。マスク外は 0"""
     return logits.masked_fill(~legal, float("-inf")).softmax(-1)
+
+
+def pack_legal(legal: torch.Tensor, action: torch.Tensor):
+    """合法手だけを左に詰めた添字 (idx [n, K], 詰めたマスク [n, K], 選んだ手の詰めた位置 [n])。K は行ごとの合法手数の最大。
+
+    方策の計算（マスク内の softmax・NeuRD の損失）はマスク内の手しか使わないので、11,259 手の配列の代わりに
+    `logits.gather(1, idx)` の [n, K] で同じ値・同じ勾配になる（合法手は平均 約45・最大 約180 手）。
+    `RNaDLearner(packed=True)` が使う。並びは行ごとに行動番号の昇順（nonzero が行優先で返すため）
+    """
+    n = legal.shape[0]
+    counts = legal.sum(1)
+    k = int(counts.max())
+    rows, cols = legal.nonzero(as_tuple=True)
+    pos = torch.arange(len(rows), device=legal.device) - (torch.cumsum(counts, 0) - counts)[rows]
+    idx = torch.zeros(n, k, dtype=torch.long, device=legal.device)
+    idx[rows, pos] = cols
+    pmask = torch.zeros(n, k, dtype=torch.bool, device=legal.device)
+    pmask[rows, pos] = True
+    apos = ((idx == action[:, None]) & pmask).to(torch.uint8).argmax(1)
+    if not bool((idx.gather(1, apos[:, None]).squeeze(1) == action).all()):
+        raise ValueError("マスク外の手が batch にある")
+    return idx, pmask, apos
 
 
 # ---------------------------------------------------------------- 正則化の繰り返し
@@ -234,6 +259,8 @@ class RNaDConfig:
     # 真実の盤面を予測する補助ヘッドの損失の重み（0 = 使わない）。損失は1決定点あたりの
     # 「自駒以外のマスの交差エントロピーの平均」の決定点平均（loss_v・nerd と同じく標本の平均の単位）
     aux_truth: float = 0.0
+    # Adam の1次モーメントの係数（参照は 0 = モーメンタムなし）。学習の速さの実験用（docs/rl-learning-speed.md）
+    adam_b1: float = 0.0
 
 
 class RNaDLearner:
@@ -243,9 +270,13 @@ class RNaDLearner:
     アフィン変換として学習する）。行動・学習・評価で統計が変わらないようにするため。
     """
 
-    def __init__(self, net, cfg: RNaDConfig, device):
+    def __init__(self, net, cfg: RNaDConfig, device, packed: bool = False):
         self.cfg = cfg
         self.device = device
+        # packed = 方策の計算を合法手に詰めて行い、正則化方策の対数確率を1回目から2回目へ持ち越す
+        # （`pack_legal`）。**数式は同じ**（浮動小数の足し順が違うだけ）で、2回目の prev / prev_ の
+        # 順伝播と [n, 11259] の要素演算がなくなる。設定（cfg）には入れない = checkpoint の互換に影響しない
+        self.packed = packed
         self.net = net.to(device).eval()
         self.target = copy.deepcopy(self.net).eval()
         self.prev = copy.deepcopy(self.net).eval()
@@ -253,7 +284,7 @@ class RNaDLearner:
         for m in (self.target, self.prev, self.prev_):
             m.requires_grad_(False)
         # 参照: adam(b1=0, b2=0.999, eps=1e-7) → scale(-lr) → clip(clip_gradient)
-        self.opt = torch.optim.Adam(self.net.parameters(), lr=cfg.lr, betas=(0.0, 0.999), eps=1e-7)
+        self.opt = torch.optim.Adam(self.net.parameters(), lr=cfg.lr, betas=(cfg.adam_b1, 0.999), eps=1e-7)
         self.schedule = EntropySchedule(cfg.schedule_sizes, cfg.schedule_repeats)
         self.step_count = 0
         # 補助ヘッドは使うときだけ作る（使わない run の checkpoint・乱数の消費は従来と同じ）
@@ -270,11 +301,23 @@ class RNaDLearner:
         for i in range(0, n, self.cfg.chunk):
             yield slice(i, min(i + self.cfg.chunk, n))
 
-    def _lpr_mix(self, obs, legal, alpha):
-        """正則化方策の対数確率（2つの前の版の α 混合）"""
-        lp_prev = legal_log_policy(forward(self.prev, obs)[0], legal)
-        lp_prev_ = legal_log_policy(forward(self.prev_, obs)[0], legal)
+    def _lpr_mix(self, obs, legal, alpha, sel=None):
+        """正則化方策の対数確率（2つの前の版の α 混合）。`sel` はロジットを詰める関数（packed のとき）"""
+        sel = sel or (lambda x: x)
+        lp_prev = legal_log_policy(sel(forward(self.prev, obs)[0]), legal)
+        lp_prev_ = legal_log_policy(sel(forward(self.prev_, obs)[0]), legal)
         return alpha * lp_prev + (1 - alpha) * lp_prev_
+
+    def _chunk_view(self, batch, sl):
+        """チャンクの (観測, マスク, 行動, ロジットを選ぶ関数)。packed なら合法手に詰めたもの"""
+        dev = self.device
+        obs = batch["obs"][sl].to(dev, torch.float32)
+        legal = batch["legal"][sl].to(dev)
+        act = batch["action"][sl].to(dev)
+        if not self.packed:
+            return obs, legal, act, (lambda x: x)
+        idx, pmask, apos = pack_legal(legal, act)
+        return obs, pmask, apos, (lambda x: x.gather(1, idx))
 
     def update(self, batch, reward_scale=1.0):
         """batch（`collect` の戻り値）で1回更新する。ログ用の dict を返す。
@@ -296,10 +339,7 @@ class RNaDLearner:
             cfg = replace(cfg, eta=cfg.eta / reward_scale)
             batch = {**batch, "reward": batch["reward"] / reward_scale}
         alpha, update_reg = self.schedule(self.step_count)
-        obs_all = batch["obs"]
-        legal_all = batch["legal"]
-        action_all = batch["action"]
-        n = len(action_all)
+        n = len(batch["action"])
         t_idx, b_idx = batch["t"], batch["b"]
         T, B = batch["valid"].shape
 
@@ -307,15 +347,17 @@ class RNaDLearner:
         pi_a = torch.zeros(n)
         ent = torch.zeros(n)
         v_tgt = torch.zeros(n)
+        mix_cache = []  # packed のとき、チャンクごとの正則化方策の対数確率（詰めたもの。2回目で使い回す）
         with torch.no_grad():
             for sl in self._chunks(n):
-                obs = obs_all[sl].to(dev, torch.float32)
-                legal = legal_all[sl].to(dev)
-                act = action_all[sl].to(dev)
-                logits, _ = forward(self.net, obs)
+                obs, legal, act, sel = self._chunk_view(batch, sl)
+                logits = sel(forward(self.net, obs)[0])
                 log_pi = legal_log_policy(logits, legal)
                 pi = log_pi.exp() * legal
-                lpr = log_pi - self._lpr_mix(obs, legal, alpha)
+                mix = self._lpr_mix(obs, legal, alpha, sel)
+                if self.packed:
+                    mix_cache.append(mix)
+                lpr = log_pi - mix
                 pi_a[sl] = pi.gather(1, act[:, None]).squeeze(1).cpu()
                 ent[sl] = (pi * lpr).sum(-1).cpu()
                 v_tgt[sl] = forward(self.target, obs)[1].cpu()
@@ -348,16 +390,16 @@ class RNaDLearner:
             self.aux_opt.zero_grad(set_to_none=True)
         self.opt.zero_grad(set_to_none=True)
         tot_v = tot_nerd = tot_aux = 0.0
-        for sl in self._chunks(n):
-            obs = obs_all[sl].to(dev, torch.float32)
-            legal = legal_all[sl].to(dev)
-            act = action_all[sl].to(dev)
+        for ci, sl in enumerate(self._chunks(n)):
+            obs, legal, act, sel = self._chunk_view(batch, sl)
             if use_aux:
                 logits, v, aux_logits = forward_aux(self.net, self.aux, obs)
             else:
                 logits, v = forward(self.net, obs)
+            logits = sel(logits)
             with torch.no_grad():
-                lpr = legal_log_policy(logits, legal) - self._lpr_mix(obs, legal, alpha)
+                mix = mix_cache[ci] if self.packed else self._lpr_mix(obs, legal, alpha)
+                lpr = legal_log_policy(logits, legal) - mix
             lv, ln = loss_terms(logits, v, legal, act, player_flat[sl].to(dev), lpr,
                                 vt[sl].to(dev), s[sl].to(dev), counts, cfg.eta, cfg.beta, cfg.clip)
             loss = lv + ln
@@ -422,6 +464,7 @@ class RNaDLearner:
         self.cfg = cfg
         for g in self.opt.param_groups:
             g["lr"] = cfg.lr
+            g["betas"] = (cfg.adam_b1, g["betas"][1])
         if self.aux_opt is not None:
             for g in self.aux_opt.param_groups:
                 g["lr"] = cfg.lr
@@ -735,6 +778,53 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
         "valid": valid[:T], "player": player[:T], "reward": reward[:T],
         "entered": entered, "advance": advance, "outcome": outcome,
     }
+
+
+class PipelinedCollector:
+    """自己対局を**別スレッドで集めて更新と重ねる**（`train_rnad.py --pipeline`。docs/rl-learning-speed.md）。
+
+    `submit(net)` の時点のネットの写しで次の batch を集め始め、`result()` で受け取る。学習ループは
+    「batch を受け取る → 今のネットで次の batch を頼む → 受け取った batch で更新」と回すので、
+    **batch は1更新前の方策で集めたもの**になる（π/μ ≠ 1。v-trace の重要度比がそのまま補正する）。
+    自己対局（Rust の env と行動の推論）と更新（ネットの順伝播・逆伝播）が重なるぶん、1更新の壁時計が
+    「自己対局 + 更新」から「大きいほう」へ縮む（GPU では自己対局の大半が CPU 側の env なので重なる）。
+
+    env は Python のスレッドをまたげない（VecEnv は unsendable）ので、集める側のスレッドの中で作って持つ。
+    行動のサンプリングは torch の大域の乱数を使うので、スレッドの割り込み方で乱数列が変わり、
+    run は再現しない（`--pipeline` なしの run は従来どおり再現する）
+    """
+
+    def __init__(self, env_factory, device, **collect_kw):
+        self.env_factory = env_factory
+        self.device = device
+        self.collect_kw = collect_kw
+        self.local = threading.local()
+        self.pool = ThreadPoolExecutor(max_workers=1)
+        self.future = None
+
+    def _work(self, net):
+        if not hasattr(self.local, "env"):
+            self.local.env = self.env_factory()
+        t0 = time.time()
+        batch = collect(self.local.env, net, self.device, **self.collect_kw)
+        finished = self.local.env.pop_finished()
+        return batch, finished, time.time() - t0
+
+    def submit(self, net):
+        if self.future is not None:
+            raise RuntimeError("前の batch を受け取る前に次を頼んだ")
+        snap = copy.deepcopy(net).eval()
+        snap.requires_grad_(False)
+        self.future = self.pool.submit(self._work, snap)
+
+    def result(self):
+        """(batch, 終局した局, 集めるのにかかった秒)"""
+        out = self.future.result()
+        self.future = None
+        return out
+
+    def close(self):
+        self.pool.shutdown(wait=True)
 
 
 @torch.no_grad()
