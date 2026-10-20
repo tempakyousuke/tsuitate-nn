@@ -310,11 +310,16 @@ def load_eval(run: pathlib.Path, ratings):
     path = run / "panel_eval.jsonl"
     if not path.exists():
         return {}
+    seen = {}
     for line in path.read_text().splitlines():
         r = json.loads(line)
         if r["opponent"] not in ratings:
             continue
-        by.setdefault((r["step"], r["which"]), []).append((r["opponent"], r["w"], r["l"], r["d"]))
+        # 同じ (step, ネット, 相手) が2回書かれていたら（eval を並べて回したときなど）後のほうだけ使う
+        # （両方数えるとその相手だけ重みが倍になり Elo がずれる）
+        seen[(r["step"], r["which"], r["opponent"])] = (r["opponent"], r["w"], r["l"], r["d"])
+    for (step, which, _), res in seen.items():
+        by.setdefault((step, which), []).append(res)
     out = {}
     for key, res in by.items():
         elo, se = fit_fixed(res, ratings)
