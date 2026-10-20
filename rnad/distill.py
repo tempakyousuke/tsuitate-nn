@@ -75,6 +75,7 @@ def main():
     ap.add_argument("--value-weight", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--threads", type=int, default=0)
+    ap.add_argument("--cache", default="", help="先生の自己対局の決定点を保存・再利用するファイル")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     if args.threads:
@@ -83,7 +84,13 @@ def main():
     teacher = read_weights(args.teacher).eval()
     planes = teacher.config["planes"]
     t0 = time.time()
-    obs_l, idx_l, pm_l, lp_l, v_l = gather(teacher, args.games, args.seed + 1)
+    cache = pathlib.Path(args.cache) if args.cache else None
+    if cache is not None and cache.exists():
+        obs_l, idx_l, pm_l, lp_l, v_l = torch.load(cache)
+    else:
+        obs_l, idx_l, pm_l, lp_l, v_l = gather(teacher, args.games, args.seed + 1)
+        if cache is not None:
+            torch.save((obs_l, idx_l, pm_l, lp_l, v_l), cache)
     # 手番ごとにバッチの幅（合法手の数の最大）が違うので、決定点を平らにして幅を揃える
     k = max(p.shape[1] for p in pm_l)
 
@@ -101,9 +108,10 @@ def main():
     student = PolicyValueNet(args.channels, args.blocks, planes).eval()
     opt = torch.optim.Adam(student.parameters(), lr=args.lr)
     perm_gen = torch.Generator().manual_seed(args.seed)
-    n_val = n // 20
-    val = torch.arange(n_val)  # 先頭 5% を検証（局をまたいで混ざるが、蒸留の進み具合を見るだけ）
-    tr = torch.arange(n_val, n)
+    # 無作為な 5% を検証にする（決定点は手番の順に並んでいるので、先頭を取ると序盤の局面だけになる。
+    # 同じ局の決定点が学習側と混ざるが、蒸留の進み具合を見るだけ）
+    shuffled = torch.randperm(n, generator=torch.Generator().manual_seed(args.seed + 7))
+    val, tr = shuffled[: n // 20], shuffled[n // 20:]
     steps = 0
     total = args.epochs * (len(tr) // args.batch)
     for ep in range(args.epochs):

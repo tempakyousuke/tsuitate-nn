@@ -4,7 +4,7 @@
 学習中の錨（train_rnad.py の eval_vs_anchor）は run ごとに相手が違い、錨が強くなると分解能も無くなるので、
 方式どうしの比較には使わない。
 
-    # 1) パネルを作る（相手どうしの総当たりで Elo を決める。乱数方策 = 0 に固定）
+    # 1) パネルを作る（相手どうしの総当たりで Elo を決める。--fix の相手を固定。既定は乱数方策 = 0）
     python rnad/speedlab.py panel --out lab/panel.json \\
         --member random --member heuristic --member ref75=lab/runs/ref/current_75.bin ...
     # 2) run の書き出し（policy_<step>.bin = ターゲット、current_<step>.bin = 現在のネット）をパネルで測る
@@ -138,9 +138,9 @@ def fit_fixed(results, ratings, iters=100):
     return r, 1.0 / math.sqrt(max(h, 1e-12))
 
 
-def fit_round_robin(names, pairs, fixed="random", iters=500):
-    """総当たりの結果 {(a, b): (a の勝, 負, 分)} から全員の Elo（`fixed` を 0 に固定）"""
-    r = {n: 0.0 for n in names}
+def fit_round_robin(names, pairs, fixed="random", iters=500, fixed_value=0.0):
+    """総当たりの結果 {(a, b): (a の勝, 負, 分)} から全員の Elo（`fixed` を `fixed_value` に固定）"""
+    r = {n: fixed_value for n in names}
     k = math.log(10) / 400
     for _ in range(iters):
         delta = 0.0
@@ -171,8 +171,9 @@ def fit_round_robin(names, pairs, fixed="random", iters=500):
 def cmd_panel(args):
     members = [Member(s, args.planes) for s in args.member]
     names = [m.name for m in members]
-    if "random" not in names:
-        raise SystemExit("パネルには random（Elo 0 の基準）を入れる")
+    fixed, _, value = args.fix.partition("=")
+    if fixed not in names:
+        raise SystemExit(f"--fix の {fixed} がパネルにいない")
     pairs = {}
     for i, a in enumerate(members):
         for b in members[i + 1:]:
@@ -183,8 +184,8 @@ def cmd_panel(args):
             w, l, d = play_vs(x.net, y, args.games, stable_seed("panel", x.name, y.name), args.planes)
             pairs[(x.name, y.name)] = (w, l, d)
             print(f"{x.name} 対 {y.name}: {w}勝{l}敗{d}分（{time.time() - t0:.0f}s）", flush=True)
-    ratings = fit_round_robin(names, pairs)
-    out = {"planes": args.planes, "games": args.games, "members": args.member,
+    ratings = fit_round_robin(names, pairs, fixed=fixed, fixed_value=float(value or 0))
+    out = {"planes": args.planes, "games": args.games, "members": args.member, "fix": args.fix,
            "ratings": ratings, "pairs": {f"{a}|{b}": v for (a, b), v in pairs.items()}}
     pathlib.Path(args.out).write_text(json.dumps(out, indent=2, ensure_ascii=False))
     for n in sorted(names, key=lambda n: ratings[n]):
@@ -408,6 +409,8 @@ def main():
     p.add_argument("--member", action="append", required=True)
     p.add_argument("--games", type=int, default=128)
     p.add_argument("--planes", type=int, default=91)
+    p.add_argument("--fix", default="random=0",
+                   help="Elo を固定する相手と値（例 rl_v15=1338.9 で凍結版のレート表 ratings/ratings.json の尺度に合わせる）")
     p.add_argument("--out", required=True)
     p = sub.add_parser("eval", help="run の書き出しをパネルで測る（済んだものは飛ばす）")
     p.add_argument("runs", nargs="+")
