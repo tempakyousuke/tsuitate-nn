@@ -16,6 +16,7 @@ R-NaD の損失で1ステップ。学習の進み具合は**錨（既定は模�
 """
 
 import argparse
+import copy
 import json
 import pathlib
 import time
@@ -199,6 +200,10 @@ def main() -> None:
     ap.add_argument("--reuse", type=int, default=1,
                     help="1つの batch で続けて更新する回数（2 以上で標本を使い回す。2回目以降は π/μ ≠ 1 を"
                          "v-trace が補正する。正則化方策の差し替え間隔は更新回数で数える）")
+    ap.add_argument("--extra-ema", default="",
+                    help="学習には使わない追加の指数移動平均（カンマ区切りの係数、例 '0.0003,0.003'）。書き出しの区切りで "
+                         "ema<係数>_<step>.bin に書く（ターゲットの 0.001 以外の平均化で書き出しが強くなるかを見る。"
+                         "状態は <out>/extra_ema.pt に保存して再開する）")
     ap.add_argument("--export-current", action="store_true",
                     help="書き出しの区切りで現在のネットも current_<step>.bin に書く（speedlab で測る）")
     ap.add_argument("--threads", type=int, default=0, help="torch のスレッド数（0 = 既定）")
@@ -324,6 +329,8 @@ def main() -> None:
 
     def save_all():
         save_checkpoint(learner, ck_path)
+        if extra_ema:
+            torch.save({str(t): n.state_dict() for t, n in extra_ema.items()}, out / "extra_ema.pt")
         if league is not None:
             (out / "league.json").write_text(json.dumps(league.state_dict()))
 
@@ -353,6 +360,26 @@ def main() -> None:
             lambda: tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False, **obs_kw), device,
             seed=args.seed * 1_000_003 + 17 + learner.step_count)
         pipe.submit(learner.net)
+
+    # 学習には使わない追加の指数移動平均（--extra-ema）。現在のネットの写しを係数ごとに持つ
+    extra_ema = {}
+    if args.extra_ema:
+        ema_path = out / "extra_ema.pt"
+        saved = torch.load(ema_path, map_location=device) if ema_path.exists() else {}
+        for tau in [float(x) for x in args.extra_ema.split(",") if x.strip()]:
+            net_ = copy.deepcopy(learner.net).eval()
+            net_.requires_grad_(False)
+            if str(tau) in saved:
+                net_.load_state_dict(saved[str(tau)])
+            extra_ema[tau] = net_
+
+    def update_extra_ema():
+        with torch.no_grad():
+            for tau, net_ in extra_ema.items():
+                for pe, p in zip(net_.parameters(), learner.net.parameters()):
+                    pe.add_(tau * (p - pe))
+                for be, b in zip(net_.buffers(), learner.net.buffers()):
+                    be.copy_(b)
 
     def crossed(step, every):
         """この反復（reuse 回の更新）で every の倍数をまたいだか（reuse=1 なら step % every == 0 と同じ）"""
@@ -425,6 +452,7 @@ def main() -> None:
             apply_guard_win_bonus(batch, [(0, finished), (n_self, league_finished)], guard_lam, args.guard_radius)
         for _ in range(args.reuse):
             info = learner.update(batch, reward_scale=reward_scale)
+            update_extra_ema()
         t2 = time.time()
         step = learner.step_count
         rec = {"step": step, **info, "games": len(finished),
@@ -507,6 +535,8 @@ def main() -> None:
             write_weights(learner.target, out / f"policy_{step}.bin")
             if args.export_current:
                 write_weights(learner.net, out / f"current_{step}.bin")
+            for tau, net_ in extra_ema.items():
+                write_weights(net_, out / f"ema{tau:g}_{step}.bin")
     if pipe is not None:
         pipe.result()  # 最後に頼んだ batch は使わずに捨てる
         pipe.close()

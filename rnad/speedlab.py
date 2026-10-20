@@ -196,9 +196,10 @@ def step_files(run: pathlib.Path):
     """run の書き出し [(step, which, path)]（which = target / current）"""
     out = []
     for p in run.glob("*.bin"):
-        m = re.fullmatch(r"(policy|current)_(\d+)\.bin", p.name)
+        m = re.fullmatch(r"(policy|current|ema[0-9.e-]+)_(\d+)\.bin", p.name)
         if m:
-            out.append((int(m.group(2)), "target" if m.group(1) == "policy" else "current", p))
+            which = {"policy": "target", "current": "current"}.get(m.group(1), m.group(1))
+            out.append((int(m.group(2)), which, p))
     return sorted(out)
 
 
@@ -416,13 +417,13 @@ def main():
     p.add_argument("runs", nargs="+")
     p.add_argument("--panel", required=True)
     p.add_argument("--games", type=int, default=64)
-    p.add_argument("--which", action="append", choices=["target", "current"])
+    p.add_argument("--which", action="append", help="target / current / ema<係数>（省くと全部）")
     p.add_argument("--every", type=int, default=0, help="この倍数の step だけ測る（0 = 全部）")
     p.add_argument("--only", action="append", help="この名前のパネルの相手だけ")
     p = sub.add_parser("report", help="腕ごとにまとめる")
     p.add_argument("runs", nargs="+")
     p.add_argument("--panel", required=True)
-    p.add_argument("--which", default="current", choices=["target", "current"])
+    p.add_argument("--which", default="current", help="target / current / ema<係数>")
     p.add_argument("--threshold", type=float, default=300.0)
     p.add_argument("--control", default="")
     p.add_argument("--out", default="")
