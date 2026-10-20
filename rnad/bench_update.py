@@ -8,7 +8,9 @@
 測るもの（ウォームアップ1回の後、--reps 回の平均）:
 - `collect`: 自己対局1回（batch 局）
 - `update`: 従来の更新 / `packed`: 合法手に詰めた更新（`RNaDLearner(packed=True)`）。同じ batch・同じ学習状態から
-  1回ずつ回し、更新量（パラメータの変化）の一致（コサイン・相対誤差）も出す
+  1回ずつ回し、**勾配**の一致（コサイン・相対誤差。数式が同じなら 1e-5 程度）と更新量の一致も出す
+  （`--weights` は Adam の状態が新しく、1歩目の更新量は勾配の符号に近いので、0 付近の成分の符号の揺れで
+  更新量のコサインは 0.9994 程度まで下がる。`--ckpt` の本物の状態なら 1 に近い）
 - `sequential` / `pipelined`: 「集める → 更新」を --loop 回まわした1更新あたりの壁時計。pipelined は
   `PipelinedCollector`（1更新遅れの方策で集めて更新と重ねる）。更新は packed で回す
 """
@@ -76,7 +78,7 @@ def main():
     kw = env_kw(base)
     env = tsuitate_rl.VecEnv(args.batch, seed=1, auto_reset=False, **kw)
     rec = {"batch": args.batch, "net": base.net.config}
-    cs, us, ps, coss, errs = [], [], [], [], []
+    cs, us, ps, coss, errs, gcos, gerr = [], [], [], [], [], [], []
     for r in range(args.reps + 1):
         torch.manual_seed(r)
         sync(device)
@@ -99,7 +101,15 @@ def main():
         t4 = time.time()
         da = torch.nn.utils.parameters_to_vector(a.net.parameters()).detach() - p0
         db = torch.nn.utils.parameters_to_vector(b.net.parameters()).detach() - p0
+        # 勾配そのものの一致（Adam の状態が新しいと1歩目は勾配の符号に近く、0 付近の成分の符号の揺れで
+        # 更新量のコサインが 0.9994 程度まで下がる。数式の一致は勾配で見る）
+        ga = torch.cat([q.grad.flatten() for q in a.net.parameters()])
+        gb = torch.cat([q.grad.flatten() for q in b.net.parameters()])
+        gcos.append(float(torch.nn.functional.cosine_similarity(ga, gb, dim=0)))
+        gerr.append(float((ga - gb).norm() / ga.norm()))
         if r == 0:
+            gcos.clear()
+            gerr.clear()
             continue  # ウォームアップ
         cs.append(t1 - t0)
         us.append(t3 - t2)
@@ -107,8 +117,10 @@ def main():
         coss.append(float(torch.nn.functional.cosine_similarity(da, db, dim=0)))
         errs.append(float((da - db).norm() / da.norm()))
         print(f"rep {r}: collect {t1 - t0:.2f}s update {t3 - t2:.2f}s packed {t4 - t3:.2f}s "
-              f"更新量のコサイン {coss[-1]:.6f} 相対誤差 {errs[-1]:.2e} 標本 {len(batch['action'])}", flush=True)
+              f"勾配のコサイン {gcos[-1]:.8f} 相対誤差 {gerr[-1]:.2e} / 更新量のコサイン {coss[-1]:.6f} "
+              f"標本 {len(batch['action'])}", flush=True)
     rec.update(collect_sec=sum(cs) / len(cs), update_sec=sum(us) / len(us), packed_sec=sum(ps) / len(ps),
+               grad_cos_min=min(gcos), grad_rel_err_max=max(gerr),
                delta_cos_min=min(coss), delta_rel_err_max=max(errs))
 
     # 集める → 更新 を回したときの1更新の壁時計（更新は packed）
