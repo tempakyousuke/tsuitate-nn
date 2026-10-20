@@ -190,6 +190,9 @@ def main() -> None:
                          " s = (結果 − v)/μ が勾配の分散のほとんどを占めるので、下げると分散が減る（偏りと引き換え）")
     ap.add_argument("--inv-mu-cap", type=float, default=0.0,
                     help="v-trace の s に掛かる 1/μ の上限（0 = 上限なし = 参照と同じ）。--neurd-clip と同じ狙いで、効く場所が違う")
+    ap.add_argument("--policy-loss", choices=["neurd", "pg"], default="neurd",
+                    help="方策の損失（neurd = 参照 / pg = 押し出しに各手の π を掛けたソフトマックス方策勾配。"
+                         "まれな手の 1/μ による分散が消える）")
     ap.add_argument("--pipeline", action="store_true",
                     help="自己対局を別スレッドで集めて更新と重ねる（1更新遅れの方策で集める。rnad.PipelinedCollector）。"
                          "自己対局だけ・ボーナスなし・補助ヘッドなしの設定に限る")
@@ -217,7 +220,7 @@ def main() -> None:
     cfg = RNaDConfig(eta=args.eta, beta=args.beta, lr=args.lr, schedule_sizes=(args.schedule,),
                      schedule_repeats=(1,), aux_truth=args.aux_truth, target_avg=args.target_avg,
                      adam_b1=args.adam_b1, c_vtrace=args.c_vtrace, clip=args.neurd_clip,
-                     inv_mu_cap=args.inv_mu_cap)
+                     inv_mu_cap=args.inv_mu_cap, policy_loss=args.policy_loss)
     lam_at, lam_max = parse_lambda_schedule(args.nyugyoku, args.schedule)
     guard_at, guard_max = parse_lambda_schedule(args.guard, args.schedule)
     speed_at, speed_max = parse_lambda_schedule(args.speed, args.schedule)

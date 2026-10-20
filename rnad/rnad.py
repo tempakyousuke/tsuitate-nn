@@ -217,12 +217,17 @@ def v_trace_scalars(v, valid, player, pi_a, mu_a, ent, reward, k, eta, c=1.0, rh
 # ---------------------------------------------------------------- 損失
 
 
-def loss_terms(logits, v, legal, action, player, lpr, vt, s, counts, eta, beta, clip=10_000.0):
+def loss_terms(logits, v, legal, action, player, lpr, vt, s, counts, eta, beta, clip=10_000.0, policy_loss="neurd"):
     """有効なステップの集まり（平らにした [N]）について、損失の和を返す。
 
     counts[k] はバッチ全体でのプレイヤー k の手番数（参照は損失をこれで割る）。チャンクに
     分けて呼んでも、全体をまとめて呼んだのと同じ値の和になる。
     lpr は勾配を止めた正則化の対数比 [N, A]、vt / s は v-trace の結果 [N]。
+
+    `policy_loss="pg"` は NeuRD の押し出し（アドバンテージそのもの）に各手の π を掛ける（参照には無い。
+    docs/rl-learning-speed.md）。η の項は −η·KL(π‖π_reg) のロジットでの勾配、s の項は選んだ手の
+    (1[b=a] − π_b)·(結果 − v)（集めた方策で更新するので π = μ）になり、まれな手の 1/μ が消える。
+    NeuRD の「確率の低い手でも押し出しが消えない」性質は失う
     """
     norm = torch.where(player == 0, 1.0 / max(counts[0], 1), 1.0 / max(counts[1], 1))
     loss_v = (norm * (v - vt) ** 2).sum()
@@ -233,6 +238,10 @@ def loss_terms(logits, v, legal, action, player, lpr, vt, s, counts, eta, beta, 
         mean_lpr = (pi * lpr).sum(-1, keepdim=True)
         onehot = F.one_hot(action, logits.shape[-1]).to(logits.dtype)
         adv = -eta * (lpr - mean_lpr) + s[:, None] * (onehot - pi_taken[:, None])
+        if policy_loss == "pg":
+            adv = adv * pi
+        elif policy_loss != "neurd":
+            raise ValueError(f"policy_loss {policy_loss}（neurd / pg）")
         adv = adv.clamp(-clip, clip)
     legal_f = legal.to(logits.dtype)
     mean_logit = (logits * legal_f).sum(-1, keepdim=True) / legal_f.sum(-1, keepdim=True)
@@ -267,6 +276,8 @@ class RNaDConfig:
     adam_b1: float = 0.0
     # v-trace の s に掛かる 1/μ の上限（0 = 上限なし = 参照と同じ）。学習の速さの実験用
     inv_mu_cap: float = 0.0
+    # 方策の損失（neurd = 参照 / pg = 押し出しに π を掛ける）。学習の速さの実験用
+    policy_loss: str = "neurd"
 
 
 class RNaDLearner:
@@ -414,7 +425,8 @@ class RNaDLearner:
                 mix = mix_cache[ci] if self.packed else self._lpr_mix(obs, legal, alpha)
                 lpr = legal_log_policy(logits, legal) - mix
             lv, ln = loss_terms(logits, v, legal, act, player_flat[sl].to(dev), lpr,
-                                vt[sl].to(dev), s[sl].to(dev), counts, cfg.eta, cfg.beta, cfg.clip)
+                                vt[sl].to(dev), s[sl].to(dev), counts, cfg.eta, cfg.beta, cfg.clip,
+                                cfg.policy_loss)
             loss = lv + ln
             if use_aux:
                 la = aux_truth_loss(aux_logits, batch["truth"][sl].to(dev, torch.long)).sum() / n

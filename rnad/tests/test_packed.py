@@ -106,7 +106,35 @@ def check_skip_zero_weight():
     print("重み 0 の正則化ネットを省いても α 混合とビット単位で同じ")
 
 
+def check_pg_is_softmax_policy_gradient():
+    """policy_loss="pg" のロジットの勾配は、η = 0・π = μ のとき (結果 − v)·log π_a の勾配と同じ"""
+    from rnad import legal_policy, loss_terms
+    torch.manual_seed(3)
+    n, a_n = 6, 9
+    legal = torch.rand(n, a_n) < 0.6
+    legal[:, 0] = True
+    logits = torch.randn(n, a_n, requires_grad=True)
+    with torch.no_grad():
+        pi = legal_policy(logits, legal)
+    action = torch.multinomial(pi, 1).squeeze(1)
+    adv_ret = torch.randn(n)  # 結果 − v
+    s = adv_ret / pi.gather(1, action[:, None]).squeeze(1)  # v-trace の s = (結果 − v)/μ
+    player = torch.zeros(n, dtype=torch.long)
+    v = torch.zeros(n, requires_grad=True)
+    _, ln = loss_terms(logits, v, legal, action, player, torch.zeros(n, a_n), torch.zeros(n), s, [n, 0],
+                       0.0, 1e9, policy_loss="pg")
+    (g,) = torch.autograd.grad(ln, logits)
+    logits2 = logits.detach().clone().requires_grad_(True)
+    from rnad import legal_log_policy
+    lp = legal_log_policy(logits2, legal).gather(1, action[:, None]).squeeze(1)
+    want = -(adv_ret * lp).sum() / n
+    (g2,) = torch.autograd.grad(want, logits2)
+    torch.testing.assert_close(g, g2, rtol=1e-5, atol=1e-6)
+    print("policy_loss=pg はソフトマックス方策勾配と一致")
+
+
 if __name__ == "__main__":
+    check_pg_is_softmax_policy_gradient()
     check_skip_zero_weight()
     check_pack()
     check_equal(0, aux=False)

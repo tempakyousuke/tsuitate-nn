@@ -17,7 +17,7 @@ lpr = 0。η の項は消え、s の項だけが残る）R-NaD の損失にか�
 - G·G_ref と cos: ref の期待勾配との内積（局を半分に分け、片方の変種ともう片方の ref の平均で不偏に推定）
 - 有効 SNR = (G·G_ref)² / (|G_ref|² · trΣ)（ref の向きへの進みの信号対雑音比。ref 自身なら |G_ref|² / trΣ_ref）
 
-変種の書き方: `<名前>:clip=<NeuRD のクリップ>,mucap=<1/μ の上限>`（省いた項は参照の値）
+変種の書き方: `<名前>:clip=<NeuRD のクリップ>,mucap=<1/μ の上限>,loss=<neurd|pg>`（省いた項は参照の値）
 """
 
 import argparse
@@ -42,12 +42,12 @@ DEV = torch.device("cpu")
 
 def parse_variant(spec):
     name, _, rest = spec.partition(":")
-    v = {"name": name, "clip": 10_000.0, "mucap": 0.0}
+    v = {"name": name, "clip": 10_000.0, "mucap": 0.0, "loss": "neurd"}
     for kv in filter(None, rest.split(",")):
         k, _, x = kv.partition("=")
-        if k not in ("clip", "mucap"):
-            raise SystemExit(f"変種の項 {k} は clip / mucap のどれか")
-        v[k] = float(x)
+        if k not in ("clip", "mucap", "loss"):
+            raise SystemExit(f"変種の項 {k} は clip / mucap / loss のどれか")
+        v[k] = x if k == "loss" else float(x)
     return v
 
 
@@ -162,7 +162,7 @@ def main():
         for vi, var in enumerate(variants):
             vt, s = s_by[var["mucap"]]
             lv, ln = loss_terms(lg, v, pmask, apos, pflat[rows], torch.zeros_like(lg), vt[rows], s[rows],
-                                counts, args.eta, args.beta, var["clip"])
+                                counts, args.eta, args.beta, var["clip"], var["loss"])
             grads = torch.autograd.grad(lv + ln, params, retain_graph=vi + 1 < len(variants))
             h = torch.cat([x.flatten() for x in grads]).double() * n_games  # 平均が全体の勾配になる尺度
             a = acc[var["name"]]
@@ -190,7 +190,7 @@ def main():
         # 内積は「この変種の A と ref の B」「この変種の B と ref の A」の平均（局が重ならないので不偏）
         dot = 0.5 * (float((a["A"] / a["nA"] * ar["B"] / ar["nB"]).sum())
                      + float((a["B"] / a["nB"] * ar["A"] / ar["nA"]).sum()))
-        rec = {"clip": var["clip"], "mucap": var["mucap"], "trSigma": tr, "G2": g2,
+        rec = {"clip": var["clip"], "mucap": var["mucap"], "loss": var["loss"], "trSigma": tr, "G2": g2,
                "B_noise": tr / g2 if g2 > 0 else None, "dot_ref": dot,
                "cos_ref": dot / math.sqrt(g2 * g2r) if g2 > 0 and g2r > 0 else None,
                "eff_snr": dot * dot / (g2r * tr) if g2r > 0 else None,
