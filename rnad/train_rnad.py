@@ -18,6 +18,7 @@ R-NaD の損失で1ステップ。学習の進み具合は**錨（既定は模�
 import argparse
 import copy
 import json
+import math
 import pathlib
 import time
 from collections import Counter
@@ -207,6 +208,16 @@ def main() -> None:
     ap.add_argument("--panel-every", type=int, default=500, help="パネルで測る間隔（更新回数。0 なら最初と最後だけ）")
     ap.add_argument("--panel-games", type=int, default=256, help="パネルの相手1体あたりの局数（偶数）")
     ap.add_argument("--panel-which", default="target", help="測るネット（target / current をカンマ区切り）")
+    ap.add_argument("--reseed", action="store_true",
+                    help="再開時に checkpoint の乱数状態を使わず --seed で乱数を初めから作り直す（同じ checkpoint から "
+                         "seed だけ変えた複製の対照を回すとき。付けないと checkpoint の乱数状態が戻り、同じ自己対局が再生される）")
+    ap.add_argument("--c-ply", default="",
+                    help="終盤だけの λ（'時刻:λ'、例 '60:0.8'。collect の時刻 = 両者の試行の通し番号がこれ以上の手番で c = λ）")
+    ap.add_argument("--lr-sched", default="",
+                    help="段階（Δm）の中の学習率の予定。'cos:<最小の割合>' で段階の頭の lr から段階末の lr×割合へ余弦で下げ、"
+                         "次の段階の頭で戻す")
+    ap.add_argument("--tail-avg", action="store_true",
+                    help="段階の後半（α = 1 の区間）の現在のネットの一様な平均を、段階の区切りで tail_<step>.bin に書く（学習には使わない）")
     ap.add_argument("--reset-adam", action="store_true",
                     help="再開時に Adam の状態（モーメントと step）を捨てる。更新の式を途中で変える A/B は両腕に付ける"
                          "（2次モーメントが古い勾配の大きさを b2 = 0.999 で何千更新も覚えているため）")
@@ -241,7 +252,8 @@ def main() -> None:
     cfg = RNaDConfig(eta=args.eta, beta=args.beta, lr=args.lr, schedule_sizes=(args.schedule,),
                      schedule_repeats=(1,), aux_truth=args.aux_truth, target_avg=args.target_avg,
                      adam_b1=args.adam_b1, c_vtrace=args.c_vtrace, clip=args.neurd_clip,
-                     inv_mu_cap=args.inv_mu_cap, policy_loss=args.policy_loss)
+                     inv_mu_cap=args.inv_mu_cap, policy_loss=args.policy_loss,
+                     c_ply=((int(args.c_ply.split(":")[0]), float(args.c_ply.split(":")[1])) if args.c_ply else (0, 1.0)))
     lam_at, lam_max = parse_lambda_schedule(args.nyugyoku, args.schedule)
     guard_at, guard_max = parse_lambda_schedule(args.guard, args.schedule)
     speed_at, speed_max = parse_lambda_schedule(args.speed, args.schedule)
@@ -291,6 +303,11 @@ def main() -> None:
             raise SystemExit(f"checkpoint と設定が違う: {diff}（(保存, 今)）。"
                              "意図した変更なら --override-config を付ける")
         learner.load_state_dict(ck)
+        if args.reseed:
+            torch.manual_seed(args.seed)
+            if device.type == "cuda":
+                torch.cuda.manual_seed_all(args.seed)
+            print(f"乱数を --seed {args.seed} で作り直した（checkpoint の乱数状態は使わない）", flush=True)
         if diff:
             learner.apply_cfg(cfg)
             print(f"再開時に設定を上書き: {diff}")
@@ -373,11 +390,42 @@ def main() -> None:
         print(f"Adam の状態を捨てた（step {learner.step_count} から）", flush=True)
     warm_from = learner.step_count
 
+    lr_min_frac = None
+    if args.lr_sched:
+        kind, _, frac_s = args.lr_sched.partition(":")
+        if kind != "cos":
+            raise SystemExit("--lr-sched は 'cos:<最小の割合>'")
+        lr_min_frac = float(frac_s or 0.1)
+
     def set_warmup_lr():
+        lr = cfg.lr
+        if lr_min_frac is not None:
+            start, size = learner.schedule.position(learner.step_count)
+            x = (learner.step_count - start) / size
+            lr = cfg.lr * (lr_min_frac + (1 - lr_min_frac) * 0.5 * (1 + math.cos(math.pi * x)))
         if args.lr_warmup > 0:
-            frac = min(1.0, (learner.step_count - warm_from + 1) / args.lr_warmup)
+            lr *= min(1.0, (learner.step_count - warm_from + 1) / args.lr_warmup)
+        if args.lr_warmup > 0 or lr_min_frac is not None:
             for g in learner.opt.param_groups:
-                g["lr"] = cfg.lr * frac
+                g["lr"] = lr
+
+    # 段階の後半の一様な平均（--tail-avg）。α = 1 の区間（段階の後半）の更新後のネットを足し、区切りで書いて捨てる
+    tail = {"sum": None, "n": 0}
+
+    def update_tail(info):
+        if not args.tail_avg:
+            return
+        start, size = learner.schedule.position(learner.step_count - 1)
+        if learner.step_count - 1 - start >= size // 2:
+            with torch.no_grad():
+                vec = torch.nn.utils.parameters_to_vector(learner.net.parameters()).detach().double()
+                tail["sum"] = vec if tail["sum"] is None else tail["sum"] + vec
+                tail["n"] += 1
+        if info["reg_update"] and tail["n"]:
+            net_ = copy.deepcopy(learner.net).eval()
+            torch.nn.utils.vector_to_parameters((tail["sum"] / tail["n"]).float(), net_.parameters())
+            write_weights(net_, out / f"tail_{learner.step_count}.bin")
+            tail["sum"], tail["n"] = None, 0
     pipe = None
     if args.pipeline:
         if league is not None or args.guard or args.speed or args.nyugyoku or cfg.aux_truth > 0:
@@ -513,6 +561,7 @@ def main() -> None:
             set_warmup_lr()
             info = learner.update(batch, reward_scale=reward_scale)
             update_extra_ema()
+            update_tail(info)
         t2 = time.time()
         step = learner.step_count
         rec = {"step": step, **info, "games": len(finished),

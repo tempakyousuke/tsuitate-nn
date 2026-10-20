@@ -39,7 +39,7 @@ sys.path.insert(0, str(HERE))
 import tsuitate_rl  # noqa: E402
 from export_weights import read as read_weights  # noqa: E402
 from model import PolicyValueNet  # noqa: E402
-from rnad import play_match  # noqa: E402
+from rnad import pack_legal, play_match  # noqa: E402
 
 DEV = torch.device("cpu")
 EVAL_SEED = 777_000  # パネル評価の env の seed の基準（相手ごとに足す）
@@ -103,12 +103,15 @@ def _splitmix(z):
     return z ^ _shr(z, 31)
 
 
-def keyed_uniform(salt, games, decs, n_actions, device):
-    """(salt, 局, その局の何番目の手番か, 行動) だけで決まる (0, 1) の一様乱数 [行, n_actions]（splitmix64 のハッシュ。
-    CPU でも GPU でも同じ値）"""
+def keyed_uniform(salt, games, decs, actions, device):
+    """(salt, 局, その局の何番目の手番か, 行動) だけで決まる (0, 1) の一様乱数（splitmix64 のハッシュ。
+    CPU でも GPU でも同じ値）。`actions` は行動の番号 [行, K]（合法手だけ渡せば速い）か、行動の総数（全部）"""
     g = torch.as_tensor(games, dtype=torch.int64, device=device)[:, None]
     k = torch.as_tensor(decs, dtype=torch.int64, device=device)[:, None]
-    a = torch.arange(n_actions, dtype=torch.int64, device=device)[None, :]
+    if isinstance(actions, int):
+        a = torch.arange(actions, dtype=torch.int64, device=device)[None, :]
+    else:
+        a = actions.to(device, torch.int64)
     z = _splitmix(_splitmix(_splitmix(torch.full_like(g, int(salt)) ^ g) ^ k) ^ a)
     return (_shr(z, 11).double() + 0.5) / float(1 << 53)
 
@@ -123,10 +126,12 @@ def keyed_actions(net, obs, mask, games, decs, salt, device=DEV):
     x = torch.from_numpy(obs).to(device).half().float()
     logits, _ = net(x)
     legal = torch.from_numpy(mask).to(device)
-    u = keyed_uniform(salt, games, decs, mask.shape[1], device)
+    # 合法手だけを詰めて乱数を作る（乱数は行動の番号で決まるので、全行動に作ったときと同じ手を選ぶ）
+    idx, pmask, _ = pack_legal(legal, legal.to(torch.uint8).argmax(1))
+    u = keyed_uniform(salt, games, decs, idx, device)
     gumbel = (-torch.log(-torch.log(u))).float()
-    masked = logits.float().masked_fill(~legal, float("-inf"))
-    return (masked + gumbel).argmax(-1).cpu().numpy()
+    masked = logits.float().gather(1, idx).masked_fill(~pmask, float("-inf"))
+    return idx.gather(1, (masked + gumbel).argmax(-1, keepdim=True)).squeeze(1).cpu().numpy()
 
 
 @torch.no_grad()
@@ -256,7 +261,7 @@ def step_files(run: pathlib.Path):
     """run の書き出し [(step, which, path)]（which = target / current）"""
     out = []
     for p in run.glob("*.bin"):
-        m = re.fullmatch(r"(policy|current|ema[0-9.e-]+)_(\d+)\.bin", p.name)
+        m = re.fullmatch(r"(policy|current|tail|ema[0-9.e-]+)_(\d+)\.bin", p.name)
         if m:
             which = {"policy": "target", "current": "current"}.get(m.group(1), m.group(1))
             out.append((int(m.group(2)), which, p))

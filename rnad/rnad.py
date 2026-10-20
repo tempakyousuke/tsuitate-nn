@@ -171,6 +171,15 @@ class EntropySchedule:
             schedule.extend([schedule[-1] + (i + 1) * size for i in range(repeat)])
         self.schedule = np.array(schedule)
 
+    def position(self, step: int):
+        """(この step を含む段階の始まり, 段階の長さ)"""
+        s = self.schedule
+        if step >= s[-1]:
+            size = s[-1] - s[-2]
+            return int(s[-1] + (step - s[-1]) // size * size), int(size)
+        start = s[s <= step].max()
+        return int(start), int(s[s > step].min() - start)
+
     def __call__(self, step: int):
         """(alpha, この step の後に正則化方策を差し替えるか)"""
         s = self.schedule
@@ -195,6 +204,7 @@ def v_trace_scalars(v, valid, player, pi_a, mu_a, ent, reward, k, eta, c=1.0, rh
     戻り値:
         vt: k の手番のステップでの価値の目標（それ以外は 0）
         s:  k の手番のステップでの Q のスカラー部分（learning_output = v + η 項 + onehot·s）
+    `c` は数か [T, B] のテンソル（時刻ごとの c。`RNaDConfig.c_ply` で序盤は 1・終盤だけ λ にするため）。
     `inv_mu_cap` > 0 なら s に掛かる 1/μ に上限を付ける（参照には無い。まれにしか選ばれない手の
     s が勾配の分散のほとんどを占めるため。docs/rl-learning-speed.md）。価値の目標 vt には効かない
     """
@@ -218,8 +228,9 @@ def v_trace_scalars(v, valid, player, pi_a, mu_a, ent, reward, k, eta, c=1.0, rh
         r_unc = reward[t] + c_reward_unc + eta_reg_entropy[t]
         disc = reward[t] + c_reward
         w = cs[t] * c_is
+        w_c = torch.minimum(w, c[t]) if torch.is_tensor(c) else torch.clamp(w, max=c)
         our_vt = (v[t] + torch.clamp(w, max=rho) * (r_unc + c_next_value - v[t])
-                  + torch.clamp(w, max=c) * (c_next_vt - c_next_value))
+                  + w_c * (c_next_vt - c_next_value))
         our_s = inv_mu[t] * (disc + c_is * c_next_vt - v[t])
         vt[t] = torch.where(ours, our_vt, zeros)
         s[t] = torch.where(ours, our_s, zeros)
@@ -298,6 +309,9 @@ class RNaDConfig:
     inv_mu_cap: float = 0.0
     # 方策の損失（neurd = 参照 / pg = 押し出しに π を掛ける）。学習の速さの実験用
     policy_loss: str = "neurd"
+    # 終盤だけの λ: (時刻, λ)。collect の時刻（両者の試行の通し番号。反則を含む）がこれ以上の手番だけ c = λ、
+    # それより前は c_vtrace。(0, 1.0) = 使わない。学習の速さの実験用
+    c_ply: tuple = (0, 1.0)
 
 
 class RNaDLearner:
@@ -436,9 +450,13 @@ class RNaDLearner:
         mu_g = torch.where(valid, grid(batch["mu_a"]), torch.ones(T, B))
         vt = torch.zeros(n)
         s = torch.zeros(n)
+        c_arg = cfg.c_vtrace
+        if tuple(cfg.c_ply) != (0, 1.0):
+            ply0, lam = cfg.c_ply
+            c_arg = torch.where(torch.arange(T)[:, None] >= int(ply0), float(lam), float(cfg.c_vtrace)).expand(T, B)
         for k in (0, 1):
             vt_k, s_k = v_trace_scalars(grid(v_tgt), valid, player, grid(pi_a), mu_g, grid(ent),
-                                        batch["reward"][:, :, k], k, cfg.eta, c=cfg.c_vtrace,
+                                        batch["reward"][:, :, k], k, cfg.eta, c=c_arg,
                                         inv_mu_cap=cfg.inv_mu_cap)
             mine = player[t_idx, b_idx] == k
             vt = torch.where(mine, vt_k[t_idx, b_idx], vt)
