@@ -179,8 +179,8 @@ def run(variant, seed, args):
     curve = []
     for step in range(args.steps + 1):
         if step % args.every == 0:
-            curve.append({"step": step, "nashconv": nash_conv(policy_table(learner.net)),
-                          "nashconv_target": nash_conv(policy_table(learner.target)),
+            curve.append({"step": step, "nashconv": float(nash_conv(policy_table(learner.net))),
+                          "nashconv_target": float(nash_conv(policy_table(learner.target))),
                           "min_prob": float(policy_table(learner.net).min())})
         if step < args.steps:
             learner.update(collect_kuhn(learner.net, args.games, rng))
