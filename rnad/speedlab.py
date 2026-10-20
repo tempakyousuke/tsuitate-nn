@@ -10,7 +10,7 @@
     # 2) run の書き出し（policy_<step>.bin = ターゲット、current_<step>.bin = 現在のネット）をパネルで測る
     python rnad/speedlab.py eval --panel lab/panel.json lab/runs/base_s0 lab/runs/base_s1 ...
     # 3) 腕ごとにまとめる（run のディレクトリ名の最後の `_s<seed>` を落とした名前を腕とみなす）
-    python rnad/speedlab.py report lab/runs/* --threshold 300 --out lab/report.md
+    python rnad/speedlab.py report lab/runs/* --panel lab/panel.json --control base --gain 50 --out lab/report.md
 
 **同じ対局条件（共通乱数）**: 手の乱数を (相手ごとの seed, 局番号, その局の何番目の手番か) だけで決める
 （`keyed_actions`）ので、どの書き出しも同じ「相手 × 局番号」の組で、方策が同じ手を選ぶ限り同じ局面を指す
@@ -443,7 +443,7 @@ def cmd_report(args):
     # 要約: 予算の最後の Elo・面積（更新回数で平均した Elo）・しきい値に届いた更新回数・壁時計
     lines.append("## 要約")
     lines.append("")
-    lines.append(f"| 腕 | seed | 最後の Elo | 平均 Elo（曲線下の面積 / 更新回数） | Elo {args.threshold} に届いた更新回数 | "
+    lines.append(f"| 腕 | seed | 最後の Elo | 平均 Elo（曲線下の面積 / 更新回数） | 起点 +{args.gain:g} に届いた更新回数 | "
                  "同・局数 | 同・壁時計（分） | 1更新の秒 |")
     lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
     for arm, rs in sorted(arms.items()):
@@ -456,7 +456,8 @@ def cmd_report(args):
             xs = [0] + [s for s, _ in pts] if pts[0][0] != 0 else [s for s, _ in pts]
             ys = ([pts[0][1]] if pts[0][0] != 0 else []) + [e for _, e in pts]
             aucs.append(float(np.trapezoid(ys, xs) / max(xs[-1] - xs[0], 1)))
-            hit = next((s for s, e in pts if e >= args.threshold), None)
+            # しきい値は起点（step 0）からの伸び（パネルの絶対値はパネル込みでしか意味を持たないため）
+            hit = next((s for s, e in pts if e >= pts[0][1] + args.gain), None)
             hits.append(hit)
             if hit is not None and hit in cum:
                 hit_games.append(cum[hit][0])
@@ -553,7 +554,7 @@ def main():
     p.add_argument("runs", nargs="+")
     p.add_argument("--panel", required=True)
     p.add_argument("--which", default="current", help="target / current / ema<係数>")
-    p.add_argument("--threshold", type=float, default=300.0)
+    p.add_argument("--gain", type=float, default=50.0, help="起点（step 0）からこの Elo だけ伸びた更新回数を数える")
     p.add_argument("--control", default="")
     p.add_argument("--out", default="")
     p.add_argument("--json", default="")
