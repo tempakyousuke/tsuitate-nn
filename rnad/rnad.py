@@ -135,7 +135,7 @@ def pack_legal(legal: torch.Tensor, action: torch.Tensor):
     """合法手だけを左に詰めた添字 (idx [n, K], 詰めたマスク [n, K], 選んだ手の詰めた位置 [n])。K は行ごとの合法手数の最大。
 
     方策の計算（マスク内の softmax・NeuRD の損失）はマスク内の手しか使わないので、11,259 手の配列の代わりに
-    `logits.gather(1, idx)` の [n, K] で同じ値・同じ勾配になる（合法手は平均 約45・最大 約180 手）。
+    `logits.gather(1, idx)` の [n, K] で同じ値・同じ勾配になる（合法手は rl_deduce_v4 の自己対局で平均 約80・最大 約330 手）。
     `RNaDLearner(packed=True)` が使う。並びは行ごとに行動番号の昇順（nonzero が行優先で返すため）
     """
     n = legal.shape[0]

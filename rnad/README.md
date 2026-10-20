@@ -69,7 +69,7 @@ ARENA_MATCH_SEED=20260927 cargo run --release --bin arena -- 100 "rl_policy:<pol
 | フラグ | 中身 |
 | --- | --- |
 | `--packed` | 方策の計算を合法手に詰めて行う（数式は同じ。`tests/test_packed.py`）。重み 0 の正則化ネットの順伝播は常に省く |
-| `--pipeline` | 自己対局を別スレッド・別 CUDA ストリームで集め、更新と重ねる（1更新遅れの方策。自己対局だけ・ボーナスなしの設定） |
+| `--pipeline` | 自己対局を別スレッド・別 CUDA ストリームで集め、更新と重ねる（1更新遅れの方策。自己対局だけ・ボーナスなし・補助ヘッドなしの設定。`--league` / `--guard` / `--speed` / `--nyugyoku` / `--aux-truth` と併用すると止まる） |
 | `--compact-legal` | batch の合法手のマスクを添字で持つ（768局で 0.79GB → 11MB。`--pipeline` のメモリ対策） |
 | `--inv-mu-cap K` / `--neurd-clip C` | v-trace の s の 1/μ の上限 / NeuRD のクリップ（まれな手のスパイクを取る） |
 | `--policy-loss pg` | NeuRD の押し出しに π を掛ける（ソフトマックス方策勾配） |
