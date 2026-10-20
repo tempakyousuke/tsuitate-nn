@@ -103,8 +103,9 @@ def keyed_actions(net, obs, mask, keys, salt):
 
 
 @torch.no_grad()
-def play_vs(a_net, b: Member, games: int, seed: int, planes: int):
-    """a_net（PyTorch）と b を games 局（偶数番の局で a が先手）。a から見た (勝, 負, 分)。
+def play_vs(a_net, b: Member, games: int, seed: int, planes: int, per_game: bool = False):
+    """a_net（PyTorch）と b を games 局（偶数番の局で a が先手）。a から見た (勝, 負, 分)（per_game なら局番号ごとの
+    結果 1 / 0 / −1 の配列）。
     手は `keyed_actions`（局ごとの共通乱数）で選ぶので、同じ (b, games, seed) で測った書き出しどうしは局ごとに対になる"""
     salt = seed
     dec = np.zeros(games, dtype=np.int64)  # 局ごとの手番の数（反則で指し直した手番も数える）
@@ -116,7 +117,7 @@ def play_vs(a_net, b: Member, games: int, seed: int, planes: int):
         env = tsuitate_rl.VecEnv(games, opponent=b.rust, seed=seed, auto_reset=False, **planes_kw(planes))
         a_color = None
     env.reset()
-    w = l = d = 0
+    outcome = np.zeros(games, dtype=np.int64)  # 局番号ごとの a から見た結果（1 / 0 / −1）
     while True:
         alive = env.alive()
         if not alive.any():
@@ -136,11 +137,10 @@ def play_vs(a_net, b: Member, games: int, seed: int, planes: int):
         dec[alive] += 1
         rew, done = env.step(actions)
         for i in np.flatnonzero(done):
-            r = rew[i, learner[i]]
-            w += r > 0
-            l += r < 0
-            d += r == 0
-    return int(w), int(l), int(d)
+            outcome[i] = int(np.sign(rew[i, learner[i]]))
+    if per_game:
+        return outcome
+    return int((outcome > 0).sum()), int((outcome < 0).sum()), int((outcome == 0).sum())
 
 
 def planes_kw(planes):
@@ -263,9 +263,10 @@ def cmd_eval(args):
                         net = read_weights(wpath).eval()
                     t0 = time.time()
                     # 相手ごとに seed を固定 = どの書き出しも同じ対局条件（共通乱数）
-                    w, l, d = play_vs(net, m, args.games, EVAL_SEED + stable_seed(m.name), planes)
+                    o = play_vs(net, m, args.games, EVAL_SEED + stable_seed(m.name), planes, per_game=True)
+                    w, l, d = int((o > 0).sum()), int((o < 0).sum()), int((o == 0).sum())
                     rec = {"step": step, "which": which, "opponent": m.name, "w": w, "l": l, "d": d,
-                           "games": args.games, "sec": round(time.time() - t0, 2)}
+                           "games": args.games, "outcomes": o.tolist(), "sec": round(time.time() - t0, 2)}
                     f.write(json.dumps(rec) + "\n")
                     f.flush()
                 print(f"{run.name} {which} {step}: 済", flush=True)
@@ -307,6 +308,72 @@ def load_log(run: pathlib.Path):
         sec += r["collect_sec"] + r["update_sec"]
         cum[r["step"]] = (games, sec)
     return cum
+
+
+def load_outcomes(run: pathlib.Path):
+    """{(step, which, 相手): 局番号ごとの結果の配列}（局ごとの結果を残した評価だけ）"""
+    out = {}
+    path = run / "panel_eval.jsonl"
+    if not path.exists():
+        return out
+    for line in path.read_text().splitlines():
+        r = json.loads(line)
+        if "outcomes" in r:
+            out[(r["step"], r["which"], r["opponent"])] = np.array(r["outcomes"], dtype=float)
+    return out
+
+
+def seed_of(run: pathlib.Path):
+    m = re.search(r"_s(\d+)$", run.name)
+    return m.group(1) if m else "0"
+
+
+def paired_section(arms, control, which, steps):
+    """対照との**局ごとのペア差**（同じ seed・step・相手・局番号。評価は共通乱数なので局どうしが対になる）。
+    得点（勝 1・分 0.5・負 0）の差を pt で。標準誤差は seed ごとに step・相手・局をまとめた平均の、seed 間の
+    ばらつき（seed が1つなら局ごとの差の標準誤差。step どうしの相関は無視するので小さめに出る）"""
+    lines = [f"## 対照（{control}）との局ごとのペア差（得点の差、pt。{which}）", "",
+             "| 腕 | " + " | ".join(str(s) for s in steps if s) + " | step > 0 の全体 | 局ごとの相関 |",
+             "| --- |" + " --- |" * (len([s for s in steps if s]) + 2)]
+    ctrl = {seed_of(r): load_outcomes(r) for r, _, _ in arms[control]}
+    for arm, rs in sorted(arms.items()):
+        if arm == control:
+            continue
+        per_step = {s: [] for s in steps if s}
+        per_seed = {}
+        corr_a, corr_b = [], []
+        for run, _, _ in rs:
+            sd = seed_of(run)
+            if sd not in ctrl:
+                continue
+            mine = load_outcomes(run)
+            for (st, w, opp), o in mine.items():
+                if w != which or st == 0 or (st, w, opp) not in ctrl[sd]:
+                    continue
+                c = ctrl[sd][(st, w, opp)]
+                diff = ((o + 1) / 2 - (c + 1) / 2) * 100
+                per_step.setdefault(st, []).extend(diff.tolist())
+                per_seed.setdefault(sd, []).extend(diff.tolist())
+                corr_a.extend(o.tolist())
+                corr_b.extend(c.tolist())
+        cells = []
+        for s in steps:
+            if not s:
+                continue
+            x = per_step.get(s, [])
+            cells.append(f"{np.mean(x):+.1f}±{np.std(x, ddof=1) / math.sqrt(len(x)):.1f}" if len(x) > 1 else "")
+        allx = [v for vs in per_seed.values() for v in vs]
+        if len(per_seed) > 1:
+            means = [np.mean(v) for v in per_seed.values()]
+            tot = f"{np.mean(allx):+.1f}±{np.std(means, ddof=1) / math.sqrt(len(means)):.1f}（seed 間、{len(means)} seed）"
+        elif allx:
+            tot = f"{np.mean(allx):+.1f}±{np.std(allx, ddof=1) / math.sqrt(len(allx)):.1f}（局ごと、1 seed）"
+        else:
+            tot = "—"
+        rho = f"{np.corrcoef(corr_a, corr_b)[0, 1]:.2f}" if len(corr_a) > 2 else "—"
+        lines.append(f"| {arm} | " + " | ".join(cells) + f" | {tot} | {rho} |")
+    lines.append("")
+    return lines
 
 
 def arm_of(run: pathlib.Path):
@@ -425,6 +492,8 @@ def cmd_report(args):
                    else f"{np.mean(v):+.0f}±{np.std(v, ddof=1) / math.sqrt(len(v)):.0f}（{len(v)} seed）")
             lines.append(f"| {arm} | " + " | ".join(cells) + f" | {tot} |")
         lines.append("")
+    if args.control and args.control in arms:
+        lines += paired_section(arms, args.control, which, steps)
     text = "\n".join(lines)
     print(text)
     if args.out:
