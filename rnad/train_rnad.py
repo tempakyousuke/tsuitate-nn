@@ -185,6 +185,11 @@ def main() -> None:
     ap.add_argument("--c-vtrace", type=float, default=1.0,
                     help="v-trace の c（参照 1.0）。1 未満は λ = c の λ-return（自己対局は集めた方策で更新するので"
                          " π/μ ≈ 1）。目標の分散を減らす代わりに、価値の当たらない区間の信号を削る")
+    ap.add_argument("--neurd-clip", type=float, default=10_000.0,
+                    help="NeuRD のアドバンテージのクリップ（参照 10,000 = 事実上無し）。まれにしか選ばれない手の"
+                         " s = (結果 − v)/μ が勾配の分散のほとんどを占めるので、下げると分散が減る（偏りと引き換え）")
+    ap.add_argument("--inv-mu-cap", type=float, default=0.0,
+                    help="v-trace の s に掛かる 1/μ の上限（0 = 上限なし = 参照と同じ）。--neurd-clip と同じ狙いで、効く場所が違う")
     ap.add_argument("--pipeline", action="store_true",
                     help="自己対局を別スレッドで集めて更新と重ねる（1更新遅れの方策で集める。rnad.PipelinedCollector）。"
                          "自己対局だけ・ボーナスなし・補助ヘッドなしの設定に限る")
@@ -211,7 +216,8 @@ def main() -> None:
 
     cfg = RNaDConfig(eta=args.eta, beta=args.beta, lr=args.lr, schedule_sizes=(args.schedule,),
                      schedule_repeats=(1,), aux_truth=args.aux_truth, target_avg=args.target_avg,
-                     adam_b1=args.adam_b1, c_vtrace=args.c_vtrace)
+                     adam_b1=args.adam_b1, c_vtrace=args.c_vtrace, clip=args.neurd_clip,
+                     inv_mu_cap=args.inv_mu_cap)
     lam_at, lam_max = parse_lambda_schedule(args.nyugyoku, args.schedule)
     guard_at, guard_max = parse_lambda_schedule(args.guard, args.schedule)
     speed_at, speed_max = parse_lambda_schedule(args.speed, args.schedule)
@@ -341,7 +347,8 @@ def main() -> None:
         if league is not None or args.guard or args.speed or args.nyugyoku or cfg.aux_truth > 0:
             raise SystemExit("--pipeline は自己対局だけ・ボーナスなし・補助ヘッドなしの設定で使う")
         pipe = PipelinedCollector(
-            lambda: tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False, **obs_kw), device)
+            lambda: tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False, **obs_kw), device,
+            seed=args.seed * 1_000_003 + 17 + learner.step_count)
         pipe.submit(learner.net)
 
     def crossed(step, every):

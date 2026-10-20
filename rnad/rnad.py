@@ -168,17 +168,21 @@ class EntropySchedule:
 # ---------------------------------------------------------------- v-trace
 
 
-def v_trace_scalars(v, valid, player, pi_a, mu_a, ent, reward, k, eta, c=1.0, rho=math.inf):
+def v_trace_scalars(v, valid, player, pi_a, mu_a, ent, reward, k, eta, c=1.0, rho=math.inf, inv_mu_cap=0.0):
     """プレイヤー k から見た v-trace（参照の v_trace をスカラーに落とした版）。
 
     引数はどれも [T, B]（reward は k の報酬、ent = Σ_a π_a·lpr_a（手番側の方策で））。
     戻り値:
         vt: k の手番のステップでの価値の目標（それ以外は 0）
         s:  k の手番のステップでの Q のスカラー部分（learning_output = v + η 項 + onehot·s）
+    `inv_mu_cap` > 0 なら s に掛かる 1/μ に上限を付ける（参照には無い。まれにしか選ばれない手の
+    s が勾配の分散のほとんどを占めるため。docs/rl-learning-speed.md）。価値の目標 vt には効かない
     """
     T, B = v.shape
     cs = torch.where(valid, pi_a / mu_a, torch.ones_like(v))
     inv_mu = torch.where(valid, 1.0 / mu_a, torch.ones_like(v))
+    if inv_mu_cap > 0:
+        inv_mu = inv_mu.clamp(max=inv_mu_cap)
     player_others = torch.where(player == k, 1.0, -1.0) * valid
     eta_reg_entropy = -eta * ent * player_others
 
@@ -261,6 +265,8 @@ class RNaDConfig:
     aux_truth: float = 0.0
     # Adam の1次モーメントの係数（参照は 0 = モーメンタムなし）。学習の速さの実験用（docs/rl-learning-speed.md）
     adam_b1: float = 0.0
+    # v-trace の s に掛かる 1/μ の上限（0 = 上限なし = 参照と同じ）。学習の速さの実験用
+    inv_mu_cap: float = 0.0
 
 
 class RNaDLearner:
@@ -304,6 +310,12 @@ class RNaDLearner:
     def _lpr_mix(self, obs, legal, alpha, sel=None):
         """正則化方策の対数確率（2つの前の版の α 混合）。`sel` はロジットを詰める関数（packed のとき）"""
         sel = sel or (lambda x: x)
+        # 重みが 0 の側は順伝播しない（段階の後半は α = 1 で prev_ が要らない）。対数確率は合法手で有限なので
+        # 1.0·x + 0.0·y = x がビット単位で成り立ち、結果は混ぜた場合と同じ
+        if alpha >= 1.0:
+            return legal_log_policy(sel(forward(self.prev, obs)[0]), legal)
+        if alpha <= 0.0:
+            return legal_log_policy(sel(forward(self.prev_, obs)[0]), legal)
         lp_prev = legal_log_policy(sel(forward(self.prev, obs)[0]), legal)
         lp_prev_ = legal_log_policy(sel(forward(self.prev_, obs)[0]), legal)
         return alpha * lp_prev + (1 - alpha) * lp_prev_
@@ -374,7 +386,8 @@ class RNaDLearner:
         s = torch.zeros(n)
         for k in (0, 1):
             vt_k, s_k = v_trace_scalars(grid(v_tgt), valid, player, grid(pi_a), mu_g, grid(ent),
-                                        batch["reward"][:, :, k], k, cfg.eta, c=cfg.c_vtrace)
+                                        batch["reward"][:, :, k], k, cfg.eta, c=cfg.c_vtrace,
+                                        inv_mu_cap=cfg.inv_mu_cap)
             mine = player[t_idx, b_idx] == k
             vt = torch.where(mine, vt_k[t_idx, b_idx], vt)
             s = torch.where(mine, s_k[t_idx, b_idx], s)
@@ -630,7 +643,8 @@ class MultiEnv:
 
 
 def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode="enter",
-            nyugyoku_zero_sum=True, opponents=None, opp_nets=None, nyugyoku_win_only=False, truth=False):
+            nyugyoku_zero_sum=True, opponents=None, opp_nets=None, nyugyoku_win_only=False, truth=False,
+            generator=None):
     """`env`（auto_reset=False の VecEnv）の全局を1局ずつ最後まで自己対局し、学習用に並べる。
 
     戻り値の obs / legal / action / mu_a / t / b は有効なステップだけを平らにしたもの、
@@ -669,6 +683,9 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
 
     `truth=True` なら記録する各手番の**真実の盤面のラベル**（`VecEnv.truth()`、[N, 81] int8）を
     `truth` に入れて返す（補助ヘッド用。乱数は消費しない）
+
+    `generator` を渡すと学習側の手のサンプリングはその乱数列を使う（`PipelinedCollector` が別スレッドでも
+    再現するように。渡さなければ従来どおり torch の大域の乱数）
     """
     env.reset()
     B = env.num_envs
@@ -728,7 +745,7 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
             last_act[b, p] = t
         actions = np.full(B, -1, dtype=np.int64)
         if len(idx):
-            a, mu = sample_actions(net, obs[idx], mask[idx], device)
+            a, mu = sample_actions(net, obs[idx], mask[idx], device, generator)
             actions[idx] = a.numpy()
         if opp_by:
             groups = {name: np.array(bs, dtype=np.int64) for name, bs in opp_by.items()}
@@ -790,23 +807,35 @@ class PipelinedCollector:
     「自己対局 + 更新」から「大きいほう」へ縮む（GPU では自己対局の大半が CPU 側の env なので重なる）。
 
     env は Python のスレッドをまたげない（VecEnv は unsendable）ので、集める側のスレッドの中で作って持つ。
-    行動のサンプリングは torch の大域の乱数を使うので、スレッドの割り込み方で乱数列が変わり、
-    run は再現しない（`--pipeline` なしの run は従来どおり再現する）
+    行動のサンプリングは専用の乱数列（`seed`）を使うので、スレッドの割り込み方によらず run は再現する
+    （乱数列が従来と違うので、`--pipeline` なしの run とは別の局になる）。
+
+    CUDA では集める側を**優先度の高い別ストリーム**で回す。既定のストリームを共有すると、集める側が手ごとに
+    `.cpu()` で待つたびに更新側の積まれたカーネルの後ろに並び、GPU の仕事が重ならない
     """
 
-    def __init__(self, env_factory, device, **collect_kw):
+    def __init__(self, env_factory, device, seed=0, **collect_kw):
         self.env_factory = env_factory
         self.device = device
         self.collect_kw = collect_kw
         self.local = threading.local()
         self.pool = ThreadPoolExecutor(max_workers=1)
         self.future = None
+        self.generator = torch.Generator(device=device)
+        self.generator.manual_seed(seed)
+        self.stream = torch.cuda.Stream(device=device, priority=-1) if device.type == "cuda" else None
 
-    def _work(self, net):
+    def _work(self, net, ready):
         if not hasattr(self.local, "env"):
             self.local.env = self.env_factory()
         t0 = time.time()
-        batch = collect(self.local.env, net, self.device, **self.collect_kw)
+        if self.stream is None:
+            batch = collect(self.local.env, net, self.device, generator=self.generator, **self.collect_kw)
+        else:
+            self.stream.wait_event(ready)  # 写しを作り終えてから使う
+            with torch.cuda.stream(self.stream):
+                batch = collect(self.local.env, net, self.device, generator=self.generator, **self.collect_kw)
+            self.stream.synchronize()
         finished = self.local.env.pop_finished()
         return batch, finished, time.time() - t0
 
@@ -815,7 +844,11 @@ class PipelinedCollector:
             raise RuntimeError("前の batch を受け取る前に次を頼んだ")
         snap = copy.deepcopy(net).eval()
         snap.requires_grad_(False)
-        self.future = self.pool.submit(self._work, snap)
+        ready = None
+        if self.stream is not None:
+            ready = torch.cuda.Event()
+            ready.record()  # 既定のストリーム上で写しを作り終えた印
+        self.future = self.pool.submit(self._work, snap, ready)
 
     def result(self):
         """(batch, 終局した局, 集めるのにかかった秒)"""

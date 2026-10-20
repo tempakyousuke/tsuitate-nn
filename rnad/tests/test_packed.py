@@ -84,7 +84,30 @@ def check_equal(step, aux):
           f"（標本 {a['samples']}、勾配の相対差 最大 {worst:.1e}）")
 
 
+def check_skip_zero_weight():
+    """α が 0 / 1 のとき重みが 0 の正則化ネットを順伝播しなくても、混ぜた値とビット単位で同じ"""
+    torch.manual_seed(0)
+    net = PolicyValueNet(8, 1).eval()
+    learner = RNaDLearner(net, RNaDConfig(), DEV)
+    with torch.no_grad():
+        for p in learner.prev_.parameters():
+            p.add_(0.3 * torch.randn_like(p))
+    torch.manual_seed(1)
+    batch = collect(tsuitate_rl.VecEnv(4, seed=5, auto_reset=False), net, DEV)
+    obs = batch["obs"][:200].float()
+    legal = batch["legal"][:200]
+    from rnad import forward, legal_log_policy
+    with torch.no_grad():
+        lp = legal_log_policy(forward(learner.prev, obs)[0], legal)
+        lp_ = legal_log_policy(forward(learner.prev_, obs)[0], legal)
+        for alpha, want in ((1.0, 1.0 * lp + 0.0 * lp_), (0.0, 0.0 * lp + 1.0 * lp_)):
+            got = learner._lpr_mix(obs, legal, alpha)
+            assert torch.equal(got, want), alpha
+    print("重み 0 の正則化ネットを省いても α 混合とビット単位で同じ")
+
+
 if __name__ == "__main__":
+    check_skip_zero_weight()
     check_pack()
     check_equal(0, aux=False)
     check_equal(3, aux=False)
