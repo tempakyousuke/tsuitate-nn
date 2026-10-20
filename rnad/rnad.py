@@ -99,6 +99,8 @@ def forward(net, x: torch.Tensor):
 
 # ---------------------------------------------------------------- 方策の基本演算
 
+NUM_ACTIONS = 139 * 81  # tsuitate-bot の rl::action（種類 × マス）
+
 
 def legal_log_policy(logits: torch.Tensor, legal: torch.Tensor) -> torch.Tensor:
     """マスク内の log softmax。マスク外は 0（参照の legal_log_policy と同じ規約）"""
@@ -109,6 +111,24 @@ def legal_log_policy(logits: torch.Tensor, legal: torch.Tensor) -> torch.Tensor:
 def legal_policy(logits: torch.Tensor, legal: torch.Tensor) -> torch.Tensor:
     """マスク内の softmax。マスク外は 0"""
     return logits.masked_fill(~legal, float("-inf")).softmax(-1)
+
+
+def pack_csr(cols: torch.Tensor, counts: torch.Tensor, action: torch.Tensor):
+    """`pack_legal` と同じ (idx, 詰めたマスク, 選んだ手の位置) を、合法手の添字の列（行ごとに昇順でつなげたもの）と
+    行ごとの個数から作る（`collect(compact_legal=True)` の batch 用。密なマスクを経由しない）"""
+    n = len(counts)
+    counts = counts.long()
+    k = int(counts.max())
+    rows = torch.repeat_interleave(torch.arange(n, device=cols.device), counts)
+    pos = torch.arange(len(rows), device=cols.device) - (torch.cumsum(counts, 0) - counts)[rows]
+    idx = torch.zeros(n, k, dtype=torch.long, device=cols.device)
+    idx[rows, pos] = cols.long()
+    pmask = torch.zeros(n, k, dtype=torch.bool, device=cols.device)
+    pmask[rows, pos] = True
+    apos = ((idx == action[:, None]) & pmask).to(torch.uint8).argmax(1)
+    if not bool((idx.gather(1, apos[:, None]).squeeze(1) == action).all()):
+        raise ValueError("マスク外の手が batch にある")
+    return idx, pmask, apos
 
 
 def pack_legal(legal: torch.Tensor, action: torch.Tensor):
@@ -332,14 +352,28 @@ class RNaDLearner:
         return alpha * lp_prev + (1 - alpha) * lp_prev_
 
     def _chunk_view(self, batch, sl):
-        """チャンクの (観測, マスク, 行動, ロジットを選ぶ関数)。packed なら合法手に詰めたもの"""
+        """チャンクの (観測, マスク, 行動, ロジットを選ぶ関数)。packed なら合法手に詰めたもの。
+        batch のマスクは密（`legal`）でも添字（`legal_cols` / `legal_counts`、`collect(compact_legal=True)`）でもよい"""
         dev = self.device
         obs = batch["obs"][sl].to(dev, torch.float32)
-        legal = batch["legal"][sl].to(dev)
         act = batch["action"][sl].to(dev)
-        if not self.packed:
-            return obs, legal, act, (lambda x: x)
-        idx, pmask, apos = pack_legal(legal, act)
+        if "legal" in batch:
+            legal = batch["legal"][sl].to(dev)
+            if not self.packed:
+                return obs, legal, act, (lambda x: x)
+            idx, pmask, apos = pack_legal(legal, act)
+        else:
+            ptr = batch.get("_legal_ptr")
+            if ptr is None:
+                ptr = torch.cat([torch.zeros(1, dtype=torch.long), torch.cumsum(batch["legal_counts"].long(), 0)])
+                batch["_legal_ptr"] = ptr
+            counts = batch["legal_counts"][sl].to(dev)
+            cols = batch["legal_cols"][int(ptr[sl.start]):int(ptr[sl.stop])].to(dev)
+            idx, pmask, apos = pack_csr(cols, counts, act)
+            if not self.packed:
+                legal = torch.zeros(len(act), NUM_ACTIONS, dtype=torch.bool, device=dev)
+                legal.scatter_(1, idx, pmask)
+                return obs, legal, act, (lambda x: x)
         return obs, pmask, apos, (lambda x: x.gather(1, idx))
 
     def update(self, batch, reward_scale=1.0):
@@ -656,7 +690,7 @@ class MultiEnv:
 
 def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode="enter",
             nyugyoku_zero_sum=True, opponents=None, opp_nets=None, nyugyoku_win_only=False, truth=False,
-            generator=None):
+            generator=None, compact_legal=False):
     """`env`（auto_reset=False の VecEnv）の全局を1局ずつ最後まで自己対局し、学習用に並べる。
 
     戻り値の obs / legal / action / mu_a / t / b は有効なステップだけを平らにしたもの、
@@ -695,6 +729,10 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
 
     `truth=True` なら記録する各手番の**真実の盤面のラベル**（`VecEnv.truth()`、[N, 81] int8）を
     `truth` に入れて返す（補助ヘッド用。乱数は消費しない）
+
+    `compact_legal=True` なら合法手のマスクを密な [N, 11259] の bool でなく、**合法手の添字**（行ごとに昇順でつなげた
+    `legal_cols` int16 と行ごとの個数 `legal_counts`）で持つ（768局で約 0.79GB → 約 11MB。`--pipeline` で batch が
+    2つ同時にあるときのメモリ対策。`RNaDLearner.update` はどちらの形でも同じ結果になる）
 
     `generator` を渡すと学習側の手のサンプリングはその乱数列を使う（`PipelinedCollector` が別スレッドでも
     再現するように。渡さなければ従来どおり torch の大域の乱数）
@@ -785,7 +823,12 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
         if not len(idx):
             continue
         obs_l.append(torch.from_numpy(obs[idx]).half())
-        legal_l.append(torch.from_numpy(mask[idx]))
+        if compact_legal:
+            rows_m = mask[idx]
+            legal_l.append((torch.from_numpy(np.nonzero(rows_m)[1].astype(np.int16)),
+                            torch.from_numpy(rows_m.sum(1).astype(np.int32))))
+        else:
+            legal_l.append(torch.from_numpy(mask[idx]))
         act_l.append(a)
         mu_l.append(mu)
         t_l.append(torch.full((len(idx),), t, dtype=torch.long))
@@ -802,7 +845,9 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
     T = t + 1
     extra = {"truth": torch.cat(truth_l)} if truth else {}
     return {**extra,
-        "obs": torch.cat(obs_l), "legal": torch.cat(legal_l), "action": torch.cat(act_l),
+        **({"legal_cols": torch.cat([c for c, _ in legal_l]), "legal_counts": torch.cat([n for _, n in legal_l])}
+           if compact_legal else {"legal": torch.cat(legal_l)}),
+        "obs": torch.cat(obs_l), "action": torch.cat(act_l),
         "mu_a": torch.cat(mu_l), "t": torch.cat(t_l), "b": torch.cat(b_l),
         "valid": valid[:T], "player": player[:T], "reward": reward[:T],
         "entered": entered, "advance": advance, "outcome": outcome,

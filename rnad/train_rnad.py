@@ -200,6 +200,9 @@ def main() -> None:
     ap.add_argument("--reuse", type=int, default=1,
                     help="1つの batch で続けて更新する回数（2 以上で標本を使い回す。2回目以降は π/μ ≠ 1 を"
                          "v-trace が補正する。正則化方策の差し替え間隔は更新回数で数える）")
+    ap.add_argument("--compact-legal", action="store_true",
+                    help="batch の合法手のマスクを添字で持つ（768局で約 0.79GB → 約 11MB。更新の結果は同じ。"
+                         "--pipeline で batch が2つ同時にあるときのメモリ対策）")
     ap.add_argument("--extra-ema", default="",
                     help="学習には使わない追加の指数移動平均（カンマ区切りの係数、例 '0.0003,0.003'）。書き出しの区切りで "
                          "ema<係数>_<step>.bin に書く（ターゲットの 0.001 以外の平均化で書き出しが強くなるかを見る。"
@@ -358,7 +361,7 @@ def main() -> None:
             raise SystemExit("--pipeline は自己対局だけ・ボーナスなし・補助ヘッドなしの設定で使う")
         pipe = PipelinedCollector(
             lambda: tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False, **obs_kw), device,
-            seed=args.seed * 1_000_003 + 17 + learner.step_count)
+            seed=args.seed * 1_000_003 + 17 + learner.step_count, compact_legal=args.compact_legal)
         pipe.submit(learner.net)
 
     # 学習には使わない追加の指数移動平均（--extra-ema）。現在のネットの写しを係数ごとに持つ
@@ -436,7 +439,7 @@ def main() -> None:
                             nyugyoku_win_only=args.nyugyoku_cond == "win",
                             opponents=(None if league_games is None else [None] * n_self + league_games),
                             opp_nets=(opp_nets if league_games is not None else None),
-                            truth=cfg.aux_truth > 0)
+                            truth=cfg.aux_truth > 0, compact_legal=args.compact_legal)
             t1 = time.time()
             finished = env.pop_finished() if env is not None else []
             league_finished = league_env.pop_finished() if league_env is not None else []

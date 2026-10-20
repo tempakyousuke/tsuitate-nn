@@ -133,7 +133,31 @@ def check_pg_is_softmax_policy_gradient():
     print("policy_loss=pg はソフトマックス方策勾配と一致")
 
 
+def check_compact_legal():
+    """collect(compact_legal=True) の batch でも、密なマスクの batch と同じ損失・勾配になる（packed でも従来でも）"""
+    torch.manual_seed(0)
+    net = PolicyValueNet(8, 1).eval()
+    cfg = RNaDConfig(beta=16.0, lr=0.0, schedule_sizes=(10,), schedule_repeats=(1,), chunk=150)
+    for packed in (False, True):
+        out = []
+        for compact in (False, True):
+            learner = RNaDLearner(copy.deepcopy(net), cfg, DEV, packed=packed)
+            learner.step_count = 3
+            torch.manual_seed(1)
+            b = collect(tsuitate_rl.VecEnv(6, seed=9, auto_reset=False), learner.net, DEV, compact_legal=compact)
+            assert ("legal" in b) != compact
+            info = learner.update(b)
+            out.append((info, grads(learner)))
+        (ia, ga), (ib, gb) = out
+        np.testing.assert_allclose(ib["loss_nerd"], ia["loss_nerd"], rtol=1e-5, atol=1e-7)
+        np.testing.assert_allclose(ib["loss_v"], ia["loss_v"], rtol=1e-5, atol=1e-7)
+        for x, y in zip(ga, gb):
+            np.testing.assert_allclose(y.numpy(), x.numpy(), rtol=1e-4, atol=1e-7)
+    print("compact_legal の batch でも損失・勾配が同じ（packed / 従来）")
+
+
 if __name__ == "__main__":
+    check_compact_legal()
     check_pg_is_softmax_policy_gradient()
     check_skip_zero_weight()
     check_pack()
