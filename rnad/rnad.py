@@ -18,6 +18,9 @@
 
 import copy
 import math
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -96,6 +99,8 @@ def forward(net, x: torch.Tensor):
 
 # ---------------------------------------------------------------- 方策の基本演算
 
+NUM_ACTIONS = 139 * 81  # tsuitate-bot の rl::action（種類 × マス）
+
 
 def legal_log_policy(logits: torch.Tensor, legal: torch.Tensor) -> torch.Tensor:
     """マスク内の log softmax。マスク外は 0（参照の legal_log_policy と同じ規約）"""
@@ -106,6 +111,46 @@ def legal_log_policy(logits: torch.Tensor, legal: torch.Tensor) -> torch.Tensor:
 def legal_policy(logits: torch.Tensor, legal: torch.Tensor) -> torch.Tensor:
     """マスク内の softmax。マスク外は 0"""
     return logits.masked_fill(~legal, float("-inf")).softmax(-1)
+
+
+def pack_csr(cols: torch.Tensor, counts: torch.Tensor, action: torch.Tensor):
+    """`pack_legal` と同じ (idx, 詰めたマスク, 選んだ手の位置) を、合法手の添字の列（行ごとに昇順でつなげたもの）と
+    行ごとの個数から作る（`collect(compact_legal=True)` の batch 用。密なマスクを経由しない）"""
+    n = len(counts)
+    counts = counts.long()
+    k = int(counts.max())
+    rows = torch.repeat_interleave(torch.arange(n, device=cols.device), counts)
+    pos = torch.arange(len(rows), device=cols.device) - (torch.cumsum(counts, 0) - counts)[rows]
+    idx = torch.zeros(n, k, dtype=torch.long, device=cols.device)
+    idx[rows, pos] = cols.long()
+    pmask = torch.zeros(n, k, dtype=torch.bool, device=cols.device)
+    pmask[rows, pos] = True
+    apos = ((idx == action[:, None]) & pmask).to(torch.uint8).argmax(1)
+    if not bool((idx.gather(1, apos[:, None]).squeeze(1) == action).all()):
+        raise ValueError("マスク外の手が batch にある")
+    return idx, pmask, apos
+
+
+def pack_legal(legal: torch.Tensor, action: torch.Tensor):
+    """合法手だけを左に詰めた添字 (idx [n, K], 詰めたマスク [n, K], 選んだ手の詰めた位置 [n])。K は行ごとの合法手数の最大。
+
+    方策の計算（マスク内の softmax・NeuRD の損失）はマスク内の手しか使わないので、11,259 手の配列の代わりに
+    `logits.gather(1, idx)` の [n, K] で同じ値・同じ勾配になる（合法手は rl_deduce_v4 の自己対局で平均 約80・最大 約330 手）。
+    `RNaDLearner(packed=True)` が使う。並びは行ごとに行動番号の昇順（nonzero が行優先で返すため）
+    """
+    n = legal.shape[0]
+    counts = legal.sum(1)
+    k = int(counts.max())
+    rows, cols = legal.nonzero(as_tuple=True)
+    pos = torch.arange(len(rows), device=legal.device) - (torch.cumsum(counts, 0) - counts)[rows]
+    idx = torch.zeros(n, k, dtype=torch.long, device=legal.device)
+    idx[rows, pos] = cols
+    pmask = torch.zeros(n, k, dtype=torch.bool, device=legal.device)
+    pmask[rows, pos] = True
+    apos = ((idx == action[:, None]) & pmask).to(torch.uint8).argmax(1)
+    if not bool((idx.gather(1, apos[:, None]).squeeze(1) == action).all()):
+        raise ValueError("マスク外の手が batch にある")
+    return idx, pmask, apos
 
 
 # ---------------------------------------------------------------- 正則化の繰り返し
@@ -126,6 +171,15 @@ class EntropySchedule:
             schedule.extend([schedule[-1] + (i + 1) * size for i in range(repeat)])
         self.schedule = np.array(schedule)
 
+    def position(self, step: int):
+        """(この step を含む段階の始まり, 段階の長さ)"""
+        s = self.schedule
+        if step >= s[-1]:
+            size = s[-1] - s[-2]
+            return int(s[-1] + (step - s[-1]) // size * size), int(size)
+        start = s[s <= step].max()
+        return int(start), int(s[s > step].min() - start)
+
     def __call__(self, step: int):
         """(alpha, この step の後に正則化方策を差し替えるか)"""
         s = self.schedule
@@ -143,17 +197,22 @@ class EntropySchedule:
 # ---------------------------------------------------------------- v-trace
 
 
-def v_trace_scalars(v, valid, player, pi_a, mu_a, ent, reward, k, eta, c=1.0, rho=math.inf):
+def v_trace_scalars(v, valid, player, pi_a, mu_a, ent, reward, k, eta, c=1.0, rho=math.inf, inv_mu_cap=0.0):
     """プレイヤー k から見た v-trace（参照の v_trace をスカラーに落とした版）。
 
     引数はどれも [T, B]（reward は k の報酬、ent = Σ_a π_a·lpr_a（手番側の方策で））。
     戻り値:
         vt: k の手番のステップでの価値の目標（それ以外は 0）
         s:  k の手番のステップでの Q のスカラー部分（learning_output = v + η 項 + onehot·s）
+    `c` は数か [T, B] のテンソル（時刻ごとの c。`RNaDConfig.c_ply` で序盤は 1・終盤だけ λ にするため）。
+    `inv_mu_cap` > 0 なら s に掛かる 1/μ に上限を付ける（参照には無い。まれにしか選ばれない手の
+    s が勾配の分散のほとんどを占めるため。docs/rl-learning-speed.md）。価値の目標 vt には効かない
     """
     T, B = v.shape
     cs = torch.where(valid, pi_a / mu_a, torch.ones_like(v))
     inv_mu = torch.where(valid, 1.0 / mu_a, torch.ones_like(v))
+    if inv_mu_cap > 0:
+        inv_mu = inv_mu.clamp(max=inv_mu_cap)
     player_others = torch.where(player == k, 1.0, -1.0) * valid
     eta_reg_entropy = -eta * ent * player_others
 
@@ -169,8 +228,9 @@ def v_trace_scalars(v, valid, player, pi_a, mu_a, ent, reward, k, eta, c=1.0, rh
         r_unc = reward[t] + c_reward_unc + eta_reg_entropy[t]
         disc = reward[t] + c_reward
         w = cs[t] * c_is
+        w_c = torch.minimum(w, c[t]) if torch.is_tensor(c) else torch.clamp(w, max=c)
         our_vt = (v[t] + torch.clamp(w, max=rho) * (r_unc + c_next_value - v[t])
-                  + torch.clamp(w, max=c) * (c_next_vt - c_next_value))
+                  + w_c * (c_next_vt - c_next_value))
         our_s = inv_mu[t] * (disc + c_is * c_next_vt - v[t])
         vt[t] = torch.where(ours, our_vt, zeros)
         s[t] = torch.where(ours, our_s, zeros)
@@ -188,12 +248,17 @@ def v_trace_scalars(v, valid, player, pi_a, mu_a, ent, reward, k, eta, c=1.0, rh
 # ---------------------------------------------------------------- 損失
 
 
-def loss_terms(logits, v, legal, action, player, lpr, vt, s, counts, eta, beta, clip=10_000.0):
+def loss_terms(logits, v, legal, action, player, lpr, vt, s, counts, eta, beta, clip=10_000.0, policy_loss="neurd"):
     """有効なステップの集まり（平らにした [N]）について、損失の和を返す。
 
     counts[k] はバッチ全体でのプレイヤー k の手番数（参照は損失をこれで割る）。チャンクに
     分けて呼んでも、全体をまとめて呼んだのと同じ値の和になる。
     lpr は勾配を止めた正則化の対数比 [N, A]、vt / s は v-trace の結果 [N]。
+
+    `policy_loss="pg"` は NeuRD の押し出し（アドバンテージそのもの）に各手の π を掛ける（参照には無い。
+    docs/rl-learning-speed.md）。η の項は −η·KL(π‖π_reg) のロジットでの勾配、s の項は選んだ手の
+    (1[b=a] − π_b)·(結果 − v)（集めた方策で更新するので π = μ）になり、まれな手の 1/μ が消える。
+    NeuRD の「確率の低い手でも押し出しが消えない」性質は失う
     """
     norm = torch.where(player == 0, 1.0 / max(counts[0], 1), 1.0 / max(counts[1], 1))
     loss_v = (norm * (v - vt) ** 2).sum()
@@ -204,6 +269,10 @@ def loss_terms(logits, v, legal, action, player, lpr, vt, s, counts, eta, beta, 
         mean_lpr = (pi * lpr).sum(-1, keepdim=True)
         onehot = F.one_hot(action, logits.shape[-1]).to(logits.dtype)
         adv = -eta * (lpr - mean_lpr) + s[:, None] * (onehot - pi_taken[:, None])
+        if policy_loss == "pg":
+            adv = adv * pi
+        elif policy_loss != "neurd":
+            raise ValueError(f"policy_loss {policy_loss}（neurd / pg）")
         adv = adv.clamp(-clip, clip)
     legal_f = legal.to(logits.dtype)
     mean_logit = (logits * legal_f).sum(-1, keepdim=True) / legal_f.sum(-1, keepdim=True)
@@ -234,6 +303,15 @@ class RNaDConfig:
     # 真実の盤面を予測する補助ヘッドの損失の重み（0 = 使わない）。損失は1決定点あたりの
     # 「自駒以外のマスの交差エントロピーの平均」の決定点平均（loss_v・nerd と同じく標本の平均の単位）
     aux_truth: float = 0.0
+    # Adam の1次モーメントの係数（参照は 0 = モーメンタムなし）。学習の速さの実験用（docs/rl-learning-speed.md）
+    adam_b1: float = 0.0
+    # v-trace の s に掛かる 1/μ の上限（0 = 上限なし = 参照と同じ）。学習の速さの実験用
+    inv_mu_cap: float = 0.0
+    # 方策の損失（neurd = 参照 / pg = 押し出しに π を掛ける）。学習の速さの実験用
+    policy_loss: str = "neurd"
+    # 終盤だけの λ: (時刻, λ)。collect の時刻（両者の試行の通し番号。反則を含む）がこれ以上の手番だけ c = λ、
+    # それより前は c_vtrace。(0, 1.0) = 使わない。学習の速さの実験用
+    c_ply: tuple = (0, 1.0)
 
 
 class RNaDLearner:
@@ -243,9 +321,13 @@ class RNaDLearner:
     アフィン変換として学習する）。行動・学習・評価で統計が変わらないようにするため。
     """
 
-    def __init__(self, net, cfg: RNaDConfig, device):
+    def __init__(self, net, cfg: RNaDConfig, device, packed: bool = False):
         self.cfg = cfg
         self.device = device
+        # packed = 方策の計算を合法手に詰めて行い、正則化方策の対数確率を1回目から2回目へ持ち越す
+        # （`pack_legal`）。**数式は同じ**（浮動小数の足し順が違うだけ）で、2回目の prev / prev_ の
+        # 順伝播と [n, 11259] の要素演算がなくなる。設定（cfg）には入れない = checkpoint の互換に影響しない
+        self.packed = packed
         self.net = net.to(device).eval()
         self.target = copy.deepcopy(self.net).eval()
         self.prev = copy.deepcopy(self.net).eval()
@@ -253,7 +335,7 @@ class RNaDLearner:
         for m in (self.target, self.prev, self.prev_):
             m.requires_grad_(False)
         # 参照: adam(b1=0, b2=0.999, eps=1e-7) → scale(-lr) → clip(clip_gradient)
-        self.opt = torch.optim.Adam(self.net.parameters(), lr=cfg.lr, betas=(0.0, 0.999), eps=1e-7)
+        self.opt = torch.optim.Adam(self.net.parameters(), lr=cfg.lr, betas=(cfg.adam_b1, 0.999), eps=1e-7)
         self.schedule = EntropySchedule(cfg.schedule_sizes, cfg.schedule_repeats)
         self.step_count = 0
         # 補助ヘッドは使うときだけ作る（使わない run の checkpoint・乱数の消費は従来と同じ）
@@ -270,11 +352,43 @@ class RNaDLearner:
         for i in range(0, n, self.cfg.chunk):
             yield slice(i, min(i + self.cfg.chunk, n))
 
-    def _lpr_mix(self, obs, legal, alpha):
-        """正則化方策の対数確率（2つの前の版の α 混合）"""
-        lp_prev = legal_log_policy(forward(self.prev, obs)[0], legal)
-        lp_prev_ = legal_log_policy(forward(self.prev_, obs)[0], legal)
+    def _lpr_mix(self, obs, legal, alpha, sel=None):
+        """正則化方策の対数確率（2つの前の版の α 混合）。`sel` はロジットを詰める関数（packed のとき）"""
+        sel = sel or (lambda x: x)
+        # 重みが 0 の側は順伝播しない（段階の後半は α = 1 で prev_ が要らない）。対数確率は合法手で有限なので
+        # 1.0·x + 0.0·y = x がビット単位で成り立ち、結果は混ぜた場合と同じ
+        if alpha >= 1.0:
+            return legal_log_policy(sel(forward(self.prev, obs)[0]), legal)
+        if alpha <= 0.0:
+            return legal_log_policy(sel(forward(self.prev_, obs)[0]), legal)
+        lp_prev = legal_log_policy(sel(forward(self.prev, obs)[0]), legal)
+        lp_prev_ = legal_log_policy(sel(forward(self.prev_, obs)[0]), legal)
         return alpha * lp_prev + (1 - alpha) * lp_prev_
+
+    def _chunk_view(self, batch, sl):
+        """チャンクの (観測, マスク, 行動, ロジットを選ぶ関数)。packed なら合法手に詰めたもの。
+        batch のマスクは密（`legal`）でも添字（`legal_cols` / `legal_counts`、`collect(compact_legal=True)`）でもよい"""
+        dev = self.device
+        obs = batch["obs"][sl].to(dev, torch.float32)
+        act = batch["action"][sl].to(dev)
+        if "legal" in batch:
+            legal = batch["legal"][sl].to(dev)
+            if not self.packed:
+                return obs, legal, act, (lambda x: x)
+            idx, pmask, apos = pack_legal(legal, act)
+        else:
+            ptr = batch.get("_legal_ptr")
+            if ptr is None:
+                ptr = torch.cat([torch.zeros(1, dtype=torch.long), torch.cumsum(batch["legal_counts"].long(), 0)])
+                batch["_legal_ptr"] = ptr
+            counts = batch["legal_counts"][sl].to(dev)
+            cols = batch["legal_cols"][int(ptr[sl.start]):int(ptr[sl.stop])].to(dev)
+            idx, pmask, apos = pack_csr(cols, counts, act)
+            if not self.packed:
+                legal = torch.zeros(len(act), NUM_ACTIONS, dtype=torch.bool, device=dev)
+                legal.scatter_(1, idx, pmask)
+                return obs, legal, act, (lambda x: x)
+        return obs, pmask, apos, (lambda x: x.gather(1, idx))
 
     def update(self, batch, reward_scale=1.0):
         """batch（`collect` の戻り値）で1回更新する。ログ用の dict を返す。
@@ -296,28 +410,34 @@ class RNaDLearner:
             cfg = replace(cfg, eta=cfg.eta / reward_scale)
             batch = {**batch, "reward": batch["reward"] / reward_scale}
         alpha, update_reg = self.schedule(self.step_count)
-        obs_all = batch["obs"]
-        legal_all = batch["legal"]
-        action_all = batch["action"]
-        n = len(action_all)
+        n = len(batch["action"])
         t_idx, b_idx = batch["t"], batch["b"]
         T, B = batch["valid"].shape
 
         # 1回目: 勾配なしで v-trace の入力（π_a・Σπ·lpr・ターゲットの v）を作る
         pi_a = torch.zeros(n)
+        # 見張り（方策が決定的に固まっていないか。PG・1/μ の上限で NeuRD の「確率の低い手でも押し出しが消えない」
+        # 性質が弱まると、ここが先に動く）: 最善手の確率の平均・0.999 を超える決定点の数・エントロピーの和
+        top_sum = top_hi = ent_sum = 0.0
         ent = torch.zeros(n)
         v_tgt = torch.zeros(n)
+        mix_cache = []  # packed のとき、チャンクごとの正則化方策の対数確率（詰めたもの。2回目で使い回す）
         with torch.no_grad():
             for sl in self._chunks(n):
-                obs = obs_all[sl].to(dev, torch.float32)
-                legal = legal_all[sl].to(dev)
-                act = action_all[sl].to(dev)
-                logits, _ = forward(self.net, obs)
+                obs, legal, act, sel = self._chunk_view(batch, sl)
+                logits = sel(forward(self.net, obs)[0])
                 log_pi = legal_log_policy(logits, legal)
                 pi = log_pi.exp() * legal
-                lpr = log_pi - self._lpr_mix(obs, legal, alpha)
+                mix = self._lpr_mix(obs, legal, alpha, sel)
+                if self.packed:
+                    mix_cache.append(mix)
+                lpr = log_pi - mix
                 pi_a[sl] = pi.gather(1, act[:, None]).squeeze(1).cpu()
                 ent[sl] = (pi * lpr).sum(-1).cpu()
+                top = pi.max(1).values
+                top_sum += float(top.sum())
+                top_hi += float((top > 0.999).sum())
+                ent_sum += float(-(pi * log_pi).sum())
                 v_tgt[sl] = forward(self.target, obs)[1].cpu()
 
         def grid(x):
@@ -330,9 +450,14 @@ class RNaDLearner:
         mu_g = torch.where(valid, grid(batch["mu_a"]), torch.ones(T, B))
         vt = torch.zeros(n)
         s = torch.zeros(n)
+        c_arg = cfg.c_vtrace
+        if tuple(cfg.c_ply) != (0, 1.0):
+            ply0, lam = cfg.c_ply
+            c_arg = torch.where(torch.arange(T)[:, None] >= int(ply0), float(lam), float(cfg.c_vtrace)).expand(T, B)
         for k in (0, 1):
             vt_k, s_k = v_trace_scalars(grid(v_tgt), valid, player, grid(pi_a), mu_g, grid(ent),
-                                        batch["reward"][:, :, k], k, cfg.eta, c=cfg.c_vtrace)
+                                        batch["reward"][:, :, k], k, cfg.eta, c=c_arg,
+                                        inv_mu_cap=cfg.inv_mu_cap)
             mine = player[t_idx, b_idx] == k
             vt = torch.where(mine, vt_k[t_idx, b_idx], vt)
             s = torch.where(mine, s_k[t_idx, b_idx], s)
@@ -348,18 +473,19 @@ class RNaDLearner:
             self.aux_opt.zero_grad(set_to_none=True)
         self.opt.zero_grad(set_to_none=True)
         tot_v = tot_nerd = tot_aux = 0.0
-        for sl in self._chunks(n):
-            obs = obs_all[sl].to(dev, torch.float32)
-            legal = legal_all[sl].to(dev)
-            act = action_all[sl].to(dev)
+        for ci, sl in enumerate(self._chunks(n)):
+            obs, legal, act, sel = self._chunk_view(batch, sl)
             if use_aux:
                 logits, v, aux_logits = forward_aux(self.net, self.aux, obs)
             else:
                 logits, v = forward(self.net, obs)
+            logits = sel(logits)
             with torch.no_grad():
-                lpr = legal_log_policy(logits, legal) - self._lpr_mix(obs, legal, alpha)
+                mix = mix_cache[ci] if self.packed else self._lpr_mix(obs, legal, alpha)
+                lpr = legal_log_policy(logits, legal) - mix
             lv, ln = loss_terms(logits, v, legal, act, player_flat[sl].to(dev), lpr,
-                                vt[sl].to(dev), s[sl].to(dev), counts, cfg.eta, cfg.beta, cfg.clip)
+                                vt[sl].to(dev), s[sl].to(dev), counts, cfg.eta, cfg.beta, cfg.clip,
+                                cfg.policy_loss)
             loss = lv + ln
             if use_aux:
                 la = aux_truth_loss(aux_logits, batch["truth"][sl].to(dev, torch.long)).sum() / n
@@ -385,6 +511,7 @@ class RNaDLearner:
         # （バッチの形で変わるカーネル・精度）で、v-trace の重要度比へそのまま入る
         ratio = pi_a / batch["mu_a"]
         out = {"loss_v": tot_v, "loss_nerd": tot_nerd, "alpha": alpha,
+               "pi_top_mean": top_sum / n, "pi_top_gt_0999": top_hi / n, "entropy_mean": ent_sum / n,
                 "reg_update": bool(update_reg), "samples": n,
                 "ratio_dev_mean": float((ratio - 1).abs().mean()),
                 "ratio_dev_max": float((ratio - 1).abs().max()),
@@ -417,11 +544,20 @@ class RNaDLearner:
         if "rng" in d:
             set_rng_state(d["rng"], self.device)
 
+    def reset_optimizer_state(self):
+        """Adam の状態（1次・2次モーメントと step）を捨てる。**途中から更新の式を変える A/B の両腕で使う**:
+        checkpoint の2次モーメントは今の式の勾配（本線ではまれな手の 1/μ のスパイク）の大きさを覚えていて、
+        分散を減らす変更をすると実効の学習率が何千更新も小さいまま残る（b2 = 0.999。docs/rl-learning-speed.md）"""
+        self.opt.state.clear()
+        if self.aux_opt is not None:
+            self.aux_opt.state.clear()
+
     def apply_cfg(self, cfg: RNaDConfig):
         """設定を差し替える（再開時に明示的に上書きするとき。optimizer の学習率も合わせる）"""
         self.cfg = cfg
         for g in self.opt.param_groups:
             g["lr"] = cfg.lr
+            g["betas"] = (cfg.adam_b1, g["betas"][1])
         if self.aux_opt is not None:
             for g in self.aux_opt.param_groups:
                 g["lr"] = cfg.lr
@@ -587,7 +723,8 @@ class MultiEnv:
 
 
 def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode="enter",
-            nyugyoku_zero_sum=True, opponents=None, opp_nets=None, nyugyoku_win_only=False, truth=False):
+            nyugyoku_zero_sum=True, opponents=None, opp_nets=None, nyugyoku_win_only=False, truth=False,
+            generator=None, compact_legal=False):
     """`env`（auto_reset=False の VecEnv）の全局を1局ずつ最後まで自己対局し、学習用に並べる。
 
     戻り値の obs / legal / action / mu_a / t / b は有効なステップだけを平らにしたもの、
@@ -626,6 +763,13 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
 
     `truth=True` なら記録する各手番の**真実の盤面のラベル**（`VecEnv.truth()`、[N, 81] int8）を
     `truth` に入れて返す（補助ヘッド用。乱数は消費しない）
+
+    `compact_legal=True` なら合法手のマスクを密な [N, 11259] の bool でなく、**合法手の添字**（行ごとに昇順でつなげた
+    `legal_cols` int16 と行ごとの個数 `legal_counts`）で持つ（768局で約 0.79GB → 約 11MB。`--pipeline` で batch が
+    2つ同時にあるときのメモリ対策。`RNaDLearner.update` はどちらの形でも同じ結果になる）
+
+    `generator` を渡すと学習側の手のサンプリングはその乱数列を使う（`PipelinedCollector` が別スレッドでも
+    再現するように。渡さなければ従来どおり torch の大域の乱数）
     """
     env.reset()
     B = env.num_envs
@@ -685,7 +829,7 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
             last_act[b, p] = t
         actions = np.full(B, -1, dtype=np.int64)
         if len(idx):
-            a, mu = sample_actions(net, obs[idx], mask[idx], device)
+            a, mu = sample_actions(net, obs[idx], mask[idx], device, generator)
             actions[idx] = a.numpy()
         if opp_by:
             groups = {name: np.array(bs, dtype=np.int64) for name, bs in opp_by.items()}
@@ -713,7 +857,12 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
         if not len(idx):
             continue
         obs_l.append(torch.from_numpy(obs[idx]).half())
-        legal_l.append(torch.from_numpy(mask[idx]))
+        if compact_legal:
+            rows_m = mask[idx]
+            legal_l.append((torch.from_numpy(np.nonzero(rows_m)[1].astype(np.int16)),
+                            torch.from_numpy(rows_m.sum(1).astype(np.int32))))
+        else:
+            legal_l.append(torch.from_numpy(mask[idx]))
         act_l.append(a)
         mu_l.append(mu)
         t_l.append(torch.full((len(idx),), t, dtype=torch.long))
@@ -730,11 +879,76 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
     T = t + 1
     extra = {"truth": torch.cat(truth_l)} if truth else {}
     return {**extra,
-        "obs": torch.cat(obs_l), "legal": torch.cat(legal_l), "action": torch.cat(act_l),
+        **({"legal_cols": torch.cat([c for c, _ in legal_l]), "legal_counts": torch.cat([n for _, n in legal_l])}
+           if compact_legal else {"legal": torch.cat(legal_l)}),
+        "obs": torch.cat(obs_l), "action": torch.cat(act_l),
         "mu_a": torch.cat(mu_l), "t": torch.cat(t_l), "b": torch.cat(b_l),
         "valid": valid[:T], "player": player[:T], "reward": reward[:T],
         "entered": entered, "advance": advance, "outcome": outcome,
     }
+
+
+class PipelinedCollector:
+    """自己対局を**別スレッドで集めて更新と重ねる**（`train_rnad.py --pipeline`。docs/rl-learning-speed.md）。
+
+    `submit(net)` の時点のネットの写しで次の batch を集め始め、`result()` で受け取る。学習ループは
+    「batch を受け取る → 今のネットで次の batch を頼む → 受け取った batch で更新」と回すので、
+    **batch は1更新前の方策で集めたもの**になる（π/μ ≠ 1。v-trace の重要度比がそのまま補正する）。
+    自己対局（Rust の env と行動の推論）と更新（ネットの順伝播・逆伝播）が重なるぶん、1更新の壁時計が
+    「自己対局 + 更新」から「大きいほう」へ縮む（GPU では自己対局の大半が CPU 側の env なので重なる）。
+
+    env は Python のスレッドをまたげない（VecEnv は unsendable）ので、集める側のスレッドの中で作って持つ。
+    行動のサンプリングは専用の乱数列（`seed`）を使うので、スレッドの割り込み方によらず run は再現する
+    （乱数列が従来と違うので、`--pipeline` なしの run とは別の局になる）。
+
+    CUDA では集める側を**優先度の高い別ストリーム**で回す。既定のストリームを共有すると、集める側が手ごとに
+    `.cpu()` で待つたびに更新側の積まれたカーネルの後ろに並び、GPU の仕事が重ならない
+    """
+
+    def __init__(self, env_factory, device, seed=0, **collect_kw):
+        self.env_factory = env_factory
+        self.device = device
+        self.collect_kw = collect_kw
+        self.local = threading.local()
+        self.pool = ThreadPoolExecutor(max_workers=1)
+        self.future = None
+        self.generator = torch.Generator(device=device)
+        self.generator.manual_seed(seed)
+        self.stream = torch.cuda.Stream(device=device, priority=-1) if device.type == "cuda" else None
+
+    def _work(self, net, ready):
+        if not hasattr(self.local, "env"):
+            self.local.env = self.env_factory()
+        t0 = time.time()
+        if self.stream is None:
+            batch = collect(self.local.env, net, self.device, generator=self.generator, **self.collect_kw)
+        else:
+            self.stream.wait_event(ready)  # 写しを作り終えてから使う
+            with torch.cuda.stream(self.stream):
+                batch = collect(self.local.env, net, self.device, generator=self.generator, **self.collect_kw)
+            self.stream.synchronize()
+        finished = self.local.env.pop_finished()
+        return batch, finished, time.time() - t0
+
+    def submit(self, net):
+        if self.future is not None:
+            raise RuntimeError("前の batch を受け取る前に次を頼んだ")
+        snap = copy.deepcopy(net).eval()
+        snap.requires_grad_(False)
+        ready = None
+        if self.stream is not None:
+            ready = torch.cuda.Event()
+            ready.record()  # 既定のストリーム上で写しを作り終えた印
+        self.future = self.pool.submit(self._work, snap, ready)
+
+    def result(self):
+        """(batch, 終局した局, 集めるのにかかった秒)"""
+        out = self.future.result()
+        self.future = None
+        return out
+
+    def close(self):
+        self.pool.shutdown(wait=True)
 
 
 @torch.no_grad()

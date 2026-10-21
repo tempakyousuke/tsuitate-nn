@@ -45,6 +45,11 @@ ARENA_MATCH_SEED=20260927 cargo run --release --bin arena -- 100 "rl_policy:<pol
 | `fetch_records.py` | GitHub Actions の対局記録を取る |
 | `league.py` | リーグ学習の相手の選び方（負けやすい相手ほど多く当てる） |
 | `guard.py` | 防御特化（玉の周りの固め）の監視値の集計 |
+| `speedlab.py` | 学習の速さの比較: 固定パネル（`panel`）で run の書き出しを測り（`eval`、局ごとに鍵を決めた共通乱数）、腕ごとの学習曲線と対照とのペア差をまとめる（`report`） |
+| `gradsnr.py` | 学習なしの診断: 変種（クリップ・1/μ の上限・PG）ごとの局ごとの勾配の分散・期待勾配・雑音のスケール |
+| `bench_update.py` | 1更新の壁時計（従来 / `--packed` / 連続 / `--pipeline`）と、packed の勾配の一致 |
+| `distill.py` | 方策ネットを小さいネットへ蒸留する（CPU の代理 P2 の出発点） |
+| `toy_kuhn.py` | クーンポーカーで R-NaD の変種の偏りを厳密な NashConv で見る |
 
 ### 結果（2026-09-27、64ch×6ブロック、4,800局・53万試行、3エポック）
 
@@ -56,6 +61,28 @@ ARENA_MATCH_SEED=20260927 cargo run --release --bin arena -- 100 "rl_policy:<pol
 - arena（同 seed、100局）: **vs estimator_v6 73勝27敗（73.0%±8.7）**、反則/局 5.81（v6 8.40）、
   思考 平均 21ms（v6 1,418ms）。**手元の実測で、マシンに他の負荷があった**（v6 は壁時計で思考を
   打ち切るので、負荷で弱く出た可能性がある）。正式な計測は CI の arena で取り直す
+
+## 学習の速さの実験（tsuitate-bot の `docs/rl-learning-speed.md`）
+
+どれも**既定は従来と同じ**（付けなければ本線の学習は変わらない）。測り方・結果・GPU での手順は tsuitate-bot の doc。
+
+| フラグ | 中身 |
+| --- | --- |
+| `--packed` | 方策の計算を合法手に詰めて行う（数式は同じ。`tests/test_packed.py`）。重み 0 の正則化ネットの順伝播は常に省く |
+| `--pipeline` | 自己対局を別スレッド・別 CUDA ストリームで集め、更新と重ねる（1更新遅れの方策。自己対局だけ・ボーナスなし・補助ヘッドなしの設定。`--league` / `--guard` / `--speed` / `--nyugyoku` / `--aux-truth` と併用すると止まる） |
+| `--compact-legal` | batch の合法手のマスクを添字で持つ（768局で 0.79GB → 11MB。`--pipeline` のメモリ対策） |
+| `--inv-mu-cap K` / `--neurd-clip C` | v-trace の s の 1/μ の上限 / NeuRD のクリップ（まれな手のスパイクを取る） |
+| `--policy-loss pg` | NeuRD の押し出しに π を掛ける（ソフトマックス方策勾配） |
+| `--c-vtrace` / `--c-ply 時刻:λ` | v-trace の c（λ-return）/ 終盤だけ λ |
+| `--target-avg` / `--adam-b1` / `--reuse` | ターゲットの平均化係数 / Adam の β1 / 1つの batch で複数回更新 |
+| `--lr-sched cos:<割合>` / `--lr-warmup N` | 段階の中の学習率の余弦 / 最初の N 更新の線形の立ち上げ |
+| `--reset-adam` | 再開時に Adam の状態を捨てる（**途中から更新の式を変える A/B は両腕に付ける**。2次モーメントが古い勾配を何千更新も覚えている） |
+| `--reseed` | 再開時に checkpoint の乱数状態を使わず `--seed` で作り直す（同じ checkpoint から seed だけ変えた複製の対照） |
+| `--extra-ema 係数,...` / `--tail-avg` / `--export-current` | 学習に使わない追加の平均・段階の後半の一様な平均・現在のネットを書き出す |
+| `--panel <panel.json>` | 学習ループの中で固定パネルを測り `panel_eval.jsonl` へ（`speedlab.py report` の入力と同じ形） |
+| `--planes` / `--threads` | `--init none` の入力のプレーン数 / torch のスレッド数 |
+
+学習ログには `lr`（実際の学習率）と、方策の固まり方の見張り `pi_top_mean` / `pi_top_gt_0999` / `entropy_mean` が出る。
 
 ## 防御特化（玉の周りの固め）モデル
 
