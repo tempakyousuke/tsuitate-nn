@@ -115,6 +115,9 @@ def main() -> None:
     ap.add_argument("--checkpoint-every", type=int, default=25,
                     help="checkpoint を書く間隔（Spot で止められたらここから再開する）")
     ap.add_argument("--schedule", type=int, default=100, help="正則化方策を差し替える間隔（更新回数）")
+    ap.add_argument("--schedule-start", type=int, default=0,
+                    help="この更新回数を区切りにして、そこから --schedule ごとに差し替える（0 = 0 から数える）。"
+                         "途中の区切りから間隔を変えて再開するときに使う（58,000 から Δm=10,000 なら 58000 → 区切りは 68,000, 78,000, …）")
     ap.add_argument("--lr", type=float, default=5e-5)
     ap.add_argument("--eta", type=float, default=0.2)
     # NeuRD のしきい値（合法手の平均を引いたロジットが ±β を超える方向へは押さない）。
@@ -249,8 +252,15 @@ def main() -> None:
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
-    cfg = RNaDConfig(eta=args.eta, beta=args.beta, lr=args.lr, schedule_sizes=(args.schedule,),
-                     schedule_repeats=(1,), aux_truth=args.aux_truth, target_avg=args.target_avg,
+    if args.schedule_start:
+        # 区切りの列 [0, start, start + schedule, …]（EntropySchedule は最後の大きさで繰り返す）
+        if args.nyugyoku or args.guard or args.speed:
+            raise SystemExit("--schedule-start とボーナスの λ の予定は併用できない（λ の区間を区切りに揃えられない）")
+        sizes, repeats = (args.schedule_start, args.schedule), (1, 1)
+    else:
+        sizes, repeats = (args.schedule,), (1,)
+    cfg = RNaDConfig(eta=args.eta, beta=args.beta, lr=args.lr, schedule_sizes=sizes,
+                     schedule_repeats=repeats, aux_truth=args.aux_truth, target_avg=args.target_avg,
                      adam_b1=args.adam_b1, c_vtrace=args.c_vtrace, clip=args.neurd_clip,
                      inv_mu_cap=args.inv_mu_cap, policy_loss=args.policy_loss,
                      c_ply=((int(args.c_ply.split(":")[0]), float(args.c_ply.split(":")[1])) if args.c_ply else (0, 1.0)))
