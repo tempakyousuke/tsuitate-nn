@@ -1,0 +1,239 @@
+F6: α の補間の長さを段階の長さから切り離す `--schedule-ramp`（RNaDConfig.schedule_ramp）と、段階の収束の見張り3つ
+（kl_online_reg / kl_target_reg / kl_online_target を学習ログへ。追加の順伝播なし・追加の同期は1更新に1回）の試作
+（docs/rl-learning-speed.md「さらに速くする」の T2。tsuitate-nn の rnad/proto/speed2/README.md）。
+schedule_ramp = 0（既定）なら α・差し替え・更新の結果は今と**ビット単位で同じ**（見張りが足されるだけ）。
+--tail-avg の窓は α = 1 の区間に合わせる（ramp = 0 なら今と同じ size // 2）。当て方（tsuitate-nn の根で）:
+    git apply --check rnad/proto/speed2/stage_monitor_and_ramp.diff && git apply rnad/proto/speed2/stage_monitor_and_ramp.diff
+    .venv/bin/python rnad/tests/test_stage_ramp.py && .venv/bin/python rnad/tests/test_rnad.py && .venv/bin/python rnad/tests/test_packed.py
+
+diff --git a/rnad/rnad.py b/rnad/rnad.py
+index eb8f711..5568eaf 100644
+--- a/rnad/rnad.py
++++ b/rnad/rnad.py
+@@ -163,13 +163,16 @@ class EntropySchedule:
+     以後は最後の大きさ（10）で繰り返す。
+     """
+ 
+-    def __init__(self, sizes, repeats):
++    def __init__(self, sizes, repeats, ramp=0):
+         if len(sizes) != len(repeats) or not sizes or repeats[-1] != 1 or min(repeats) <= 0:
+             raise ValueError(f"entropy schedule: sizes={sizes} repeats={repeats}")
+         schedule = [0]
+         for size, repeat in zip(sizes, repeats):
+             schedule.extend([schedule[-1] + (i + 1) * size for i in range(repeat)])
+         self.schedule = np.array(schedule)
++        # α の補間の長さ（更新回数）。0 = 段階の長さの半分（参照と同じ）。段階の長さから切り離す実験用
++        # （docs/rl-learning-speed.md「さらに速くする」の T2）
++        self.ramp = ramp
+ 
+     def position(self, step: int):
+         """(この step を含む段階の始まり, 段階の長さ)"""
+@@ -190,9 +193,15 @@ class EntropySchedule:
+             start = s[s <= step].max()
+             size = s[s > step].min() - start
+         update = step > 0 and step == start + size - 1
+-        alpha = min(2.0 * (step - start) / size, 1.0)
++        # ramp = 0 は参照の min(2n/size, 1) と同じ値（2n/size と n/(size/2) はどちらも同じ実数の正しい丸め）
++        ramp = self.ramp if self.ramp > 0 else size / 2
++        alpha = min((step - start) / ramp, 1.0)
+         return alpha, update
+ 
++    def ramp_len(self, size: int) -> int:
++        """長さ size の段階で α = 1 になるまでの更新回数（train_rnad.py の --tail-avg の窓の始まり）"""
++        return self.ramp if self.ramp > 0 else size // 2
++
+ 
+ # ---------------------------------------------------------------- v-trace
+ 
+@@ -299,6 +308,8 @@ class RNaDConfig:
+     target_avg: float = 0.001
+     schedule_sizes: tuple = (200,)
+     schedule_repeats: tuple = (1,)
++    # α の補間の長さ（0 = 段階の長さの半分 = 参照と同じ）。段階の長さから切り離すための実験用
++    schedule_ramp: int = 0
+     chunk: int = 1024
+     # 真実の盤面を予測する補助ヘッドの損失の重み（0 = 使わない）。損失は1決定点あたりの
+     # 「自駒以外のマスの交差エントロピーの平均」の決定点平均（loss_v・nerd と同じく標本の平均の単位）
+@@ -336,7 +347,7 @@ class RNaDLearner:
+             m.requires_grad_(False)
+         # 参照: adam(b1=0, b2=0.999, eps=1e-7) → scale(-lr) → clip(clip_gradient)
+         self.opt = torch.optim.Adam(self.net.parameters(), lr=cfg.lr, betas=(cfg.adam_b1, 0.999), eps=1e-7)
+-        self.schedule = EntropySchedule(cfg.schedule_sizes, cfg.schedule_repeats)
++        self.schedule = EntropySchedule(cfg.schedule_sizes, cfg.schedule_repeats, cfg.schedule_ramp)
+         self.step_count = 0
+         # 補助ヘッドは使うときだけ作る（使わない run の checkpoint・乱数の消費は従来と同じ）
+         self.aux = None
+@@ -422,6 +433,8 @@ class RNaDLearner:
+         ent = torch.zeros(n)
+         v_tgt = torch.zeros(n)
+         mix_cache = []  # packed のとき、チャンクごとの正則化方策の対数確率（詰めたもの。2回目で使い回す）
++        # 段階の収束の見張り: KL(ターゲット‖正則化方策)・KL(現在‖ターゲット)。チャンクごとの和をデバイスに貯めて最後に1回だけ戻す
++        kl_mon = []
+         with torch.no_grad():
+             for sl in self._chunks(n):
+                 obs, legal, act, sel = self._chunk_view(batch, sl)
+@@ -438,7 +451,12 @@ class RNaDLearner:
+                 top_sum += float(top.sum())
+                 top_hi += float((top > 0.999).sum())
+                 ent_sum += float(-(pi * log_pi).sum())
+-                v_tgt[sl] = forward(self.target, obs)[1].cpu()
++                logits_t, v_t = forward(self.target, obs)
++                v_tgt[sl] = v_t.cpu()
++                # 1回目で捨てていたターゲットのロジットを使う（追加の順伝播なし）
++                log_t = legal_log_policy(sel(logits_t), legal)
++                p_t = log_t.exp() * legal
++                kl_mon.append(torch.stack([(p_t * (log_t - mix)).sum(), (pi * (log_pi - log_t)).sum()]))
+ 
+         def grid(x):
+             g = torch.zeros(T, B)
+@@ -510,12 +528,17 @@ class RNaDLearner:
+         # 集めた直後に1回更新するので π_a/μ_a は本来 1。ずれは行動時と学習時の数値誤差
+         # （バッチの形で変わるカーネル・精度）で、v-trace の重要度比へそのまま入る
+         ratio = pi_a / batch["mu_a"]
++        kl_sum = torch.stack(kl_mon).cpu().double().sum(0)
+         out = {"loss_v": tot_v, "loss_nerd": tot_nerd, "alpha": alpha,
+                "pi_top_mean": top_sum / n, "pi_top_gt_0999": top_hi / n, "entropy_mean": ent_sum / n,
+                 "reg_update": bool(update_reg), "samples": n,
+                 "ratio_dev_mean": float((ratio - 1).abs().mean()),
+                 "ratio_dev_max": float((ratio - 1).abs().max()),
+-                "v_target_mean": float(vt.mean()), "s_abs_mean": float(s.abs().mean())}
++                "v_target_mean": float(vt.mean()), "s_abs_mean": float(s.abs().mean()),
++                # 段階の収束の見張り（決定点平均）。kl_online_reg（= Σπ·lpr）が α = 1 の区間で平らになれば、その段階の
++                # 固定点に着いた（T_r はこれで読む）。kl_target_reg はターゲットの遅れ（1/τ）のぶん Δm=2,000 では平らにならない
++                "kl_online_reg": float(ent.mean()), "kl_target_reg": float(kl_sum[0]) / n,
++                "kl_online_target": float(kl_sum[1]) / n}
+         if use_aux:
+             out["loss_aux"] = tot_aux  # 重みを掛ける前の値（決定点平均の交差エントロピー）
+         return out
+@@ -561,7 +584,7 @@ class RNaDLearner:
+         if self.aux_opt is not None:
+             for g in self.aux_opt.param_groups:
+                 g["lr"] = cfg.lr
+-        self.schedule = EntropySchedule(cfg.schedule_sizes, cfg.schedule_repeats)
++        self.schedule = EntropySchedule(cfg.schedule_sizes, cfg.schedule_repeats, cfg.schedule_ramp)
+ 
+ 
+ def cfg_diff(saved: dict, cfg: RNaDConfig) -> dict:
+diff --git a/rnad/tests/test_stage_ramp.py b/rnad/tests/test_stage_ramp.py
+new file mode 100644
+index 0000000..246d5e1
+--- /dev/null
++++ b/rnad/tests/test_stage_ramp.py
+@@ -0,0 +1,74 @@
++"""α の補間の長さ（`RNaDConfig.schedule_ramp`）と段階の収束の見張り（kl_online_reg / kl_target_reg / kl_online_target）の検査。
++tsuitate_rl が要る。
++
++    .venv/bin/python rnad/tests/test_stage_ramp.py
++
++- schedule_ramp = 0 の α と差し替えの step は、参照の min(2n/size, 1) とビット単位で同じ（--schedule-start の列でも）
++- schedule_ramp = R なら段階の頭から R 更新で α = 1 に届き、ramp_len が --tail-avg の窓の始まりを返す
++- 見張りの3つは、4つのネットが同じ学習の頭では 0、更新が進むと有限で非負。古い checkpoint の設定（schedule_ramp が無い）
++  とは設定の差にならない
++"""
++
++import pathlib
++import sys
++
++import torch
++
++HERE = pathlib.Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE.parent))
++import tsuitate_rl  # noqa: E402
++from model import PolicyValueNet  # noqa: E402
++from rnad import EntropySchedule, RNaDConfig, RNaDLearner, cfg_diff, collect  # noqa: E402
++
++DEV = torch.device("cpu")
++
++
++def check_default_alpha():
++    for sizes, repeats in (((10000,), (1,)), ((58000, 10000), (1, 1)), ((3, 5, 10), (2, 4, 1)), ((1,), (1,))):
++        sch = EntropySchedule(sizes, repeats)
++        for step in list(range(0, 400)) + list(range(57990, 58010)) + list(range(67990, 70010, 7)):
++            start, size = sch.position(step)
++            want = min(2.0 * (step - start) / size, 1.0)
++            alpha, update = sch(step)
++            assert alpha == want, (sizes, step, alpha, want)
++            assert update == (step > 0 and step == start + size - 1)
++        assert sch.ramp_len(10000) == 5000
++    print("schedule_ramp=0: α と差し替えの step は参照の式とビット単位で同じ")
++
++
++def check_ramp():
++    sch = EntropySchedule((2000,), (1,), ramp=250)
++    assert sch(4000) == (0.0, False) and sch(4125)[0] == 0.5 and sch(4250)[0] == 1.0 and sch(5999) == (1.0, True)
++    assert sch.ramp_len(2000) == 250
++    print("schedule_ramp=250: 段階の頭から 250 更新で α = 1")
++
++
++def check_monitors():
++    torch.manual_seed(0)
++    net = PolicyValueNet(8, 1)
++    learner = RNaDLearner(net, RNaDConfig(eta=0.2, beta=16.0, lr=1e-3, schedule_sizes=(4,), chunk=64), DEV,
++                          packed=True)
++    b = collect(tsuitate_rl.VecEnv(4, seed=3, auto_reset=False), learner.net, DEV, compact_legal=True)
++    info = learner.update(b)
++    for k in ("kl_online_reg", "kl_target_reg", "kl_online_target"):
++        assert info[k] == 0.0, (k, info[k])
++    for _ in range(5):
++        b = collect(tsuitate_rl.VecEnv(4, seed=3, auto_reset=False), learner.net, DEV, compact_legal=True)
++        info = learner.update(b)
++    vals = [info[k] for k in ("kl_online_reg", "kl_target_reg", "kl_online_target")]
++    assert all(torch.isfinite(torch.tensor(v)) and v > -1e-6 for v in vals) and vals[2] > 0, vals
++    print("見張り: 学習の頭は 0、更新後は " + " / ".join(f"{v:.2e}" for v in vals))
++
++
++def check_cfg_compat():
++    old = {k: v for k, v in RNaDConfig().__dict__.items() if k != "schedule_ramp"}
++    assert cfg_diff(old, RNaDConfig()) == {}
++    assert cfg_diff(old, RNaDConfig(schedule_ramp=250)) == {"schedule_ramp": (0, 250)}
++    print("schedule_ramp の無い古い checkpoint の設定とは差にならない")
++
++
++if __name__ == "__main__":
++    check_default_alpha()
++    check_ramp()
++    check_monitors()
++    check_cfg_compat()
+diff --git a/rnad/train_rnad.py b/rnad/train_rnad.py
+index aba1cf1..a0bce93 100644
+--- a/rnad/train_rnad.py
++++ b/rnad/train_rnad.py
+@@ -118,6 +118,9 @@ def main() -> None:
+     ap.add_argument("--schedule-start", type=int, default=0,
+                     help="この更新回数を区切りにして、そこから --schedule ごとに差し替える（0 = 0 から数える）。"
+                          "途中の区切りから間隔を変えて再開するときに使う（58,000 から Δm=10,000 なら 58000 → 区切りは 68,000, 78,000, …）")
++    ap.add_argument("--schedule-ramp", type=int, default=0,
++                    help="段階の頭で正則化方策を新旧の間で補間する長さ（更新回数。0 = 段階の長さの半分 = 参照と同じ）。"
++                         "Δm を縮めるときに補間を短く切り離す実験用（docs/rl-learning-speed.md の T2）。--tail-avg の窓は α = 1 の区間")
+     ap.add_argument("--lr", type=float, default=5e-5)
+     ap.add_argument("--eta", type=float, default=0.2)
+     # NeuRD のしきい値（合法手の平均を引いたロジットが ±β を超える方向へは押さない）。
+@@ -259,8 +262,11 @@ def main() -> None:
+         sizes, repeats = (args.schedule_start, args.schedule), (1, 1)
+     else:
+         sizes, repeats = (args.schedule,), (1,)
++    if not 0 <= args.schedule_ramp <= args.schedule:
++        raise SystemExit(f"--schedule-ramp {args.schedule_ramp} は 0〜--schedule（{args.schedule}）にする")
+     cfg = RNaDConfig(eta=args.eta, beta=args.beta, lr=args.lr, schedule_sizes=sizes,
+-                     schedule_repeats=repeats, aux_truth=args.aux_truth, target_avg=args.target_avg,
++                     schedule_repeats=repeats, schedule_ramp=args.schedule_ramp,
++                     aux_truth=args.aux_truth, target_avg=args.target_avg,
+                      adam_b1=args.adam_b1, c_vtrace=args.c_vtrace, clip=args.neurd_clip,
+                      inv_mu_cap=args.inv_mu_cap, policy_loss=args.policy_loss,
+                      c_ply=((int(args.c_ply.split(":")[0]), float(args.c_ply.split(":")[1])) if args.c_ply else (0, 1.0)))
+@@ -443,13 +449,13 @@ def main() -> None:
+         if not args.tail_avg:
+             return
+         start, size = learner.schedule.position(learner.step_count - 1)
+-        if learner.step_count - 1 - start >= size // 2:
++        if learner.step_count - 1 - start >= learner.schedule.ramp_len(size):
+             with torch.no_grad():
+                 vec = torch.nn.utils.parameters_to_vector(learner.net.parameters()).detach().double().cpu()
+                 tail["sum"] = vec if tail["sum"] is None else tail["sum"] + vec
+                 tail["n"] += 1
+         if info["reg_update"] and tail["n"]:
+-            want = size - size // 2
++            want = size - learner.schedule.ramp_len(size)
+             if tail["n"] == want:
+                 net_ = copy.deepcopy(learner.net).eval()
+                 torch.nn.utils.vector_to_parameters((tail["sum"] / tail["n"]).float().to(device), net_.parameters())

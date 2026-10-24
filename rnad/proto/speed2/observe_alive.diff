@@ -1,0 +1,178 @@
+F3: tsuitate-bot の rl-env（tsuitate_rl.VecEnv）に、生きている局だけを観測するメソッドを足す試作
+（docs/rl-learning-speed.md「さらに速くする」の S1(b)。tsuitate-nn の rnad/proto/speed2/README.md）。
+既存の observe は変えない。当て方（tsuitate-bot のリポジトリの根で）:
+    git apply --check ../tsuitate-nn/rnad/proto/speed2/observe_alive.diff && git apply ../tsuitate-nn/rnad/proto/speed2/observe_alive.diff
+    （tsuitate-nn で）VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop --release -m ../tsuitate-bot/rl-env/Cargo.toml
+- observe_alive: 生きている局だけの (観測 float32, マスク, 手番の色)
+- observe_alive_f16_csr: 生きている局だけの (観測の fp16 のビット, 合法手の添字, 行ごとの個数, 手番の色)。
+  rnad/proto/speed2/fast_collect.py の rust_alive=True（verify_collect.py の fast_rs）が使う
+- bench_parts: 計測専用（observe の部品の秒）。本線に入れるときは外してよい
+
+--- a/rl-env/src/lib.rs
++++ b/rl-env/src/lib.rs
+@@ -120,6 +120,44 @@
+     planes: usize,
+ }
+ 
++/// f32 → f16 のビット（最近接偶数丸め。half クレートのソフトウェア版と同じ手順）
++fn f32_to_f16(value: f32) -> u16 {
++    let x: u32 = value.to_bits();
++    let sign = x & 0x8000_0000u32;
++    let exp = x & 0x7F80_0000u32;
++    let man = x & 0x007F_FFFFu32;
++    if exp == 0x7F80_0000u32 {
++        let nan_bit = if man == 0 { 0 } else { 0x0200u32 };
++        return ((sign >> 16) | 0x7C00u32 | nan_bit | (man >> 13)) as u16;
++    }
++    let half_sign = sign >> 16;
++    let unbiased_exp = ((exp >> 23) as i32) - 127;
++    let half_exp = unbiased_exp + 15;
++    if half_exp >= 0x1F {
++        return (half_sign | 0x7C00u32) as u16;
++    }
++    if half_exp <= 0 {
++        if 14 - half_exp > 24 {
++            return half_sign as u16;
++        }
++        let man = man | 0x0080_0000u32;
++        let mut half_man = man >> (14 - half_exp);
++        let round_bit = 1 << (13 - half_exp);
++        if (man & round_bit) != 0 && (man & (3 * round_bit - 1)) != 0 {
++            half_man += 1;
++        }
++        return (half_sign | half_man) as u16;
++    }
++    let half_exp = (half_exp as u32) << 10;
++    let half_man = man >> 13;
++    let round_bit = 0x0000_1000u32;
++    if (man & round_bit) != 0 && (man & (3 * round_bit - 1)) != 0 {
++        ((half_sign | half_exp | half_man) + 1) as u16
++    } else {
++        (half_sign | half_exp | half_man) as u16
++    }
++}
++
+ fn color_code(c: Color) -> i8 {
+     match c {
+         Color::Sente => 0,
+@@ -310,6 +348,120 @@
+             PyArray1::from_vec(py, player),
+         ))
+     }
++
++    /// （計測専用。tsuitate-nn の rnad/proto/speed2）生きている局の手番について、observe の部品を1スレッドで順に呼んだ合計の秒:
++    /// [referee.view, candidate_usis, deduced_facts, legal_mask, encode_into(v1 = 86枚), observe_into(v2・差分キャッシュ込み)]
++    fn bench_parts(&mut self) -> Vec<f64> {
++        use std::time::Instant;
++        use tsuitate_bot::rl::action::{candidate_usis, deduced_facts, legal_mask};
++        use tsuitate_bot::rl::encode::encode_into;
++        let mut t = vec![0.0f64; 6];
++        let mut buf1 = vec![0.0f32; OBS_LEN];
++        let mut buf2 = vec![0.0f32; self.planes * 81];
++        for g in self.games.iter_mut().filter(|g| g.outcome().is_none()) {
++            let r = g.referee();
++            let side = r.to_move();
++            let s = Instant::now();
++            let view = r.view(side, [300_000, 300_000], g.game_no());
++            t[0] += s.elapsed().as_secs_f64();
++            let s = Instant::now();
++            let c = candidate_usis(&view);
++            t[1] += s.elapsed().as_secs_f64();
++            std::hint::black_box(&c);
++            let s = Instant::now();
++            let f = deduced_facts(&view, r.log(side), r.foul_tried(side));
++            t[2] += s.elapsed().as_secs_f64();
++            std::hint::black_box(&f.occupied);
++            let s = Instant::now();
++            let m = legal_mask(&view, r.log(side), r.foul_tried(side));
++            t[3] += s.elapsed().as_secs_f64();
++            std::hint::black_box(&m);
++            let s = Instant::now();
++            encode_into(&view, r.log(side), r.foul_tried(side), &mut buf1);
++            t[4] += s.elapsed().as_secs_f64();
++            let s = Instant::now();
++            g.observe_into(&mut buf2);
++            t[5] += s.elapsed().as_secs_f64();
++        }
++        t
++    }
++
++    /// （試作。docs/rl-learning-speed.md の S1(b)）生きている局だけの (観測, マスク, 手番の色)。
++    /// 並びは局の添字の昇順 = `observe()` の obs[alive] と同じ。終局した局の観測を作らない
++    fn observe_alive<'py>(&mut self, py: Python<'py>) -> PyResult<ObserveOut<'py>> {
++        let planes = self.planes;
++        let len = planes * 81;
++        let mut live: Vec<&mut EnvGame> = self.games.iter_mut().filter(|g| g.outcome().is_none()).collect();
++        let n = live.len();
++        let player: Vec<i8> = live.iter().map(|g| color_code(g.to_move())).collect();
++        let (obs, mask) = py.detach(|| {
++            let mut obs = vec![0.0f32; n * len];
++            let mut mask = vec![false; n * NUM_ACTIONS];
++            obs.par_chunks_mut(len)
++                .zip(mask.par_chunks_mut(NUM_ACTIONS))
++                .zip(live.par_iter_mut())
++                .for_each(|((o, m), g)| {
++                    g.observe_into(o);
++                    m.copy_from_slice(g.mask());
++                });
++            (obs, mask)
++        });
++        Ok((
++            PyArray1::from_vec(py, obs).reshape([n, planes, 9, 9])?,
++            PyArray1::from_vec(py, mask).reshape([n, NUM_ACTIONS])?,
++            PyArray1::from_vec(py, player),
++        ))
++    }
++
++    /// （試作。docs/rl-learning-speed.md の S1(b)）生きている局だけの
++    /// (観測の fp16 のビット [n, planes*81] u16, 合法手の添字 i16, 行ごとの個数 i32, 手番の色)。
++    /// fp16 への丸めは torch の `.half()` と同じ最近接偶数、添字は行ごとに昇順（`np.nonzero(mask[alive])[1]` と同じ）
++    fn observe_alive_f16_csr<'py>(
++        &mut self,
++        py: Python<'py>,
++    ) -> PyResult<(
++        Bound<'py, PyArray2<u16>>,
++        Bound<'py, PyArray1<i16>>,
++        Bound<'py, PyArray1<i32>>,
++        Bound<'py, PyArray1<i8>>,
++    )> {
++        let planes = self.planes;
++        let len = planes * 81;
++        let mut live: Vec<&mut EnvGame> = self.games.iter_mut().filter(|g| g.outcome().is_none()).collect();
++        let n = live.len();
++        let player: Vec<i8> = live.iter().map(|g| color_code(g.to_move())).collect();
++        let (obs16, cols, counts) = py.detach(|| {
++            let mut obs16 = vec![0u16; n * len];
++            let per: Vec<Vec<i16>> = obs16
++                .par_chunks_mut(len)
++                .zip(live.par_iter_mut())
++                .map_init(
++                    || vec![0.0f32; len],
++                    |buf, (o, g)| {
++                        g.observe_into(buf);
++                        for (d, &s) in o.iter_mut().zip(buf.iter()) {
++                            *d = f32_to_f16(s);
++                        }
++                        g.mask()
++                            .iter()
++                            .enumerate()
++                            .filter(|&(_, &m)| m)
++                            .map(|(i, _)| i as i16)
++                            .collect()
++                    },
++                )
++                .collect();
++            let counts: Vec<i32> = per.iter().map(|v| v.len() as i32).collect();
++            let cols: Vec<i16> = per.concat();
++            (obs16, cols, counts)
++        });
++        Ok((
++            PyArray1::from_vec(py, obs16).reshape([n, len])?,
++            PyArray1::from_vec(py, cols),
++            PyArray1::from_vec(py, counts),
++            PyArray1::from_vec(py, player),
++        ))
++    }
+ 
+     /// 各局に行動を1つずつ適用する。終局した局は [先手,後手] の報酬と done=True を返し、
+     /// 新しい局へ差し替える。
