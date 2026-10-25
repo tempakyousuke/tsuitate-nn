@@ -45,7 +45,8 @@ from rnad import _pack_csr, forward, legal_log_policy, rng_state, set_rng_state,
 @dataclass
 class MMDConfig:
     # 方策の行の選び方: "pps:<割合>[,floor=<下限>]"（|A| に比例した確率で残し、重み s̄/p で戻す。不偏）/
-    # "quantile:<分位>[,min=<下限>]"（Ataraxos: |A| が分位点以上の行だけ。重み 1）/ "none"（全行）
+    # "quantile:<分位>[,min=<下限>]"（Ataraxos: |A| が分位点以上の行だけ。重み 1）/
+    # "topk:<割合>"（|A| の大きい順にちょうどその割合。同値は乱数で切る。重み 1）/ "none"（全行）
     filter: str = "pps:0.25,floor=0.05"
     # 価値の行: "auto"（pps は方策と同じ行・重み、quantile は "uniform:0.25"、none は全行）/ "all" /
     # "uniform:<割合>" / "filtered"（方策と同じ行。Ataraxos。確信のある局面の価値が 0 へ縮む）
@@ -139,8 +140,13 @@ def parse_config(cfg: MMDConfig) -> dict:
         if not 0.0 <= q < 1.0 or mn < 0:
             raise ValueError(f"filter {cfg.filter}: 0 ≤ 分位 < 1、min ≥ 0 にする")
         filt = ("quantile", q, mn)
+    elif kind == "topk" and len(pos) == 1 and not kw:
+        frac = float(pos[0])
+        if not 0.0 < frac <= 1.0:
+            raise ValueError(f"filter {cfg.filter}: 0 < 割合 ≤ 1 にする")
+        filt = ("topk", frac)
     else:
-        raise ValueError(f"filter {cfg.filter}（pps:<割合>[,floor=] / quantile:<分位>[,min=] / none）")
+        raise ValueError(f"filter {cfg.filter}（pps:<割合>[,floor=] / quantile:<分位>[,min=] / topk:<割合> / none）")
     kind, pos, kw = _spec(cfg.value_rows)
     if kind in ("auto", "all", "filtered") and not pos and not kw:
         vrows = (kind,)
@@ -152,7 +158,8 @@ def parse_config(cfg: MMDConfig) -> dict:
     else:
         raise ValueError(f"value_rows {cfg.value_rows}（auto / all / filtered / uniform:<割合>）")
     if vrows == ("auto",):
-        vrows = {"pps": ("filtered",), "quantile": ("uniform", 0.25), "none": ("all",)}[filt[0]]
+        vrows = {"pps": ("filtered",), "quantile": ("uniform", 0.25), "topk": ("uniform", 0.25),
+                 "none": ("all",)}[filt[0]]
     kind, pos, kw = _spec(cfg.magnet)
     if kind in ("uniform", "target") and not pos and not kw:
         mag = (kind,)
@@ -269,6 +276,14 @@ def select_rows(adv, filt, vrows, gen, hist=None):
         w = (p.mean() / p).float() * keep
         info.update(pps_c=c, p_mean=float(p.mean()), p_one=float((p >= 1.0).double().mean()),
                     p_floor=float((p <= filt[2]).double().mean()))
+    elif filt[0] == "topk":
+        k = min(n, math.ceil(filt[1] * n))
+        perm = torch.randperm(n, generator=gen)  # 同値は乱数の並びで切る
+        top = perm[torch.sort(a[perm], descending=True, stable=True).indices[:k]]
+        keep = torch.zeros(n, dtype=torch.bool)
+        keep[top] = True
+        w = keep.float()
+        info["adv_thr"] = float(a[top].min()) if k else 0.0
     else:
         _, q, mn = filt
         pool = torch.cat([*(hist or []), a]) if hist else a

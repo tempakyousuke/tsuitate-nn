@@ -338,7 +338,7 @@ def main() -> None:
                     help="tsuitate = 本線向けの既定（pps 0.25・混合の磁石・λ_A 0.8・学習率固定）/ "
                          "ataraxos = Ataraxos のコードの既定（|A| の 75%%点で切る・一様な磁石・λ_A 0.5・学習率も下げる）")
     mg.add_argument("--mmd-filter", default=None,
-                    help="方策の行の選び方: pps:<割合>[,floor=<下限>] / quantile:<分位>[,min=<下限>] / none")
+                    help="方策の行の選び方: pps:<割合>[,floor=<下限>] / quantile:<分位>[,min=<下限>] / topk:<割合> / none")
     mg.add_argument("--mmd-value-rows", default=None, help="価値の行: auto / all / filtered / uniform:<割合>")
     mg.add_argument("--mmd-filt-window", type=int, default=None, help="quantile の分位点に入れる過去の更新の数")
     mg.add_argument("--mmd-pol-scale", type=float, default=None, help="方策の項の倍率")

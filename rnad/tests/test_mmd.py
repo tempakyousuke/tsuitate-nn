@@ -428,6 +428,14 @@ def check_selection():
     assert abs(int(kp.sum()) - math.ceil(0.25 * 5001)) <= 1 and torch.equal(wp, kp.float())
     kp, *_ = select_rows(adv * 1e-3, ("quantile", 0.75, 0.01), ("all",), g)
     assert int(kp.sum()) == int((adv.abs() * 1e-3 >= 0.01).sum())
+    # topk: 同値が多くてもちょうど ⌈割合·n⌉ 行、残した行の |A| は残さなかった行以上、同値は乱数で切る
+    tied = torch.tensor([0.5] * 10 + [0.1] * 90)
+    picks = set()
+    for _ in range(20):
+        kp, wp, *_ = select_rows(tied, ("topk", 0.05), ("all",), g)
+        assert int(kp.sum()) == 5 and bool((tied[kp] == 0.5).all()) and torch.equal(wp, kp.float())
+        picks.add(tuple(kp.nonzero().squeeze(1).tolist()))
+    assert len(picks) > 1, "topk の同値が乱数で切られていない"
     # pps: mean p = 割合、p ∈ [floor, 1]
     for rate, floor in ((0.25, 0.05), (0.5, 0.05), (0.1, 0.02)):
         p, c = pps_probs(a, rate, floor)
@@ -446,7 +454,7 @@ def check_selection():
     # 価値の行: uniform は約その割合、重み 1
     kp, wp, kv, wv, _ = select_rows(a, ("quantile", 0.75, 0.0), ("uniform", 0.25), g)
     assert abs(float(kv.float().mean()) - 0.25) < 0.03 and torch.equal(wv, kv.float())
-    print(f"T6 行の選び方: quantile の数と下限、pps の mean p = 割合、pps の重み付き平均は不偏"
+    print(f"T6 行の選び方: quantile の数と下限、topk の数と同値の切り方、pps の mean p = 割合、pps の重み付き平均は不偏"
           f"（1,000回の平均と全行の差 {dev_:.4f}、SE {se:.4f}）")
 
 

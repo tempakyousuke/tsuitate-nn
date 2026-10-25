@@ -11,6 +11,10 @@
     python rnad/speedlab.py eval --panel lab/panel.json lab/runs/base_s0 lab/runs/base_s1 ...
     # 3) 腕ごとにまとめる（run のディレクトリ名の最後の `_s<seed>` を落とした名前を腕とみなす）
     python rnad/speedlab.py report lab/runs/* --panel lab/panel.json --control base --gain 50 --out lab/report.md
+    # 途中の checkpoint から分けた2つの学習法を「同じ壁時計」で比べる（MMD の A/B。docs/rl-learning-speed.md 10節）
+    python rnad/speedlab.py report out/ab_rnad_s1 out/ab_mmd_s1 --panel panel_v2.json --control ab_rnad --which target \
+        --pair-by wallclock --sec-per-update ab_rnad=5.5,ab_mmd=3.9 --from-step 108000 --exclude-step 108000 \
+        --control-any-seed --groups lineage.json
 
 **同じ対局条件（共通乱数）**: 手の乱数を (相手ごとの seed, 局番号, その局の何番目の手番か) だけで決める
 （`keyed_actions`）ので、どの書き出しも同じ「相手 × 局番号」の組で、方策が同じ手を選ぶ限り同じ局面を指す
@@ -268,14 +272,21 @@ def step_files(run: pathlib.Path):
     return sorted(out)
 
 
+def pick_device(name):
+    if name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(name)
+
+
 def cmd_eval(args):
     panel = json.loads(pathlib.Path(args.panel).read_text())
     planes = panel["planes"]
-    members = [Member(s, planes) for s in panel["members"]]
+    device = pick_device(args.device)
+    members = [Member(s, planes, device) for s in panel["members"]]
     members = [m for m in members if args.only is None or m.name in args.only]
-    ratings = panel["ratings"]
+    only_steps = {int(x) for x in args.steps.split(",")} if args.steps else None
     for run in map(pathlib.Path, args.runs):
-        path = run / "panel_eval.jsonl"
+        path = run / args.out_file
         done = set()
         if path.exists():
             for line in path.read_text().splitlines():
@@ -287,15 +298,18 @@ def cmd_eval(args):
                     continue
                 if args.every and step % args.every:
                     continue
+                if only_steps is not None and step not in only_steps:
+                    continue
                 net = None
                 for m in members:
                     if (step, which, m.name) in done:
                         continue
                     if net is None:
-                        net = read_weights(wpath).eval()
+                        net = read_weights(wpath).eval().to(device)
                     t0 = time.time()
                     # 相手ごとに seed を固定 = どの書き出しも同じ対局条件（共通乱数）
-                    o = play_vs(net, m, args.games, EVAL_SEED + stable_seed(m.name), planes, per_game=True)
+                    o = play_vs(net, m, args.games, EVAL_SEED + stable_seed(m.name), planes, per_game=True,
+                                device=device)
                     w, l, d = int((o > 0).sum()), int((o < 0).sum()), int((o == 0).sum())
                     rec = {"step": step, "which": which, "opponent": m.name, "w": w, "l": l, "d": d,
                            "games": args.games, "outcomes": o.tolist(), "sec": round(time.time() - t0, 2)}
@@ -304,10 +318,10 @@ def cmd_eval(args):
                 print(f"{run.name} {which} {step}: 済", flush=True)
 
 
-def load_eval(run: pathlib.Path, ratings):
+def load_eval(run: pathlib.Path, ratings, fname="panel_eval.jsonl"):
     """{(step, which): (Elo, SE, 平均得点, 局数)}"""
     by = {}
-    path = run / "panel_eval.jsonl"
+    path = run / fname
     if not path.exists():
         return {}
     seen = {}
@@ -348,10 +362,10 @@ def load_log(run: pathlib.Path):
     return cum
 
 
-def load_outcomes(run: pathlib.Path):
+def load_outcomes(run: pathlib.Path, fname="panel_eval.jsonl"):
     """{(step, which, 相手): 局番号ごとの結果の配列}（局ごとの結果を残した評価だけ）"""
     out = {}
-    path = run / "panel_eval.jsonl"
+    path = run / fname
     if not path.exists():
         return out
     for line in path.read_text().splitlines():
@@ -366,31 +380,115 @@ def seed_of(run: pathlib.Path):
     return m.group(1) if m else "0"
 
 
-def paired_section(arms, control, which, steps):
+def median_sec_per_update(run: pathlib.Path, from_step=0):
+    """log.jsonl の更新の行の (collect_sec + update_sec) の中央値（WSL の一時停止のような外れ値を入れない）"""
+    path = run / "log.jsonl"
+    xs = []
+    if path.exists():
+        for line in path.read_text().splitlines():
+            r = json.loads(line)
+            if "eval" in r or "collect_sec" not in r or r["step"] <= from_step:
+                continue
+            xs.append(r["collect_sec"] + r["update_sec"])
+    return float(np.median(xs)) if xs else None
+
+
+class Pairing:
+    """対照の run の選び方（seed ごと / `--control-any-seed`）と、step の対応（同じ step / 同じ壁時計）"""
+
+    def __init__(self, arms, control, args):
+        self.args = args
+        self.ctrl_runs = {seed_of(r): r for r, _, _ in arms.get(control, [])}
+        self.any_seed = getattr(args, "control_any_seed", False) and len(self.ctrl_runs) == 1
+        self.base = getattr(args, "from_step", 0) or 0
+        self.by = getattr(args, "pair_by", "step") or "step"
+        self.spu = {}
+        for item in (getattr(args, "sec_per_update", None) or []):
+            for part in filter(None, item.split(",")):
+                k, _, v = part.partition("=")
+                self.spu[k] = float(v)
+        for arm, rs in arms.items():
+            if arm not in self.spu and self.by == "wallclock":
+                xs = [median_sec_per_update(r, self.base) for r, _, _ in rs]
+                xs = [x for x in xs if x is not None]
+                if not xs:
+                    raise SystemExit(f"--pair-by wallclock: 腕 {arm} の秒/更新が分からない（--sec-per-update {arm}=秒）")
+                self.spu[arm] = float(np.median(xs))
+        self.control = control
+
+    def control_run(self, run):
+        sd = seed_of(run)
+        if sd in self.ctrl_runs:
+            return self.ctrl_runs[sd]
+        return next(iter(self.ctrl_runs.values())) if self.any_seed else None
+
+    def control_step(self, arm, step, ctrl_steps):
+        """arm の step に対応する対照の step（無ければ None）"""
+        if self.by == "step":
+            return step if step in ctrl_steps else None
+        if not ctrl_steps:
+            return None
+        t = (step - self.base) * self.spu[arm]
+        return min(ctrl_steps, key=lambda c: (abs((c - self.base) * self.spu[self.control] - t), c))
+
+
+def step_ok(st, args):
+    """集計に入れる step か（0・--from-step より前・--exclude-step を除く）"""
+    return st != 0 and st >= (getattr(args, "from_step", 0) or 0) and st not in set(getattr(args, "exclude_step", None) or [])
+
+
+def _fmt_diff(xs, seed_means=None):
+    if seed_means is not None and len(seed_means) > 1:
+        return f"{np.mean(seed_means):+.1f}±{np.std(seed_means, ddof=1) / math.sqrt(len(seed_means)):.1f}"
+    return f"{np.mean(xs):+.1f}±{np.std(xs, ddof=1) / math.sqrt(len(xs)):.1f}" if len(xs) > 1 else ""
+
+
+def paired_section(arms, control, which, steps, args=None):
     """対照との**局ごとのペア差**（同じ seed・step・相手・局番号。評価は共通乱数なので局どうしが対になる）。
     得点（勝 1・分 0.5・負 0）の差を pt で。標準誤差は seed ごとに step・相手・局をまとめた平均の、seed 間の
-    ばらつき（seed が1つなら局ごとの差の標準誤差。step どうしの相関は無視するので小さめに出る）"""
-    lines = [f"## 対照（{control}）との局ごとのペア差（得点の差、pt。{which}）", "",
+    ばらつき（seed が1つなら局ごとの差の標準誤差。step どうしの相関は無視するので小さめに出る）。
+
+    `--pair-by wallclock` なら、腕の step を「(step − --from-step) × 秒/更新」の壁時計へ写し、対照の書き出しのうち
+    同じ壁時計に最も近いものと対にする（列は腕の step。対応は表の下に書く）。`--control-any-seed` なら対照の seed が
+    1つのとき、どの seed の run とも対にする。`--groups` があれば相手の組ごとの小計も出す"""
+    args = args or argparse.Namespace()
+    fname = getattr(args, "eval_file", "panel_eval.jsonl")
+    pr = Pairing(arms, control, args)
+    groups = json.loads(pathlib.Path(args.groups).read_text()) if getattr(args, "groups", "") else {}
+    title = "同じ壁時計" if pr.by == "wallclock" else "同じ step"
+    lines = [f"## 対照（{control}）との局ごとのペア差（得点の差、pt。{which}、{title}）", "",
              "| 腕 | " + " | ".join(str(s) for s in steps if s) + " | step > 0 の全体 | 局ごとの相関 |",
              "| --- |" + " --- |" * (len([s for s in steps if s]) + 2)]
-    ctrl = {seed_of(r): load_outcomes(r) for r, _, _ in arms[control]}
+    ctrl_cache = {}
     skipped = set()
+    mapping = {}
+    group_rows = []
     for arm, rs in sorted(arms.items()):
         if arm == control:
             continue
         per_step = {s: [] for s in steps if s}
         per_step_seed = {}  # (step, seed) → 局ごとの差
         per_seed = {}
+        per_group = {g: {} for g in groups}  # 組 → seed → 局ごとの差
         corr_a, corr_b = [], []
         for run, _, _ in rs:
-            sd = seed_of(run)
-            if sd not in ctrl:
+            crun = pr.control_run(run)
+            if crun is None:
                 continue
-            mine = load_outcomes(run)
+            if crun not in ctrl_cache:
+                ctrl_cache[crun] = load_outcomes(crun, fname)
+            ctrl = ctrl_cache[crun]
+            ctrl_steps = sorted({st for (st, w, _) in ctrl if w == which and step_ok(st, args)})
+            sd = seed_of(run)
+            mine = load_outcomes(run, fname)
             for (st, w, opp), o in mine.items():
-                if w != which or st == 0 or (st, w, opp) not in ctrl[sd]:
+                if w != which or not step_ok(st, args):
                     continue
-                c = ctrl[sd][(st, w, opp)]
+                cst = pr.control_step(arm, st, ctrl_steps)
+                if cst is None or (cst, w, opp) not in ctrl:
+                    continue
+                mapping[(arm, st)] = cst
+                c = ctrl[(cst, w, opp)]
                 if len(c) != len(o):
                     # 局数が違うと局番号が対にならない（相手の seed や先後が局番号で決まる）
                     skipped.add((arm, st, opp))
@@ -399,19 +497,17 @@ def paired_section(arms, control, which, steps):
                 per_step.setdefault(st, []).extend(diff.tolist())
                 per_step_seed.setdefault((st, sd), []).extend(diff.tolist())
                 per_seed.setdefault(sd, []).extend(diff.tolist())
+                for gname, members in groups.items():
+                    if opp in members:
+                        per_group[gname].setdefault(sd, []).extend(diff.tolist())
                 corr_a.extend(o.tolist())
                 corr_b.extend(c.tolist())
         cells = []
         for s in steps:
             if not s:
                 continue
-            x = per_step.get(s, [])
             seed_means = [np.mean(v) for (st, _), v in per_step_seed.items() if st == s]
-            if len(seed_means) > 1:
-                # seed が複数あれば seed ごとの平均のばらつきから（局ごとの誤差だけでは seed の間の違いを見落とす）
-                cells.append(f"{np.mean(seed_means):+.1f}±{np.std(seed_means, ddof=1) / math.sqrt(len(seed_means)):.1f}")
-            else:
-                cells.append(f"{np.mean(x):+.1f}±{np.std(x, ddof=1) / math.sqrt(len(x)):.1f}" if len(x) > 1 else "")
+            cells.append(_fmt_diff(per_step.get(s, []), seed_means))
         allx = [v for vs in per_seed.values() for v in vs]
         if len(per_seed) > 1:
             means = [np.mean(v) for v in per_seed.values()]
@@ -420,12 +516,57 @@ def paired_section(arms, control, which, steps):
             tot = f"{np.mean(allx):+.1f}±{np.std(allx, ddof=1) / math.sqrt(len(allx)):.1f}（局ごと、1 seed）"
         else:
             tot = "—"
-        rho = f"{np.corrcoef(corr_a, corr_b)[0, 1]:.2f}" if len(corr_a) > 2 else "—"
+        rho = (f"{np.corrcoef(corr_a, corr_b)[0, 1]:.2f}"
+               if len(corr_a) > 2 and np.std(corr_a) > 0 and np.std(corr_b) > 0 else "—")
         lines.append(f"| {arm} | " + " | ".join(cells) + f" | {tot} | {rho} |")
+        if groups:
+            gcells = []
+            for gname in groups:
+                xs = [v for vs in per_group[gname].values() for v in vs]
+                means = [np.mean(v) for v in per_group[gname].values()]
+                gcells.append((_fmt_diff(xs, means) or "—") + f"（{len(xs)}組）")
+            group_rows.append(f"| {arm} | " + " | ".join(gcells) + " |")
     lines.append("")
     lines.append("step ごとの ± は seed が2本以上なら seed ごとの平均の標準誤差、1本なら局ごとの標準誤差（その書き出しを固定したときの誤差）。")
+    if pr.by == "wallclock":
+        lines.append("壁時計の対応（腕の step → 対照の step、秒/更新 " + ", ".join(f"{a} {v:.2f}" for a, v in sorted(pr.spu.items()))
+                     + f"、起点 {pr.base}）: " + ", ".join(f"{a} {s}→{c}" for (a, s), c in sorted(mapping.items())))
+    if pr.any_seed:
+        lines.append(f"対照の seed は1つ（{next(iter(pr.ctrl_runs))}）なので、どの seed の run とも対にした（--control-any-seed）。")
     if skipped:
         lines.append(f"局数が対照と違うため比べなかった組: {len(skipped)}（腕・step・相手）")
+    lines.append("")
+    if groups:
+        lines += ["### 相手の組ごとの小計（step > 0 の全体）", "", "| 腕 | " + " | ".join(groups) + " |",
+                  "| --- |" + " --- |" * len(groups), *group_rows, ""]
+    return lines
+
+
+def vs_step_section(arms, which, steps, args):
+    """同じ run の中で、各 step を step N（--vs-step）と局ごとに対にした得点の差（pt）。起点からの伸びを、
+    起点の書き出しの評価の揺れごと打ち消して測る"""
+    fname = getattr(args, "eval_file", "panel_eval.jsonl")
+    n0 = args.vs_step
+    cols = [s for s in steps if s != n0 and s >= (getattr(args, "from_step", 0) or 0)]
+    lines = [f"## step {n0} との局ごとのペア差（同じ run、得点の差、pt。{which}）", "",
+             "| 腕 | " + " | ".join(str(s) for s in cols) + " |", "| --- |" + " --- |" * len(cols)]
+    for arm, rs in sorted(arms.items()):
+        per = {s: {} for s in cols}
+        for run, _, _ in rs:
+            out = load_outcomes(run, fname)
+            sd = seed_of(run)
+            for (st, w, opp), o in out.items():
+                if w != which or st not in per or (n0, w, opp) not in out:
+                    continue
+                c = out[(n0, w, opp)]
+                if len(c) != len(o):
+                    continue
+                per[st].setdefault(sd, []).extend((((o + 1) / 2 - (c + 1) / 2) * 100).tolist())
+        cells = []
+        for s in cols:
+            xs = [v for vs in per[s].values() for v in vs]
+            cells.append(_fmt_diff(xs, [np.mean(v) for v in per[s].values()]) or "")
+        lines.append(f"| {arm} | " + " | ".join(cells) + " |")
     lines.append("")
     return lines
 
@@ -440,7 +581,10 @@ def cmd_report(args):
     runs = [pathlib.Path(r) for r in args.runs if (pathlib.Path(r) / "log.jsonl").exists()]
     arms = {}
     for run in runs:
-        ev = load_eval(run, ratings)
+        ev = load_eval(run, ratings, args.eval_file)
+        # --from-step より前と --exclude-step は表から外す（step 0 は起点として曲線と要約に残す）
+        ev = {k: v for k, v in ev.items()
+              if k[0] == 0 or (k[0] >= args.from_step and k[0] not in set(args.exclude_step or []))}
         cum = load_log(run)
         arms.setdefault(arm_of(run), []).append((run, ev, cum))
     lines = [f"パネル: " + ", ".join(f"{n} {r:.0f}" for n, r in sorted(ratings.items(), key=lambda x: x[1])), ""]
@@ -510,8 +654,10 @@ def cmd_report(args):
         lines.append("")
         lines.append("| 腕 | " + " | ".join(str(s) for s in steps) + " | 全 step 平均 |")
         lines.append("| --- |" + " --- |" * (len(steps) + 1))
-        ctrl = {re.search(r"_s(\d+)$", r.name).group(1) if re.search(r"_s(\d+)$", r.name) else "0": ev
-                for r, ev, _ in arms[args.control]}
+        ctrl = {seed_of(r): ev for r, ev, _ in arms[args.control]}
+        if args.control_any_seed and len(ctrl) == 1:
+            only = next(iter(ctrl.values()))
+            ctrl = {seed_of(r): only for rs_ in arms.values() for r, _, _ in rs_}
         for arm, rs in sorted(arms.items()):
             if arm == args.control:
                 continue
@@ -548,7 +694,9 @@ def cmd_report(args):
             lines.append(f"| {arm} | " + " | ".join(cells) + f" | {tot} |")
         lines.append("")
     if args.control and args.control in arms:
-        lines += paired_section(arms, args.control, which, steps)
+        lines += paired_section(arms, args.control, which, steps, args)
+    if args.vs_step is not None:
+        lines += vs_step_section(arms, which, steps, args)
     text = "\n".join(lines)
     print(text)
     if args.out:
@@ -577,6 +725,10 @@ def main():
     p.add_argument("--which", action="append", help="target / current / ema<係数>（省くと全部）")
     p.add_argument("--every", type=int, default=0, help="この倍数の step だけ測る（0 = 全部）")
     p.add_argument("--only", action="append", help="この名前のパネルの相手だけ")
+    p.add_argument("--device", default="cpu", help="cpu / cuda / auto（学習中の書き出しを GPU でまとめて測る）")
+    p.add_argument("--out-file", default="panel_eval.jsonl",
+                   help="結果を書く run の中のファイル名（局数の違う測り直しはループ内の 1,024局と混ぜない）")
+    p.add_argument("--steps", default="", help="この step だけ測る（カンマ区切り）")
     p = sub.add_parser("report", help="腕ごとにまとめる")
     p.add_argument("runs", nargs="+")
     p.add_argument("--panel", required=True)
@@ -585,6 +737,17 @@ def main():
     p.add_argument("--control", default="")
     p.add_argument("--out", default="")
     p.add_argument("--json", default="")
+    p.add_argument("--eval-file", default="panel_eval.jsonl", help="run の中の評価のファイル名")
+    p.add_argument("--from-step", type=int, default=0, help="この step より前の書き出しを読まない（途中から分けた A/B の起点）")
+    p.add_argument("--exclude-step", type=int, action="append", help="この step を集計から外す（両腕で同じネットの起点など）")
+    p.add_argument("--pair-by", choices=["step", "wallclock"], default="step",
+                   help="対照との対応: 同じ step / 同じ壁時計（(step − --from-step) × 秒/更新 が最も近い書き出し）")
+    p.add_argument("--sec-per-update", action="append",
+                   help="腕=秒（カンマ区切り可）。省いた腕は log.jsonl の中央値（--pair-by wallclock）")
+    p.add_argument("--control-any-seed", action="store_true",
+                   help="対照の seed が1つなら、どの seed の run とも対にする（パネルの乱数は相手の名前だけで決まる）")
+    p.add_argument("--vs-step", type=int, default=None, help="同じ run の中で各 step をこの step と局ごとに対にする")
+    p.add_argument("--groups", default="", help="相手の組 {組名: [相手の名前, ...]} の JSON（ペア差の小計を出す）")
     args = ap.parse_args()
     torch.set_num_threads(int(__import__("os").environ.get("OMP_NUM_THREADS", "1")))
     {"panel": cmd_panel, "eval": cmd_eval, "report": cmd_report}[args.cmd](args)

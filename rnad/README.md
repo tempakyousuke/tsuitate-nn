@@ -116,7 +116,7 @@ R-NaD の checkpoint から続ける（net ← 現在のネット、ターゲッ
 
 | フラグ | 既定（`--mmd-preset tsuitate`） | `ataraxos` | 中身 |
 | --- | --- | --- | --- |
-| `--mmd-filter` | `pps:0.25,floor=0.05` | `quantile:0.75,min=0.01` | 方策の行: `pps:<割合>[,floor=]` / `quantile:<分位>[,min=]` / `none` |
+| `--mmd-filter` | `pps:0.25,floor=0.05` | `quantile:0.75,min=0.01` | 方策の行: `pps:<割合>[,floor=]` / `quantile:<分位>[,min=]` / `topk:<割合>`（ちょうどその割合、同値は乱数）/ `none` |
 | `--mmd-value-rows` | `auto` | `filtered` | 価値の行: `auto`（pps は方策と同じ行・重み、quantile は `uniform:0.25`）/ `all` / `uniform:<割合>` / `filtered` |
 | `--mmd-gae-lambda` / `--mmd-td-lambda` | 0.8 / 0.8 | 0.5 / 0.8 | A と価値の目標の λ |
 | `--mmd-lambda-unit` | `attempt` | 同じ | λ を試行ごと（反則も1回）/ `turn`（受理された手ごと） |
