@@ -236,6 +236,17 @@ def main() -> None:
                          "状態は <out>/extra_ema.pt に保存して再開する）")
     ap.add_argument("--export-current", action="store_true",
                     help="書き出しの区切りで現在のネットも current_<step>.bin に書く（speedlab で測る）")
+    ap.add_argument("--fast-collect", choices=["py", "rust"], default="",
+                    help="自己対局の収集の CPU の仕事を減らす（batch はビット単位で同じ。rnad.collect の fast）。"
+                         "py = Python だけの変更、rust = 生きている局だけを Rust で観測する（rl-env を作り直した "
+                         "tsuitate_rl が要る）。--compact-legal と一緒に使い、相手をネットに指させるリーグ"
+                         "（--league-device gpu）・入玉ボーナス・補助ヘッドとは使えない")
+    ap.add_argument("--device-batch", action="store_true",
+                    help="batch を更新の頭で1回だけデバイスへ送り、チャンクごとの転送と同期をなくす（結果は同じ。"
+                         "--packed --compact-legal と一緒に使う。GPU のメモリを batch あたり約1GB 使う）")
+    ap.add_argument("--fused", action="store_true",
+                    help="1回目の現在のネットの順伝播を2回目へまとめる（決定点あたり順伝播1回分が減る。結果は同じ。"
+                         "--league-device gpu とは使えない。勾配をチャンクごとに取っておくので GPU のメモリを約130MB 使う）")
     ap.add_argument("--threads", type=int, default=0, help="torch のスレッド数（0 = 既定）")
     ap.add_argument("--planes", type=int, default=NUM_PLANES,
                     help="--init none のときの入力のプレーン数（86 = v1 / 91 = v2 確定事実つき）")
@@ -245,6 +256,15 @@ def main() -> None:
     args = ap.parse_args()
 
     set_precision(args.precision)
+    # 速くする選択肢（docs/rl-learning-speed.md「さらに速くする」）が使えない組み合わせを最初に止める
+    if args.fast_collect and (not args.compact_legal or args.aux_truth > 0 or args.nyugyoku
+                              or (args.league and args.league_device == "gpu")):
+        raise SystemExit("--fast-collect は --compact-legal と一緒に使い、--league-device gpu・入玉ボーナス・"
+                         "補助ヘッドとは使えない")
+    if args.device_batch and not (args.packed and args.compact_legal):
+        raise SystemExit("--device-batch は --packed --compact-legal と一緒に使う")
+    if args.fused and args.league and args.league_device == "gpu":
+        raise SystemExit("--fused は --league-device gpu とは使えない（相手の手番が batch の隙間になる）")
     if args.threads:
         torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
@@ -298,7 +318,8 @@ def main() -> None:
         init_net = PolicyValueNet(ck["config"]["channels"], ck["config"]["blocks"], ck["config"]["planes"])
     else:
         init_net = load_net(args.init, args.channels, args.blocks, planes=args.planes)
-    learner = RNaDLearner(init_net, cfg, device, packed=args.packed)
+    learner = RNaDLearner(init_net, cfg, device, packed=args.packed, device_batch=args.device_batch,
+                          fused=args.fused)
     # 観測のプレーン数は学習するネットの形で決まる（v2 = 確定事実のプレーンつきの checkpoint は
     # widen_planes.py で作る）。錨・リーグの相手が v1 のネットでも、v2 の観測の先頭が v1 なので読める
     # （PolicyValueNet.trunk が切る）。v1 のときは引数を渡さない（planes の無い古い tsuitate_rl でも動くように）
@@ -465,7 +486,8 @@ def main() -> None:
             raise SystemExit("--pipeline は自己対局だけ・ボーナスなし・補助ヘッドなしの設定で使う")
         pipe = PipelinedCollector(
             lambda: tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False, **obs_kw), device,
-            seed=args.seed * 1_000_003 + 17 + learner.step_count, compact_legal=args.compact_legal)
+            seed=args.seed * 1_000_003 + 17 + learner.step_count, compact_legal=args.compact_legal,
+            fast=args.fast_collect)
         pipe.submit(learner.net)
 
     # 学習には使わない追加の指数移動平均（--extra-ema）。現在のネットの写しを係数ごとに持つ
@@ -578,7 +600,7 @@ def main() -> None:
                             nyugyoku_win_only=args.nyugyoku_cond == "win",
                             opponents=(None if league_games is None else [None] * n_self + league_games),
                             opp_nets=(opp_nets if league_games is not None else None),
-                            truth=cfg.aux_truth > 0, compact_legal=args.compact_legal)
+                            truth=cfg.aux_truth > 0, compact_legal=args.compact_legal, fast=args.fast_collect)
             t1 = time.time()
             finished = env.pop_finished() if env is not None else []
             league_finished = league_env.pop_finished() if league_env is not None else []

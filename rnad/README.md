@@ -47,7 +47,7 @@ ARENA_MATCH_SEED=20260927 cargo run --release --bin arena -- 100 "rl_policy:<pol
 | `guard.py` | 防御特化（玉の周りの固め）の監視値の集計 |
 | `speedlab.py` | 学習の速さの比較: 固定パネル（`panel`）で run の書き出しを測り（`eval`、局ごとに鍵を決めた共通乱数）、腕ごとの学習曲線と対照とのペア差をまとめる（`report`） |
 | `gradsnr.py` | 学習なしの診断: 変種（クリップ・1/μ の上限・PG）ごとの局ごとの勾配の分散・期待勾配・雑音のスケール |
-| `bench_update.py` | 1更新の壁時計（従来 / `--packed` / 連続 / `--pipeline`）と、packed の勾配の一致 |
+| `bench_update.py` | 1更新の壁時計（従来 / `--packed` / 連続 / `--pipeline`）と、packed の勾配の一致。`--collect-arms` / `--update-arms` で `--fast-collect` / `--device-batch` / `--fused` を同じ batch・同じ乱数のペアで測り、結果がビット単位で同じかも出す |
 | `distill.py` | 方策ネットを小さいネットへ蒸留する（CPU の代理 P2 の出発点） |
 | `toy_kuhn.py` | クーンポーカーで R-NaD の変種の偏りを厳密な NashConv で見る |
 | `stage_log.py` | 学習ログ（log.jsonl）だけでの事前確認: α<1 / α=1 ごとの1更新の秒と律速、錨への勝率の段階内の形と段階の平らさ g（Δm を縮めるかの判断）、`--out-dir` で区切りでの停止の時間とループの外の雑費 |
@@ -75,6 +75,9 @@ ARENA_MATCH_SEED=20260927 cargo run --release --bin arena -- 100 "rl_policy:<pol
 | `--packed` | 方策の計算を合法手に詰めて行う（数式は同じ。`tests/test_packed.py`）。重み 0 の正則化ネットの順伝播は常に省く |
 | `--pipeline` | 自己対局を別スレッド・別 CUDA ストリームで集め、更新と重ねる（1更新遅れの方策。自己対局だけ・ボーナスなし・補助ヘッドなしの設定。`--league` / `--guard` / `--speed` / `--nyugyoku` / `--aux-truth` と併用すると止まる） |
 | `--compact-legal` | batch の合法手のマスクを添字で持つ（768局で 0.79GB → 11MB。`--pipeline` のメモリ対策） |
+| `--fast-collect py\|rust` | 自己対局の収集の CPU の仕事を減らす（**batch はビット単位で同じ**。`tests/test_fast_collect.py`）。py は Python だけ（生きている局の行を1回だけ抜く・観測を fp16 で送る・合法手の添字を1回だけ作る）、rust は加えて Rust 側で生きている局だけを観測する（`VecEnv.observe_alive_f16_csr`。tsuitate-bot の rl-env を `maturin develop` で作り直す）。`--compact-legal` と一緒に使い、`--league-device gpu`・入玉ボーナス・補助ヘッドとは使えない |
+| `--device-batch` | batch を更新の頭で1回だけ GPU へ送り、チャンクごとの転送と同期をなくす（**結果はビット単位で同じ**。`tests/test_fast_update.py`）。`--packed --compact-legal` と一緒に使う。GPU のメモリを batch あたり約1GB 使う |
+| `--fused` | 1回目（勾配なし）の現在のネットの順伝播を2回目へまとめる（決定点あたり順伝播1回分が減る。チャンクを後ろから回して v-trace をチャンクごとに進め、勾配はチャンクごとに取っておいて従来と同じ順に足すので**結果はビット単位で同じ**）。`--league-device gpu` とは使えない。GPU のメモリを約130MB 使う |
 | `--inv-mu-cap K` / `--neurd-clip C` | v-trace の s の 1/μ の上限 / NeuRD のクリップ（まれな手のスパイクを取る） |
 | `--policy-loss pg` | NeuRD の押し出しに π を掛ける（ソフトマックス方策勾配） |
 | `--c-vtrace` / `--c-ply 時刻:λ` | v-trace の c（λ-return）/ 終盤だけ λ |

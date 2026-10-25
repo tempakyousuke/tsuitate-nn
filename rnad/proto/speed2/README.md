@@ -4,6 +4,12 @@ tsuitate-bot の `docs/rl-learning-speed.md`「さらに速くする」で検討
 書き出しの平均（T3）・GPU リーグの不具合（9.8）の試作と検算。**train_rnad.py からは読まれない**（本線は変わらない）。
 調べた環境（CPU 4コア・GPU なし）では CPU での一致と時間しか測れなかったので、**ゲーム用 PC（RTX 3070）で確かめるために残す**。
 
+> **2026-10-25 追記**: S1〜S3 は本体に入った（既定オフのフラグ `--fast-collect py|rust` / `--device-batch` / `--fused`。
+> rl-env には `VecEnv.observe_alive_f16_csr` が入ったので F3 の差分はもう当てなくてよい）。本体の版は試作と違い、
+> fused も勾配をチャンクごとに取っておいて従来と同じ順に足すので**ビット単位で同じ**（試作は相対誤差 1e-8）。
+> 3070 での計時と一致の確認は `rnad/bench_update.py --collect-arms ... --update-arms ...`（rnad/README.md）。
+> ここの F1〜F5 は経緯の記録として残す
+
 - どれも tsuitate-nn のリポジトリの根から `.venv/bin/python rnad/proto/speed2/<ファイル>` で動かす。`proto_common.py` が
   `rnad/` を読めるようにし、重みの既定は `../tsuitate-bot/models/rl_deduce_v7.bin`（学習状態を作る `make_learner` は
   rl_deduce_v5〜v7 を使う。本線と同じ η 0.2・β 16・lr 1e-4・Δm 10,000）
