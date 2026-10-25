@@ -146,7 +146,8 @@ def check_algo_args(ap, args):
             pol_scale=args.mmd_pol_scale, clip=args.mmd_clip, kl=args.mmd_kl,
             decoupled=None if args.mmd_decoupled is None else args.mmd_decoupled == "on",
             prox_cap=args.mmd_prox_cap, vf=args.mmd_vf, gae_lambda=args.mmd_gae_lambda, td_lambda=args.mmd_td_lambda,
-            lambda_unit=args.mmd_lambda_unit, magnet=args.mmd_magnet, temp=_floats4(args.mmd_temp, "mmd-temp"),
+            lambda_unit=args.mmd_lambda_unit, magnet=args.mmd_magnet, magnet_avg=args.mmd_magnet_avg,
+            temp=_floats4(args.mmd_temp, "mmd-temp"),
             temp_t_off=args.mmd_temp_t_off, lr=_floats4(args.mmd_lr, "mmd-lr"), lr_t_off=args.mmd_lr_t_off,
             t_scale=args.mmd_t_scale, steps=args.mmd_steps, chunk=args.mmd_chunk, epochs=args.mmd_epochs,
             max_grad_norm=args.mmd_max_grad_norm, adam_b1=args.mmd_adam_b1, value_warmup=args.mmd_value_warmup,
@@ -335,7 +336,8 @@ def main() -> None:
                          "温度・学習率の予定と --lr-warmup はこの step から数える")
     mg = ap.add_argument_group("MMD（--algo mmd のときだけ。指定しなければ --mmd-preset の値）")
     mg.add_argument("--mmd-preset", choices=list(MMD_PRESETS), default="tsuitate",
-                    help="tsuitate = 本線向けの既定（pps 0.25・混合の磁石・λ_A 0.8・学習率固定）/ "
+                    help="tsuitate = 本線向けの既定（pps 0.5・動く磁石〔ターゲット〕・温度 0.05 固定・λ_A 0.8・学習率固定）/ "
+                         "mixinit = 設計の初版（pps 0.25・始めの方策の固定の混合磁石・温度を下げる。代理で崩れた形）/ "
                          "ataraxos = Ataraxos のコードの既定（|A| の 75%%点で切る・一様な磁石・λ_A 0.5・学習率も下げる）")
     mg.add_argument("--mmd-filter", default=None,
                     help="方策の行の選び方: pps:<割合>[,floor=<下限>] / quantile:<分位>[,min=<下限>] / topk:<割合> / none")
@@ -353,6 +355,8 @@ def main() -> None:
     mg.add_argument("--mmd-lambda-unit", choices=["attempt", "turn"], default=None,
                     help="λ をかける単位（attempt = 反則の試行も1回 / turn = 受理された手ごと）")
     mg.add_argument("--mmd-magnet", default=None, help="磁石: mix:init,<ε> / mix:target,<ε> / uniform / target")
+    mg.add_argument("--mmd-magnet-avg", type=float, default=None,
+                    help="動く磁石の EMA の係数（0 = 書き出しのターゲット〔--target-avg〕をそのまま磁石にする）")
     mg.add_argument("--mmd-temp", default=None, help="温度（磁石への KL の係数）の予定 'coef,decay,ceil,floor'")
     mg.add_argument("--mmd-temp-t-off", type=float, default=None, help="温度の予定の起点のずらし")
     mg.add_argument("--mmd-lr", default=None,

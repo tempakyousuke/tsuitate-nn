@@ -100,10 +100,11 @@ ARENA_MATCH_SEED=20260927 cargo run --release --bin arena -- 100 "rl_policy:<pol
   （R-NaD の勾配の雑音の 99.6〜99.9% は v-trace の s = (G − v)/μ）
 - アドバンテージは手番側ごとの GAE（λ_A）、価値の目標は TD(λ)。どちらも収集時の価値（`collect(actor_extras=True)` の
   `v_actor`）で作る。反則で同じ側が続く手番も、`v_trace_scalars` を η=0・π=μ=1・c=λ で呼べばそのまま扱える
-- 学習に使う行は既定で **|A| に比例した確率の間引き（pps、割合 0.25）**。重み s̄/p で戻すので期待値は全行と同じ
+- 学習に使う行は既定で **|A| に比例した確率の間引き（pps、割合 0.5）**。重み s̄/p で戻すので期待値は全行と同じ
   （Ataraxos どおりの「|A| の 75%点以上だけ」はクーンで固定点を均衡から外すので、`--mmd-preset ataraxos` の腕に残す）
-- 1回の収集を 8 歩の Adam に分ける（行を無作為に並べて8等分）。段階（Δm）は無く、磁石への KL の係数（温度）を
-  MMD を始めてからの更新回数のべき乗で下げる。磁石は既定で「始めたときのターゲットと一様の混合（ε=0.03）」
+- 1回の収集を 8 歩の Adam に分ける（行を無作為に並べて8等分）。段階（Δm）は無く、**磁石は既定でターゲット（現在のネットの
+  EMA = 動く磁石）、温度は 0.05 固定**。設計の初版の「固定の磁石 ＋ 温度を下げる」形（`--mmd-preset mixinit`）は、クーンで
+  R-NaD の約8倍遅く、代理 P2 で自己対局が短い詰みの筋に固まった（tsuitate-bot の docs 10.4）
 - `--pipeline` ではクリップと KL の中心を更新の頭の方策にし、μ との比を外側の重みにする（decoupled PPO）
 
 R-NaD の checkpoint から続ける（net ← 現在のネット、ターゲットと磁石 ← ターゲット、step の番号を続ける。Adam は新しく作る）:
@@ -116,12 +117,13 @@ R-NaD の checkpoint から続ける（net ← 現在のネット、ターゲッ
 
 | フラグ | 既定（`--mmd-preset tsuitate`） | `ataraxos` | 中身 |
 | --- | --- | --- | --- |
-| `--mmd-filter` | `pps:0.25,floor=0.05` | `quantile:0.75,min=0.01` | 方策の行: `pps:<割合>[,floor=]` / `quantile:<分位>[,min=]` / `topk:<割合>`（ちょうどその割合、同値は乱数）/ `none` |
+| `--mmd-filter` | `pps:0.5,floor=0.05`（`mixinit` は 0.25） | `quantile:0.75,min=0.01` | 方策の行: `pps:<割合>[,floor=]` / `quantile:<分位>[,min=]` / `topk:<割合>`（ちょうどその割合、同値は乱数）/ `none` |
 | `--mmd-value-rows` | `auto` | `filtered` | 価値の行: `auto`（pps は方策と同じ行・重み、quantile は `uniform:0.25`）/ `all` / `uniform:<割合>` / `filtered` |
 | `--mmd-gae-lambda` / `--mmd-td-lambda` | 0.8 / 0.8 | 0.5 / 0.8 | A と価値の目標の λ |
 | `--mmd-lambda-unit` | `attempt` | 同じ | λ を試行ごと（反則も1回）/ `turn`（受理された手ごと） |
-| `--mmd-magnet` | `mix:init,0.03` | `uniform` | `mix:init,<ε>` / `mix:target,<ε>` / `uniform` / `target` |
-| `--mmd-temp` / `--mmd-temp-t-off` | `0.05,0.3,0.1,0.001` / 2000 | 同じ / 0 | 温度 clip(coef/(t+1)^decay, floor, ceil)、t = MMD の更新回数 + ずらし |
+| `--mmd-magnet` | `target`（`mixinit` は `mix:init,0.03`） | `uniform` | `mix:init,<ε>` / `mix:target,<ε>` / `uniform` / `target` |
+| `--mmd-magnet-avg` | 0 | 0 | 動く磁石（`target` / `mix:target`）の EMA の係数。0 = 書き出しのターゲット（`--target-avg`）をそのまま磁石にする |
+| `--mmd-temp` / `--mmd-temp-t-off` | `0.05,0,0.05,0.05`（固定）/ 0（`mixinit` は `0.05,0.3,0.1,0.001` / 2000） | `0.05,0.3,0.1,0.001` / 0 | 温度 clip(coef/(t+1)^decay, floor, ceil)、t = MMD の更新回数 + ずらし |
 | `--mmd-lr` / `--mmd-lr-t-off` | `1e-4,0,1e-4,1e-4`（固定）/ 0 | `0.5,1.1,1e-4,5e-6` / 0 | 学習率の予定（同じ式）。`--lr-warmup` を掛ける |
 | `--mmd-clip` / `--mmd-kl` / `--mmd-vf` / `--mmd-pol-scale` | 0.2 / 0.1 / 1.0 / 1.0 | 同じ | 比のクリップ / 近い方策への KL / 価値 / 方策の項の係数 |
 | `--mmd-decoupled` / `--mmd-prox-cap` | on / 2.0 | off | pipeline の中心を更新の頭の方策にする / 外側の重みの上限 |

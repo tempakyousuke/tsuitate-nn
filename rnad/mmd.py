@@ -23,8 +23,10 @@
     kl    = Σ w·KL(π_θ ‖ c) / m_pol、mag = Σ w·KL(π_θ ‖ ρ) / m_pol、lv = Σ w_v·(v − G_td)² / m_val
     loss  = pol_scale·pol + α_t·mag + vf·lv + kl_coef·kl
 
-磁石 ρ は既定で「始めたときのターゲットを凍結した写しの方策と一様の混合」（`mix:init,ε`）。Ataraxos のコードの既定
-（合法手に一様）は、ついたて将棋の合法手では質量の 39% を打ちに置き、強い方策を打ちの側へ引き戻すため
+磁石 ρ は既定で**ターゲット（現在のネットの EMA）= 動く磁石**、温度は 0.05 固定（MMD 論文 H.5 の形。R-NaD の段階ごとの正則化方策の
+差し替えを滑らかにしたもの）。設計の初版の「始めたときの方策と一様の混合を固定の磁石にし、温度を t で下げる」形（`preset="mixinit"`）は、
+クーンで R-NaD の約8倍遅く、代理 P2 では自己対局が短い詰みの筋に固まった（docs/rl-learning-speed.md 10.4）。Ataraxos のコードの既定
+（合法手に一様）は、ついたて将棋の合法手では質量の 39% を打ちに置き、強い方策を打ちの側へ引き戻す
 """
 
 import copy
@@ -47,7 +49,7 @@ class MMDConfig:
     # 方策の行の選び方: "pps:<割合>[,floor=<下限>]"（|A| に比例した確率で残し、重み s̄/p で戻す。不偏）/
     # "quantile:<分位>[,min=<下限>]"（Ataraxos: |A| が分位点以上の行だけ。重み 1）/
     # "topk:<割合>"（|A| の大きい順にちょうどその割合。同値は乱数で切る。重み 1）/ "none"（全行）
-    filter: str = "pps:0.25,floor=0.05"
+    filter: str = "pps:0.5,floor=0.05"
     # 価値の行: "auto"（pps は方策と同じ行・重み、quantile は "uniform:0.25"、none は全行）/ "all" /
     # "uniform:<割合>" / "filtered"（方策と同じ行。Ataraxos。確信のある局面の価値が 0 へ縮む）
     value_rows: str = "auto"
@@ -64,12 +66,14 @@ class MMDConfig:
     td_lambda: float = 0.8
     # λ をかける単位: "attempt"（反則の試行も1回と数える）/ "turn"（受理された手ごと。反則の試行では λ をかけない）
     lambda_unit: str = "attempt"
-    # 磁石: "mix:init,<ε>"（始めたときのターゲットの写しと一様の混合）/ "mix:target,<ε>"（今のターゲットと一様の混合）/
-    # "uniform"（合法手に一様。Ataraxos のコードの既定）/ "target"（今のターゲット = 動く磁石）
-    magnet: str = "mix:init,0.03"
-    # 温度と学習率の予定: (coef, decay, ceil, floor) → clip(coef / (t + 1)^decay, floor, ceil)
-    temp: tuple = (0.05, 0.3, 0.1, 0.001)
-    temp_t_off: float = 2000.0
+    # 磁石: "target"（今のターゲット = 現在のネットの EMA。動く磁石）/ "mix:target,<ε>"（今のターゲットと一様の混合）/
+    # "mix:init,<ε>"（始めたときのターゲットの写しと一様の混合 = 固定の磁石）/ "uniform"（合法手に一様。Ataraxos のコードの既定）。
+    # 既定は動く磁石（2026-10-25。固定の磁石 ＋ 温度を下げる形は、クーンで R-NaD の約8倍遅く、代理 P2 で自己対局が短い詰みの筋に
+    # 固まった。docs/rl-learning-speed.md 10.4）
+    magnet: str = "target"
+    # 温度と学習率の予定: (coef, decay, ceil, floor) → clip(coef / (t + 1)^decay, floor, ceil)。既定の温度は 0.05 固定
+    temp: tuple = (0.05, 0.0, 0.05, 0.05)
+    temp_t_off: float = 0.0
     lr: tuple = (1e-4, 0.0, 1e-4, 1e-4)
     lr_t_off: float = 0.0
     # t = (更新回数 − MMD を始めた更新回数) × t_scale
@@ -83,13 +87,20 @@ class MMDConfig:
     # 最初の N 更新は価値の頭だけを全行で学ぶ（幹と方策の頭は止める）
     value_warmup: int = 0
     target_avg: float = 0.001
+    # 動く磁石（target / mix:target）の速さ。0 = 書き出しのターゲット（target_avg）をそのまま磁石にする。> 0 なら磁石だけを
+    # 別の EMA（magnet_net、この係数）で動かし、書き出しの EMA とは切り離す
+    magnet_avg: float = 0.0
 
 
 PRESETS = {
     "tsuitate": {},
+    # 設計の初版の既定（固定の混合磁石・温度を t で下げる・起点 2,000・pps 0.25）。代理 P2 で崩れた形の再現用
+    "mixinit": {"filter": "pps:0.25,floor=0.05", "magnet": "mix:init,0.03", "temp": (0.05, 0.3, 0.1, 0.001),
+                "temp_t_off": 2000.0},
     # Ataraxos のコードの既定（scripts/train/rl_main.py・pyengine/core/rl.py）。pipeline でも μ を中心にする
     "ataraxos": {"filter": "quantile:0.75,min=0.01", "value_rows": "filtered", "magnet": "uniform",
-                 "gae_lambda": 0.5, "lr": (0.5, 1.1, 1e-4, 5e-6), "temp_t_off": 0.0, "decoupled": False},
+                 "gae_lambda": 0.5, "lr": (0.5, 1.1, 1e-4, 5e-6), "temp": (0.05, 0.3, 0.1, 0.001), "temp_t_off": 0.0,
+                 "decoupled": False},
 }
 
 
@@ -183,6 +194,10 @@ def parse_config(cfg: MMDConfig) -> dict:
             raise ValueError(f"{name} は (coef, decay, ceil, floor) の4つ")
     if cfg.steps < 1 or cfg.epochs < 1 or cfg.chunk < 1 or cfg.filt_window < 1:
         raise ValueError("steps・epochs・chunk・filt_window は 1 以上")
+    if not 0.0 <= cfg.magnet_avg <= 1.0:
+        raise ValueError("magnet_avg は 0〜1")
+    if cfg.magnet_avg > 0 and not (mag[0] == "target" or (mag[0] == "mix" and mag[1] == "target")):
+        raise ValueError("magnet_avg は動く磁石（target / mix:target,<ε>）と一緒に使う")
     if cfg.prox_cap < 1.0 or cfg.clip <= 0 or cfg.max_grad_norm < 0:
         raise ValueError("prox_cap ≥ 1、clip > 0、max_grad_norm ≥ 0 にする")
     return {"filter": filt, "value_rows": vrows, "magnet": mag}
@@ -467,6 +482,11 @@ class MMDLearner:
                 pt.add_(cfg.target_avg * (p - pt))
             for bt, b in zip(self.target.buffers(), self.net.buffers()):
                 bt.copy_(b)
+            if cfg.magnet_avg > 0:
+                for pm, p in zip(self.magnet_net.parameters(), self.net.parameters()):
+                    pm.add_(cfg.magnet_avg * (p - pm))
+                for bm, b in zip(self.magnet_net.buffers(), self.net.buffers()):
+                    bm.copy_(b)
         self.step_count += 1
         t_train = time.time()
 
@@ -522,8 +542,11 @@ class MMDLearner:
         capped = 0.0
         need_prox = cfg.decoupled and self.stale_actor and not value_only
         mag_kind = parsed["magnet"]
+        # 磁石のネット: mix:init は始めたときの写し（magnet_net、動かさない）、動く磁石は書き出しのターゲットか、
+        # magnet_avg > 0 なら別の EMA（magnet_net）
+        moving_own = cfg.magnet_avg > 0
         mag_net = None if mag_kind[0] == "uniform" else (
-            self.magnet_net if mag_kind[0] == "mix" and mag_kind[1] == "init" else self.target)
+            self.magnet_net if (mag_kind[0] == "mix" and mag_kind[1] == "init") or moving_own else self.target)
         with torch.no_grad():
             for i in range(0, len(pol_loc), cfg.chunk):
                 rows = pol_loc[i:i + cfg.chunk]

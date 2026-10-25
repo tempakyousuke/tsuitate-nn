@@ -471,7 +471,8 @@ def check_schedules():
         for spec in ((0.05, 0.3, 0.1, 0.001), (0.5, 1.1, 1e-4, 5e-6)):
             assert power_schedule(spec[0], t, *spec[1:]) == ataraxos_power_schedule(spec[0], t, *spec[1:])
     net = PolicyValueNet(8, 1, 91)
-    cfg = make_config("tsuitate", temp_t_off=2000, t_scale=0.5, lr=(0.5, 1.1, 1e-4, 5e-6), lr_t_off=100)
+    cfg = make_config("tsuitate", temp=(0.05, 0.3, 0.1, 0.001), temp_t_off=2000, t_scale=0.5,
+                      lr=(0.5, 1.1, 1e-4, 5e-6), lr_t_off=100)
     L = MMDLearner(net, cfg, DEV)
     L.start_from(net.state_dict(), net.state_dict(), 98_000)
     for step in (98_000, 98_010, 99_000):
@@ -479,7 +480,40 @@ def check_schedules():
         assert L.temperature(step) == ataraxos_power_schedule(0.05, t + 2000, 0.3, 0.1, 0.001)
         assert L.scheduled_lr(step) == ataraxos_power_schedule(0.5, t + 100, 1.1, 1e-4, 5e-6)
     assert abs(make_config("ataraxos").temp_t_off) == 0 and make_config("tsuitate").lr == (1e-4, 0.0, 1e-4, 1e-4)
+    # 既定の温度は 0.05 固定（t によらない）
+    Ld = MMDLearner(PolicyValueNet(8, 1, 91), make_config("tsuitate"), DEV)
+    assert Ld.temperature(0) == Ld.temperature(10_000) == 0.05
     print("T7 予定: Ataraxos の power_schedule と一致（t のずらし・刻み・MMD を始めた step からの数え方）")
+
+
+def check_moving_magnet(net0, batch):
+    """動く磁石: magnet_avg > 0 なら磁石（magnet_net）だけが別の EMA で動き、書き出しのターゲットは target_avg で動く。
+    磁石の対数確率は magnet_net から作る"""
+    cfg = make_config("tsuitate", magnet="target", magnet_avg=0.5, target_avg=0.1, filter="none", chunk=10_000)
+    L = MMDLearner(copy.deepcopy(net0), cfg, DEV)
+    m0 = [p.detach().clone() for p in L.magnet_net.parameters()]
+    t0 = [p.detach().clone() for p in L.target.parameters()]
+    L.update(batch)
+    for p, q, a, b in zip(L.net.parameters(), L.magnet_net.parameters(), m0, t0):
+        assert torch.allclose(q, a + 0.5 * (p - a), atol=1e-7)
+    for p, q, b in zip(L.net.parameters(), L.target.parameters(), t0):
+        assert torch.allclose(q, b + 0.1 * (p - b), atol=1e-7)
+    # 2回目の更新の頭の磁石は magnet_net（ターゲットではない）
+    n = len(batch["action"])
+    keep = torch.ones(n, dtype=torch.bool)
+    st, _ = L.prepare(batch, torch.zeros(n), torch.zeros(n), batch["v_actor"].float(), keep, torch.ones(n), keep, torch.ones(n))
+    rows = torch.arange(min(n, 50))
+    obs, pmask, apos, idx, pos = st.view(rows)
+    with torch.no_grad():
+        want = torch.log_softmax(L.magnet_net(obs)[0].gather(1, idx).masked_fill(~pmask, float("-inf")), -1)[pmask]
+    assert float((st.lrho[pos] - want).abs().max()) < 1e-5
+    for bad in (dict(magnet="mix:init,0.03", magnet_avg=0.1), dict(magnet="uniform", magnet_avg=0.1)):
+        try:
+            make_config("tsuitate", **bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"magnet_avg を {bad['magnet']} と通した")
+    print("動く磁石: magnet_avg の EMA で磁石だけが動き（書き出しのターゲットとは別）、磁石の対数確率はそのネットから作る")
 
 
 # ---------------------------------------------------------------- 再開
@@ -543,7 +577,9 @@ def read_log(path):
 
 def check_resume_train(tmp):
     """pipeline なしの train_rnad.py: 6更新を続けた run と、3更新で止めて同じコマンドで 6 まで続けた run が同じ"""
-    common = ["--seed", "4", "--lr-warmup", "4", "--mmd-chunk", "50", "--mmd-steps", "3"]
+    # 温度の予定（t で下げる・起点のずらし）の配線も見るため、初版の予定を明示する
+    common = ["--seed", "4", "--lr-warmup", "4", "--mmd-chunk", "50", "--mmd-steps", "3",
+              "--mmd-temp", "0.05,0.3,0.1,0.001", "--mmd-temp-t-off", "2000"]
     run_train(tmp / "straight", *common, steps=6)
     run_train(tmp / "resumed", *common, steps=3)
     run_train(tmp / "resumed", *common, steps=6)
@@ -590,7 +626,7 @@ def check_init_from_rnad(tmp):
     lg = read_log(tmp / "from_rnad" / "log.jsonl")
     assert [x["step"] for x in lg] == [3] and lg[0]["mmd_t"] == 0
     cfg = json.loads((tmp / "from_rnad" / "config.json").read_text())
-    assert cfg["init_from"]["step"] == 2 and cfg["mmd"]["filter"] == "pps:0.25,floor=0.05"
+    assert cfg["init_from"]["step"] == 2 and cfg["mmd"]["filter"] == "pps:0.5,floor=0.05" and cfg["mmd"]["magnet"] == "target"
     # checkpoint があれば --init* は使わない（表示して続ける）
     r = run_train(tmp / "from_rnad", "--init", str(src), "--init-which", "both", "--init-step", steps=4)
     assert "--init / --init-which / --init-step は使わない" in r.stdout
@@ -628,7 +664,7 @@ def check_rejects(tmp):
 
 def check_smoke(tmp):
     """pipeline・fast py・device_batch で2つの preset を回し、NaN なし・ログのキーあり・stage_log.py が読める"""
-    for preset in ("tsuitate", "ataraxos"):
+    for preset in ("tsuitate", "mixinit", "ataraxos"):
         out = tmp / f"smoke_{preset}"
         run_train(out, "--mmd-preset", preset, "--pipeline", "--fast-collect", "py", "--device-batch",
                   "--mmd-chunk", "64", "--lr-warmup", "2", steps=4)
@@ -643,7 +679,7 @@ def check_smoke(tmp):
         r = subprocess.run([sys.executable, str(HERE.parent / "stage_log.py"), str(out / "log.jsonl"), "--dm", "2",
                             "--out-dir", str(out / "stage")], capture_output=True, text=True)
         assert r.returncode == 0, r.stderr[-1500:]
-    print("T10 煙テスト: --pipeline --fast-collect py --device-batch で preset 2つとも NaN なし・ログのキーあり・"
+    print("T10 煙テスト: --pipeline --fast-collect py --device-batch で preset 3つとも NaN なし・ログのキーあり・"
           "stage_log.py が読める")
 
 
@@ -657,6 +693,7 @@ if __name__ == "__main__":
     check_loss_dense(net0, batch)
     check_end_to_end(net0, batch)
     check_first_step(net0, batch)
+    check_moving_magnet(net0, batch)
     check_resume(net0)
     with tempfile.TemporaryDirectory() as d:
         tmp = pathlib.Path(d)
