@@ -91,6 +91,69 @@ ARENA_MATCH_SEED=20260927 cargo run --release --bin arena -- 100 "rl_policy:<pol
 
 学習ログには `lr`（実際の学習率）と、方策の固まり方の見張り `pi_top_mean` / `pi_top_gt_0999` / `entropy_mean` が出る。
 
+## MMD 学習器（Ataraxos 型、`--algo mmd`）
+
+`--algo mmd` で更新を R-NaD から **Ataraxos（Stratego）型**に替える（`mmd.py`。既定は R-NaD のまま）。
+設計・根拠・計測と 3070 での A/B の手順は tsuitate-bot の `docs/rl-learning-speed.md` 10節。
+
+- 損失は PPO の比クリップ ＋ 近い方策への逆KL ＋ 磁石への逆KL × 温度 ＋ 価値の MSE。**1/μ がどこにも無い**
+  （R-NaD の勾配の雑音の 99.6〜99.9% は v-trace の s = (G − v)/μ）
+- アドバンテージは手番側ごとの GAE（λ_A）、価値の目標は TD(λ)。どちらも収集時の価値（`collect(actor_extras=True)` の
+  `v_actor`）で作る。反則で同じ側が続く手番も、`v_trace_scalars` を η=0・π=μ=1・c=λ で呼べばそのまま扱える
+- 学習に使う行は既定で **|A| に比例した確率の間引き（pps、割合 0.25）**。重み s̄/p で戻すので期待値は全行と同じ
+  （Ataraxos どおりの「|A| の 75%点以上だけ」はクーンで固定点を均衡から外すので、`--mmd-preset ataraxos` の腕に残す）
+- 1回の収集を 8 歩の Adam に分ける（行を無作為に並べて8等分）。段階（Δm）は無く、磁石への KL の係数（温度）を
+  MMD を始めてからの更新回数のべき乗で下げる。磁石は既定で「始めたときのターゲットと一様の混合（ε=0.03）」
+- `--pipeline` ではクリップと KL の中心を更新の頭の方策にし、μ との比を外側の重みにする（decoupled PPO）
+
+R-NaD の checkpoint から続ける（net ← 現在のネット、ターゲットと磁石 ← ターゲット、step の番号を続ける。Adam は新しく作る）:
+
+```sh
+.venv/bin/python -u rnad/train_rnad.py --algo mmd --init out_rnad/ab_base_98000.pt --init-which both --init-step \
+    --out out_rnad/ab_mmd_s1 --seed <本線と同じ> --steps <終わりの step> --batch 768 --anchor <本線と同じ> \
+    --pipeline --compact-legal --fast-collect rust --device-batch --precision tf32 --lr-warmup 100
+```
+
+| フラグ | 既定（`--mmd-preset tsuitate`） | `ataraxos` | 中身 |
+| --- | --- | --- | --- |
+| `--mmd-filter` | `pps:0.25,floor=0.05` | `quantile:0.75,min=0.01` | 方策の行: `pps:<割合>[,floor=]` / `quantile:<分位>[,min=]` / `none` |
+| `--mmd-value-rows` | `auto` | `filtered` | 価値の行: `auto`（pps は方策と同じ行・重み、quantile は `uniform:0.25`）/ `all` / `uniform:<割合>` / `filtered` |
+| `--mmd-gae-lambda` / `--mmd-td-lambda` | 0.8 / 0.8 | 0.5 / 0.8 | A と価値の目標の λ |
+| `--mmd-lambda-unit` | `attempt` | 同じ | λ を試行ごと（反則も1回）/ `turn`（受理された手ごと） |
+| `--mmd-magnet` | `mix:init,0.03` | `uniform` | `mix:init,<ε>` / `mix:target,<ε>` / `uniform` / `target` |
+| `--mmd-temp` / `--mmd-temp-t-off` | `0.05,0.3,0.1,0.001` / 2000 | 同じ / 0 | 温度 clip(coef/(t+1)^decay, floor, ceil)、t = MMD の更新回数 + ずらし |
+| `--mmd-lr` / `--mmd-lr-t-off` | `1e-4,0,1e-4,1e-4`（固定）/ 0 | `0.5,1.1,1e-4,5e-6` / 0 | 学習率の予定（同じ式）。`--lr-warmup` を掛ける |
+| `--mmd-clip` / `--mmd-kl` / `--mmd-vf` / `--mmd-pol-scale` | 0.2 / 0.1 / 1.0 / 1.0 | 同じ | 比のクリップ / 近い方策への KL / 価値 / 方策の項の係数 |
+| `--mmd-decoupled` / `--mmd-prox-cap` | on / 2.0 | off | pipeline の中心を更新の頭の方策にする / 外側の重みの上限 |
+| `--mmd-steps` / `--mmd-chunk` / `--mmd-epochs` | 8 / 2048 / 1 | 同じ | 1更新の Adam の歩数 / 逆伝播のチャンク / 何周するか |
+| `--mmd-max-grad-norm` / `--mmd-adam-b1` | 0.267 / 0.9 | 同じ | 勾配ノルムのクリップ（0 = なし）/ Adam の β1 |
+| `--mmd-value-warmup` / `--mmd-filt-window` / `--mmd-t-scale` | 0 / 1 / 1.0 | 同じ | 最初の N 更新は価値の頭だけ / quantile の窓 / 予定の t の刻み |
+| `--init-which` / `--init-step` | `target` / なし | — | `--init` の checkpoint のどのネットから始めるか（`both` 推奨）/ step の番号を続ける |
+
+- `--compact-legal` が要る。`--fast-collect`・`--pipeline`・`--device-batch`（`--packed` は無くてよい）・`--lr-warmup`・
+  `--reset-adam`・`--reseed`・`--panel`・`--extra-ema`・`--export-current` は使える
+- 止める組み合わせ: `--fused`・`--reuse` > 1・`--lr-sched`・`--tail-avg`・`--league`・ボーナス（`--nyugyoku` / `--guard` /
+  `--speed`）・`--aux-truth`、R-NaD だけの設定（`--lr` `--eta` `--beta` `--neurd-clip` `--inv-mu-cap` `--policy-loss`
+  `--c-vtrace` `--c-ply` `--schedule` `--schedule-start` `--adam-b1`）を既定以外にしたとき。R-NaD の `out` を MMD で
+  （またはその逆で）再開しようとしたとき
+- checkpoint は `algo: "mmd"` と `net` / `target` / `magnet_net` / `opt` / `step` / `mmd_t0` / 行の間引きの乱数を持つ。
+  `--init` / `--anchor` / `distill.py` は R-NaD と同じに読める（`config` と `target` がある）。書き出しはターゲット
+  （現在のネットの EMA）。**本線と同じ step 番号になるので、Release のタグには `mmd` を入れる**
+- 再開: pipeline なしなら、続けて回した run とビット単位で同じ（`tests/test_mmd.py`）。pipeline では再開すると収集が
+  `seed*1_000_003 + 17 + step` から始まるので、続けた run とは別の局になる（R-NaD と同じ）。`--lr-warmup` は MMD を
+  始めた step から数えるので、同じコマンドで再開しても走り直さない
+- ログ（log.jsonl）: R-NaD と共通の `samples` `loss_v` `loss_nerd`（方策の項）`alpha`（1.0）`reg_update`（false）`lr`
+  `collect_sec` `update_sec` に加え、`temperature` `mmd_t` `rows_kept` `keep_rate` `pps_c` `w_max`、信頼領域の
+  `kl_prox_mean` / `kl_prox_last`（中心への KL）`kl_mu_unkept`（残さなかった行の更新後の KL(π‖μ)）`clip_frac`
+  `ratio_dev_first` `prox_is_capped`、勾配の `grad_norm_p50/p90/max`（クリップ前）`clip_rate`、方策の `entropy_mean`
+  `pi_top_mean` `pi_top_gt_0999`（収集方策の値）`magnet_kl`、価値の `calib_band`（|v| の帯ごとの mean(z·sign v)・mean|v|）
+  `calib_slope_by_remain`（終局までの手番数の帯ごとの傾き）`resid_band`（V の帯ごとの mean(G_td − v)）
+- `bench_update.py --mmd-arms 0.25,0.5,1 --calib net,target --loop-mmd <割合>` で割合ごとの1更新の秒・勾配ノルムの分位・
+  GPU のメモリ・価値の較正を測る（A/B の前の 6.0c）
+- テスト: `tests/test_mmd.py`（λ-return と素直なループ・閉形式、extras の収集、Ataraxos の式の密な参照との損失と勾配、
+  decoupled PPO、端から端の勾配、行の選び方の不偏性、予定、再開のビット一致、R-NaD の checkpoint からの始め方、
+  止める組み合わせ、煙テスト）
+
 ## 防御特化（玉の周りの固め）モデル
 
 「自玉の周りに駒を打ちまくって相手の打ち反則を誘い、自分の打ち反則で相手の駒を検知して取る」戦法の

@@ -17,7 +17,7 @@ import time
 import torch
 
 import tsuitate_rl
-from model import PolicyValueNet
+from model import NUM_PLANES, PolicyValueNet
 from rnad import (RNaDConfig, RNaDLearner, collect, forward, legal_log_policy,
                   set_precision)
 from train_rnad import pick_device
@@ -26,6 +26,12 @@ from train_rnad import pick_device
 def make_learner(ck, device):
     c = ck["config"]
     net = PolicyValueNet(c["channels"], c["blocks"], c["planes"])
+    if ck.get("algo", "rnad") == "mmd":
+        # MMD の checkpoint（train_rnad.py --algo mmd）: 現在のネットを R-NaD の更新で測る（正則化方策・ターゲットも同じネット）
+        net.load_state_dict(ck["net"])
+        learner = RNaDLearner(net, RNaDConfig(beta=16.0, lr=1e-4, schedule_sizes=(2000,), schedule_repeats=(1,)), device)
+        learner.step_count = 1000
+        return learner
     cfg = RNaDConfig(**{k: tuple(v) if isinstance(v, list) else v for k, v in ck["cfg"].items()})
     learner = RNaDLearner(net, cfg, device)
     learner.load_state_dict(copy.deepcopy(ck))
@@ -62,7 +68,10 @@ def main():
     # 一致を見る共通のバッチ（fp32 で集める）と、fp32 での基準
     set_precision("fp32")
     torch.manual_seed(0)
-    env = tsuitate_rl.VecEnv(args.batch, seed=0, auto_reset=False)
+    planes = ck["config"]["planes"]
+    # v2（91枚）のネットには v2 の観測を渡す（v1 のときは引数なし = planes の無い古い tsuitate_rl でも動く）
+    obs_kw = {"planes": planes} if planes != NUM_PLANES else {}
+    env = tsuitate_rl.VecEnv(args.batch, seed=0, auto_reset=False, **obs_kw)
     base = make_learner(ck, device)
     fixed = collect(env, base.net, device)
     env.pop_finished()
@@ -91,7 +100,7 @@ def main():
         # 速さと自己無撞着（この精度で集めて、この精度で更新する = 学習と同じ）
         learner = make_learner(ck, device)
         torch.manual_seed(1)
-        env = tsuitate_rl.VecEnv(args.batch, seed=1, auto_reset=False)
+        env = tsuitate_rl.VecEnv(args.batch, seed=1, auto_reset=False, **obs_kw)
         cs, us, dev_mean, dev_max = [], [], [], []
         for r in range(args.reps + 1):
             sync(device)

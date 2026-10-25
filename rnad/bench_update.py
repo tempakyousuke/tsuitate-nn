@@ -25,7 +25,21 @@
   `--ckpt` の区切りの checkpoint は α=0 なので、α=1 の区間は `--step` で区切り + Δm/2 以上を渡して別に測る
 - `sequential` / `pipelined`: 「集める → 更新」を --loop 回まわした1更新あたりの壁時計。pipelined は
   `PipelinedCollector`（1更新遅れの方策で集めて更新と重ねる）。更新は packed で回し、`--fast-collect` /
-  `--device-batch` / `--fused` を付けるとこのループにも使う
+  `--device-batch` / `--fused` を付けるとこのループにも使う。`--loop-mmd <割合>` なら更新を MMD 学習器にする
+  （pipelined は decoupled の近い方策の順伝播も入る）
+
+MMD 学習器（`--algo mmd`。docs/rl-learning-speed.md 10節）の A/B の前に決めること（6.0c）:
+
+    .venv/bin/python rnad/bench_update.py --ckpt out_rnad/ab_base_98000.pt --batch 768 --compact-legal \\
+        --collect-arms rust,rust+extras --mmd-arms 0.25,0.5,1 --fast-collect rust --device-batch --precision tf32 \\
+        --calib net,target --loop-mmd 0.25
+
+- `--collect-arms` に `+extras` の腕（`collect(actor_extras=True)`）: 既存のキーが extras なしとビット単位で同じか
+- `--mmd-arms`: 行を残す割合ごと（1 = 絞り込みなし）の MMD の1更新の秒、クリップ前の勾配ノルムの分位（歩ごと）、
+  `torch.cuda.max_memory_allocated`。R-NaD の checkpoint なら net ← 現在のネット、ターゲットと磁石 ← ターゲットで始める
+  （`--init-which both` と同じ）。`--mmd-stale` で pipeline の decoupled の順伝播も入れて測る
+- `--calib net,target`: checkpoint の現在のネットとターゲットの価値の較正（|v| の帯・終局までの手番数の帯・V の帯の残差）。
+  `--mmd-value-warmup` を使うかを決める
 """
 
 import argparse
@@ -39,7 +53,9 @@ import torch
 import tsuitate_rl
 from export_weights import read as read_weights
 from model import NUM_PLANES, PolicyValueNet
-from rnad import PRECISIONS, PipelinedCollector, RNaDConfig, RNaDLearner, collect, set_precision
+from mmd import MMDLearner, _value_monitors, player_lambda_returns
+from mmd import make_config as make_mmd_config
+from rnad import PRECISIONS, PipelinedCollector, RNaDConfig, RNaDLearner, collect, forward, set_precision
 from train_rnad import pick_device
 
 UPDATE_ARMS = {"packed": {}, "device": {"device_batch": True}, "fused": {"fused": True},
@@ -51,14 +67,30 @@ def sync(device):
         torch.cuda.synchronize()
 
 
+_CK = {}
+
+
+def load_ck(args, device):
+    if args.ckpt not in _CK:
+        _CK[args.ckpt] = torch.load(args.ckpt, map_location=device)
+    return _CK[args.ckpt]
+
+
 def make_learner(args, device, packed, **flags):
     if args.ckpt:
-        ck = torch.load(args.ckpt, map_location=device)
+        ck = copy.deepcopy(load_ck(args, device))
         c = ck["config"]
         net = PolicyValueNet(c["channels"], c["blocks"], c["planes"])
+        if ck.get("algo", "rnad") == "mmd":
+            # MMD の checkpoint: R-NaD の腕は現在のネットから（正則化方策・ターゲットも同じネット。α = 1）
+            net.load_state_dict(ck["net"])
+            cfg = RNaDConfig(beta=16.0, lr=1e-4, schedule_sizes=(2000,), schedule_repeats=(1,))
+            learner = RNaDLearner(net, cfg, device, packed=packed, **flags)
+            learner.step_count = 1000 if args.step < 0 else args.step
+            return learner
         cfg = RNaDConfig(**{k: tuple(v) if isinstance(v, list) else v for k, v in ck["cfg"].items()})
         learner = RNaDLearner(net, cfg, device, packed=packed, **flags)
-        learner.load_state_dict(copy.deepcopy(ck))
+        learner.load_state_dict(ck)
         if args.step >= 0:
             learner.step_count = args.step  # α を選ぶ（計時と一致の確認だけ。学習状態の中身は checkpoint のまま）
         return learner
@@ -67,6 +99,49 @@ def make_learner(args, device, packed, **flags):
     learner = RNaDLearner(net, cfg, device, packed=packed, **flags)
     learner.step_count = 1000  # α = 1（段階の途中）。正則化方策は同じネット
     return learner
+
+
+def make_mmd(args, device, rate, stale=False, device_batch=False):
+    """MMD 学習器（tsuitate preset、行を残す割合 rate。1 なら絞り込みなし）。新しい Adam で始める（A/B と同じ）"""
+    cfg = make_mmd_config("tsuitate", filter="none" if rate >= 1 else f"pps:{rate},floor=0.05",
+                          max_grad_norm=args.mmd_max_grad_norm, chunk=args.mmd_chunk, steps=args.mmd_steps)
+    if args.ckpt:
+        ck = load_ck(args, device)
+        c = ck["config"]
+        L = MMDLearner(PolicyValueNet(c["channels"], c["blocks"], c["planes"]), cfg, device, device_batch=device_batch,
+                       stale_actor=stale)
+        L.start_from(ck["net"], ck["target"], int(ck.get("step", 0)))
+        if ck.get("algo") == "mmd":
+            L.magnet_net.load_state_dict(ck["magnet_net"])
+        return L
+    net = read_weights(args.weights) if args.weights else PolicyValueNet(args.channels, args.blocks, args.planes)
+    return MMDLearner(net, cfg, device, device_batch=device_batch, stale_actor=stale)
+
+
+@torch.no_grad()
+def calib_report(args, device, batch):
+    """checkpoint の現在のネット・ターゲットの価値の較正（`mmd._value_monitors` と同じ帯。λ=0.8 の TD 目標）"""
+    ck = load_ck(args, device) if args.ckpt else None
+    out = {}
+    for which in [w for w in args.calib.split(",") if w]:
+        if ck is None:
+            raise SystemExit("--calib は --ckpt と一緒に使う")
+        c = ck["config"]
+        net = PolicyValueNet(c["channels"], c["blocks"], c["planes"]).to(device).eval()
+        net.load_state_dict(ck[which])
+        v = torch.cat([forward(net, batch["obs"][i:i + 2048].to(device, torch.float32))[1].cpu()
+                       for i in range(0, len(batch["action"]), 2048)])
+        g = player_lambda_returns(batch, v, 0.8)
+        everything = torch.ones(len(v), dtype=torch.bool)
+        mon = _value_monitors(batch, v, g, g - v, everything, everything)
+        out[which] = {k: mon[k] for k in ("calib_band", "calib_slope_by_remain", "resid_band")}
+        print(f"較正（{which}）: |v| の帯 " + " / ".join(
+            f"[{b['lo']:.1f},{b['hi']:.1f}) n={b['n']} z·sign(v) {b['z_sign_v'] if b['z_sign_v'] is None else round(b['z_sign_v'], 3)}"
+            f" |v| {b['abs_v'] if b['abs_v'] is None else round(b['abs_v'], 3)}" for b in mon["calib_band"])
+            + " ／ 終局までの手番数の帯の傾き " + " / ".join(
+            f"{b['lo']}〜{b['hi']} {b['slope'] if b['slope'] is None else round(b['slope'], 2)}"
+            for b in mon["calib_slope_by_remain"]), flush=True)
+    return out
 
 
 def env_kw(learner):
@@ -132,6 +207,15 @@ def main():
                          "α=1 の区間を測るには区切り + Δm/2 以上を渡す）")
     ap.add_argument("--precision", choices=PRECISIONS, default="default",
                     help="ネットの計算精度（train_rnad.py と同じ。本線は tf32）")
+    ap.add_argument("--mmd-arms", default="", help="MMD の更新の腕（行を残す割合のカンマ区切り。1 = 絞り込みなし）")
+    ap.add_argument("--mmd-stale", action="store_true",
+                    help="MMD の腕を pipeline と同じ持ち方（decoupled の近い方策の順伝播あり）で測る")
+    ap.add_argument("--mmd-max-grad-norm", type=float, default=0.267, help="MMD の腕の勾配ノルムのクリップ")
+    ap.add_argument("--mmd-chunk", type=int, default=2048, help="MMD の腕の逆伝播のチャンク")
+    ap.add_argument("--mmd-steps", type=int, default=8, help="MMD の腕の1更新の歩数")
+    ap.add_argument("--loop-mmd", type=float, default=0.0,
+                    help="sequential / pipelined の更新を MMD（この割合）にする（0 = R-NaD）")
+    ap.add_argument("--calib", default="", help="価値の較正を測るネット（net / target をカンマ区切り。--ckpt が要る）")
     args = ap.parse_args()
     set_precision(args.precision)
     if args.threads:
@@ -140,8 +224,11 @@ def main():
     collect_arms = [a for a in args.collect_arms.split(",") if a]
     update_arms = [a for a in args.update_arms.split(",") if a]
     for a in collect_arms:
-        if a not in ("orig", "py", "rust"):
-            raise SystemExit(f"--collect-arms の {a}（orig / py / rust）")
+        if a.removesuffix("+extras") not in ("orig", "py", "rust"):
+            raise SystemExit(f"--collect-arms の {a}（orig / py / rust、どれも +extras を付けてよい）")
+    mmd_rates = [float(x) for x in args.mmd_arms.split(",") if x]
+    if (mmd_rates or args.loop_mmd or args.calib) and not args.compact_legal:
+        raise SystemExit("--mmd-arms / --loop-mmd / --calib は --compact-legal の batch で測る")
     for a in update_arms:
         if a not in UPDATE_ARMS:
             raise SystemExit(f"--update-arms の {a}（{' / '.join(UPDATE_ARMS)}）")
@@ -166,11 +253,16 @@ def main():
     # 決まる（逆伝播と Adam を通らない）。CUDA で逆伝播のカーネルが非決定的でパラメータが揺れても、ここが基準と
     # 完全に同じなら、順伝播と v-trace は腕どうしで同じ
     upd_info_same = {k: True for k in upd_sec}
+    mmd_sec = {r: [] for r in mmd_rates}
+    mmd_mem = {r: [] for r in mmd_rates}
+    mmd_gn = {r: [] for r in mmd_rates}
+    mmd_rows = {r: [] for r in mmd_rates}
+    want_extras = bool(mmd_rates or args.calib)
     for r in range(args.reps + 1):
         torch.manual_seed(r)
         sync(device)
         t0 = time.time()
-        batch = collect(env, base.net, device, compact_legal=args.compact_legal)
+        batch = collect(env, base.net, device, compact_legal=args.compact_legal, actor_extras=want_extras)
         sync(device)
         t1 = time.time()
         env.pop_finished()
@@ -203,14 +295,17 @@ def main():
             gen.manual_seed(r)
             sync(device)
             s0 = time.time()
+            kind = arm.removesuffix("+extras")
             bc = collect(env_c, base.net, device, compact_legal=True, generator=gen,
-                         fast="" if arm == "orig" else arm)
+                         fast="" if kind == "orig" else kind, actor_extras=arm.endswith("+extras"))
             sync(device)
             arm_t[arm] = time.time() - s0
             if first is None:
                 first = bc
             else:
-                bad = batch_diff(first, bc)
+                # extras の腕どうしは extras も、extras の有無が違う腕は共通のキーだけ比べる
+                keys = set(first) & set(bc)
+                bad = batch_diff({k: first[k] for k in keys}, {k: bc[k] for k in keys})
                 if bad:
                     mismatch.append({"rep": r, "arm": arm, "keys": bad})
 
@@ -237,6 +332,27 @@ def main():
                 upd_err[key].append(float(((vec - q0) - ref_d).norm() / ref_d.norm()))
             del L
 
+        # MMD の腕: 同じ batch・同じ出発点から1更新ずつ
+        mmd_t = {}
+        for rate in mmd_rates:
+            L = make_mmd(args, device, rate, stale=args.mmd_stale, device_batch=args.device_batch)
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
+            sync(device)
+            s0 = time.time()
+            info = L.update(batch)
+            sync(device)
+            mmd_t[rate] = time.time() - s0
+            if r > 0:
+                mmd_sec[rate].append(mmd_t[rate])
+                mmd_gn[rate] += L.last_grad_norms
+                mmd_rows[rate].append(info["rows_kept"])
+                if device.type == "cuda":
+                    mmd_mem[rate].append(torch.cuda.max_memory_allocated(device) / 2**30)
+            del L
+        if r == 0 and args.calib:
+            rec["calib"] = calib_report(args, device, batch)
+
         if r == 0:
             gcos.clear()
             gerr.clear()
@@ -252,6 +368,7 @@ def main():
             upd_sec[key].append(s)
         extra = "".join(f" / 収集 {arm} {s:.2f}s" for arm, s in arm_t.items())
         extra += "".join(f" / 更新 {key.split(':', 1)[1]} {s:.2f}s" for key, s in upd_t.items())
+        extra += "".join(f" / MMD {rate:g} {s:.2f}s" for rate, s in mmd_t.items())
         print(f"rep {r}: collect {t1 - t0:.2f}s update {t3 - t2:.2f}s packed {t4 - t3:.2f}s "
               f"勾配のコサイン {gcos[-1]:.8f} 相対誤差 {gerr[-1]:.2e} / 更新量のコサイン {coss[-1]:.6f} "
               f"標本 {len(batch['action'])}{extra}", flush=True)
@@ -274,11 +391,31 @@ def main():
               + " / ログの値が基準と同じ: " + ", ".join(f"{k.split(':', 1)[1]}={v}" for k, v in
                                                   rec["update_arms_info_same"].items()), flush=True)
 
-    # 集める → 更新 を回したときの1更新の壁時計（更新は packed）
+    if mmd_rates:
+        rec["mmd_arms"] = {}
+        for rate in mmd_rates:
+            gn = torch.tensor(mmd_gn[rate], dtype=torch.float64)
+            q = {f"p{int(x * 100)}": float(gn.quantile(x)) for x in (0.1, 0.5, 0.9)}
+            rec["mmd_arms"][f"{rate:g}"] = {
+                "sec": sum(mmd_sec[rate]) / len(mmd_sec[rate]), "rows_kept": sum(mmd_rows[rate]) / len(mmd_rows[rate]),
+                "grad_norm": {**q, "max": float(gn.max())},
+                "clip_rate_at": {f"{c:g}": float((gn > c).double().mean()) for c in (0.267, 0.5, 1.0, 2.0)},
+                **({"max_mem_gb": max(mmd_mem[rate])} if mmd_mem[rate] else {})}
+            a = rec["mmd_arms"][f"{rate:g}"]
+            print(f"MMD {rate:g}: 1更新 {a['sec']:.2f}s 残した行 {a['rows_kept']:.0f} "
+                  f"クリップ前の勾配ノルム p10 {q['p10']:.3f} p50 {q['p50']:.3f} p90 {q['p90']:.3f} 最大 {a['grad_norm']['max']:.3f}"
+                  + (f" メモリ {a['max_mem_gb']:.2f}GB" if "max_mem_gb" in a else ""), flush=True)
+
+    # 集める → 更新 を回したときの1更新の壁時計（更新は packed、--loop-mmd なら MMD）
     loop_flags = {"device_batch": args.device_batch, "fused": args.fused}
     collect_kw = {"compact_legal": args.compact_legal, "fast": args.fast_collect}
+    if args.loop_mmd:
+        collect_kw["actor_extras"] = True
     for mode in () if args.skip_loop else ("sequential", "pipelined"):
-        learner = make_learner(args, device, packed=True, **loop_flags)
+        if args.loop_mmd:
+            learner = make_mmd(args, device, args.loop_mmd, stale=mode == "pipelined", device_batch=args.device_batch)
+        else:
+            learner = make_learner(args, device, packed=True, **loop_flags)
         times = []
         if mode == "pipelined":
             pipe = PipelinedCollector(lambda: tsuitate_rl.VecEnv(args.batch, seed=2, auto_reset=False, **kw), device,
@@ -304,7 +441,7 @@ def main():
             pipe.close()
         rec[f"{mode}_sec"] = sum(times) / len(times)
         print(f"{mode}: 1更新 {rec[f'{mode}_sec']:.2f}s", flush=True)
-    rec["loop_flags"] = {**loop_flags, "fast_collect": args.fast_collect}
+    rec["loop_flags"] = {**loop_flags, "fast_collect": args.fast_collect, "loop_mmd": args.loop_mmd}
     print(json.dumps(rec))
     msg = (f"\n従来: collect {rec['collect_sec']:.2f} + update {rec['update_sec']:.2f} = "
            f"{rec['collect_sec'] + rec['update_sec']:.2f}s / packed の更新 {rec['packed_sec']:.2f}s "
