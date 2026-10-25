@@ -246,7 +246,8 @@ def main() -> None:
                          "--packed --compact-legal と一緒に使う。GPU のメモリを batch あたり約1GB 使う）")
     ap.add_argument("--fused", action="store_true",
                     help="1回目の現在のネットの順伝播を2回目へまとめる（決定点あたり順伝播1回分が減る。結果は同じ。"
-                         "--league-device gpu とは使えない。勾配をチャンクごとに取っておくので GPU のメモリを約130MB 使う）")
+                         "--league-device gpu とは使えない。勾配をチャンクごとに取っておくので GPU のメモリを約130MB 使う。"
+                         "v-trace を CPU でチャンクごとに進めるので、--device-batch と併用してもチャンクごとに1回の同期は残る）")
     ap.add_argument("--threads", type=int, default=0, help="torch のスレッド数（0 = 既定）")
     ap.add_argument("--planes", type=int, default=NUM_PLANES,
                     help="--init none のときの入力のプレーン数（86 = v1 / 91 = v2 確定事実つき）")
@@ -261,6 +262,9 @@ def main() -> None:
                               or (args.league and args.league_device == "gpu")):
         raise SystemExit("--fast-collect は --compact-legal と一緒に使い、--league-device gpu・入玉ボーナス・"
                          "補助ヘッドとは使えない")
+    if args.fast_collect == "rust" and not hasattr(tsuitate_rl.VecEnv, "observe_alive_f16_csr"):
+        raise SystemExit("--fast-collect rust には VecEnv.observe_alive_f16_csr が要る（tsuitate-bot の rl-env を "
+                         "maturin develop で作り直す）")
     if args.device_batch and not (args.packed and args.compact_legal):
         raise SystemExit("--device-batch は --packed --compact-legal と一緒に使う")
     if args.fused and args.league and args.league_device == "gpu":

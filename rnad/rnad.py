@@ -211,6 +211,8 @@ def v_trace_scalars(v, valid, player, pi_a, mu_a, ent, reward, k, eta, c=1.0, rh
         vt: k の手番のステップでの価値の目標（それ以外は 0）
         s:  k の手番のステップでの Q のスカラー部分（learning_output = v + η 項 + onehot·s）
     `c` は数か [T, B] のテンソル（時刻ごとの c。`RNaDConfig.c_ply` で序盤は 1・終盤だけ λ にするため）。
+    **式を変えたら `RNaDLearner._v_trace_chunk`（`--fused` が使う同じ再帰のチャンク版）も同じように直す**
+    （`tests/test_fast_update.py` の合成データの検査が食い違いを止める）。
     `inv_mu_cap` > 0 なら s に掛かる 1/μ に上限を付ける（参照には無い。まれにしか選ばれない手の
     s が勾配の分散のほとんどを占めるため。docs/rl-learning-speed.md）。価値の目標 vt には効かない
     """
@@ -693,7 +695,8 @@ class RNaDLearner:
             vt_c, s_c = self._v_trace_chunk(cfg, carry, t_idx[sl], b_idx[sl], player, reward, pa_c, mu[sl],
                                             ent_c, vv_c, c_ply)
             vt[sl], s[sl] = vt_c, s_c
-            lv, ln = loss_terms(logits, v, legal, act, pl_d[sl], lpr, vt_c.to(dev), s_c.to(dev), counts,
+            vt_d, s_d = torch.stack([vt_c, s_c]).to(dev)
+            lv, ln = loss_terms(logits, v, legal, act, pl_d[sl], lpr, vt_d, s_d, counts,
                                 cfg.eta, cfg.beta, cfg.clip, cfg.policy_loss)
             loss = lv + ln
             parts = [lv.detach(), ln.detach()]
@@ -1095,7 +1098,7 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
         if opponents is not None or nyugyoku_lambda != 0 or truth or not compact_legal:
             raise ValueError("collect(fast=...) は自己対局（opponents なし）・入玉ボーナスなし・truth なし・"
                              "compact_legal=True に限る")
-        if fast == "rust" and not hasattr(env, "observe_alive_f16_csr"):
+        if fast == "rust" and not all(hasattr(e, "observe_alive_f16_csr") for e in getattr(env, "envs", [env])):
             raise ValueError("collect(fast='rust') には VecEnv.observe_alive_f16_csr が要る（tsuitate-bot の rl-env を"
                              " maturin develop で作り直す）")
         return _collect_fast(env, net, device, max_steps, generator, rust=fast == "rust")

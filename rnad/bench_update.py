@@ -19,7 +19,10 @@
   seed・同じ乱数列で集めるので、腕どうしの batch は**ビット単位で同じ**はず（違えば `collect_mismatch` に出る）
 - `--update-arms`: 更新の腕（packed = 基準、device = `device_batch`、fused、fused+device）。同じ batch・同じ学習状態から
   1回ずつ回し、更新後の全パラメータが基準とビット単位で同じか（CPU では同じ。CUDA は畳み込みの逆伝播のカーネルが
-  非決定的なら基準を2回回しても揺れるので、`packed` を2回並べると揺れの床が見える）と、更新量の相対誤差を出す
+  非決定的なら基準を2回回しても揺れるので、`packed` を2回並べると揺れの床が見える）と、更新量の相対誤差を出す。
+  更新が返すログの値（損失・見張り・π/μ のずれ・v-trace の目標と s。順伝播と v-trace だけで決まる）が基準と完全に同じかも
+  出す（`update_arms_info_same`。パラメータが逆伝播の揺れで違っても、ここが同じなら順伝播と v-trace は同じ）。
+  `--ckpt` の区切りの checkpoint は α=0 なので、α=1 の区間は `--step` で区切り + Δm/2 以上を渡して別に測る
 - `sequential` / `pipelined`: 「集める → 更新」を --loop 回まわした1更新あたりの壁時計。pipelined は
   `PipelinedCollector`（1更新遅れの方策で集めて更新と重ねる）。更新は packed で回し、`--fast-collect` /
   `--device-batch` / `--fused` を付けるとこのループにも使う
@@ -30,6 +33,7 @@ import copy
 import json
 import time
 
+import numpy as np
 import torch
 
 import tsuitate_rl
@@ -55,6 +59,8 @@ def make_learner(args, device, packed, **flags):
         cfg = RNaDConfig(**{k: tuple(v) if isinstance(v, list) else v for k, v in ck["cfg"].items()})
         learner = RNaDLearner(net, cfg, device, packed=packed, **flags)
         learner.load_state_dict(copy.deepcopy(ck))
+        if args.step >= 0:
+            learner.step_count = args.step  # α を選ぶ（計時と一致の確認だけ。学習状態の中身は checkpoint のまま）
         return learner
     net = read_weights(args.weights) if args.weights else PolicyValueNet(args.channels, args.blocks, args.planes)
     cfg = RNaDConfig(beta=16.0, lr=1e-4, schedule_sizes=(2000,), schedule_repeats=(1,))
@@ -68,18 +74,35 @@ def env_kw(learner):
     return {"planes": planes} if planes != NUM_PLANES else {}
 
 
+_INT_VIEW = {torch.float16: torch.int16, torch.bfloat16: torch.int16, torch.float32: torch.int32,
+             torch.float64: torch.int64}
+
+
+def same_bits(x, y):
+    """テンソルどうしがビット単位で同じか（torch.equal は値で比べ、+0 と −0 を同じ・NaN を違うとみなすので、整数として見る）"""
+    if x.dtype != y.dtype or x.shape != y.shape:
+        return False
+    x, y = x.detach().contiguous(), y.detach().contiguous()
+    if x.dtype in _INT_VIEW:
+        x, y = x.view(_INT_VIEW[x.dtype]), y.view(_INT_VIEW[y.dtype])
+    return bool(torch.equal(x, y))
+
+
 def batch_diff(a, b):
     """batch どうしで違うキー（ビット単位）"""
     bad = []
     for k in sorted(set(a) | set(b)):
         x, y = a.get(k), b.get(k)
-        if torch.is_tensor(x) and torch.is_tensor(y):
-            if not (x.dtype == y.dtype and x.shape == y.shape and torch.equal(x, y)):
+        if x is None or y is None:
+            bad.append(k)
+        elif torch.is_tensor(x) and torch.is_tensor(y):
+            if not same_bits(x, y):
                 bad.append(k)
-        elif hasattr(x, "shape") and hasattr(y, "shape"):
-            if not (x.shape == y.shape and (x == y).all()):
+        elif isinstance(x, np.ndarray) and isinstance(y, np.ndarray):
+            if not (x.dtype == y.dtype and x.shape == y.shape
+                    and np.array_equal(np.ascontiguousarray(x).view(np.uint8), np.ascontiguousarray(y).view(np.uint8))):
                 bad.append(k)
-        elif x is None or y is None:
+        elif x != y:
             bad.append(k)
     return bad
 
@@ -104,6 +127,9 @@ def main():
     ap.add_argument("--device-batch", action="store_true", help="sequential / pipelined の更新に使う")
     ap.add_argument("--fused", action="store_true", help="sequential / pipelined の更新に使う")
     ap.add_argument("--skip-loop", action="store_true", help="sequential / pipelined を測らない")
+    ap.add_argument("--step", type=int, default=-1,
+                    help="--ckpt の step を上書きする（段階の中の位置 = α を選ぶ。区切りの checkpoint は α=0 なので、"
+                         "α=1 の区間を測るには区切り + Δm/2 以上を渡す）")
     ap.add_argument("--precision", choices=PRECISIONS, default="default",
                     help="ネットの計算精度（train_rnad.py と同じ。本線は tf32）")
     args = ap.parse_args()
@@ -136,6 +162,10 @@ def main():
     upd_sec = {f"{i}:{a}": [] for i, a in enumerate(update_arms)}
     upd_err = {k: [] for k in upd_sec}
     upd_bitwise = {k: True for k in upd_sec}
+    # 更新が返すログの値（損失・見張りの和・π/μ のずれ・v-trace の目標と s）は全部、順伝播と CPU の v-trace から
+    # 決まる（逆伝播と Adam を通らない）。CUDA で逆伝播のカーネルが非決定的でパラメータが揺れても、ここが基準と
+    # 完全に同じなら、順伝播と v-trace は腕どうしで同じ
+    upd_info_same = {k: True for k in upd_sec}
     for r in range(args.reps + 1):
         torch.manual_seed(r)
         sync(device)
@@ -195,14 +225,15 @@ def main():
             q0 = torch.nn.utils.parameters_to_vector(L.net.parameters()).detach().clone()
             sync(device)
             s0 = time.time()
-            L.update(batch)
+            info = L.update(batch)
             sync(device)
             upd_t[key] = time.time() - s0
             vec = torch.nn.utils.parameters_to_vector(L.net.parameters()).detach()
             if ref_vec is None:
-                ref_vec, ref_d = vec, vec - q0
+                ref_vec, ref_d, ref_info = vec, vec - q0, info
             elif r > 0:
-                upd_bitwise[key] &= bool(torch.equal(vec, ref_vec))
+                upd_bitwise[key] &= same_bits(vec, ref_vec)
+                upd_info_same[key] &= info == ref_info
                 upd_err[key].append(float(((vec - q0) - ref_d).norm() / ref_d.norm()))
             del L
 
@@ -235,10 +266,13 @@ def main():
     if update_arms:
         rec["update_arms_sec"] = {k: sum(v) / len(v) for k, v in upd_sec.items()}
         rec["update_arms_bitwise"] = {k: v for k, v in list(upd_bitwise.items())[1:]}
+        rec["update_arms_info_same"] = {k: v for k, v in list(upd_info_same.items())[1:]}
         rec["update_arms_delta_rel_err_max"] = {k: max(v) for k, v in upd_err.items() if v}
         print("更新の腕（秒）: " + " / ".join(f"{k.split(':', 1)[1]} {s:.2f}" for k, s in rec["update_arms_sec"].items())
               + " / 基準とビット単位で同じ: " + ", ".join(f"{k.split(':', 1)[1]}={v}" for k, v in
-                                                     rec["update_arms_bitwise"].items()), flush=True)
+                                                     rec["update_arms_bitwise"].items())
+              + " / ログの値が基準と同じ: " + ", ".join(f"{k.split(':', 1)[1]}={v}" for k, v in
+                                                  rec["update_arms_info_same"].items()), flush=True)
 
     # 集める → 更新 を回したときの1更新の壁時計（更新は packed）
     loop_flags = {"device_batch": args.device_batch, "fused": args.fused}

@@ -7,6 +7,10 @@
   ターゲット・正則化2つ）の全パラメータ、勾配、Adam の状態、ログの値がビット単位で一致する
 - α = 0 / 補間中 / 1 と正則化方策の差し替えの更新、補助ヘッド、終盤だけの λ（c_ply）、1/μ の上限、報酬の縮め、
   密なマスクの batch（fused だけ。device_batch は添字の batch に限る）
+- 評価モードの局（相手は Rust の戦略。学習側が後手の局を含む）を混ぜた batch でも同じ
+- fused が使う v-trace のチャンク版（`_v_trace_chunk`）を、合成した batch（途中の報酬・反則で同じ側が続く手番・
+  長さ1の局・片方の手番が無い局・いろいろなチャンクの大きさと設定）で `v_trace_scalars` と突き合わせる
+  （`v_trace_scalars` だけを直して fused が黙って違う目標で学ぶのを止める）
 - 相手のネットに指させた局（手番に隙間がある）を fused は止める。device_batch は packed なしを止める
 """
 
@@ -21,7 +25,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 import tsuitate_rl  # noqa: E402
 from model import PolicyValueNet  # noqa: E402
-from rnad import RNaDConfig, RNaDLearner, collect  # noqa: E402
+from rnad import MultiEnv, RNaDConfig, RNaDLearner, collect  # noqa: E402
 
 DEV = torch.device("cpu")
 
@@ -78,18 +82,24 @@ def make_base(step, cfg, packed):
     return base
 
 
-def batches(net, compact, truth, n=2):
+def batches(net, compact, truth, n=2, league=False):
     out = []
     for i in range(n):
         torch.manual_seed(10 + i)
-        env = tsuitate_rl.VecEnv(10, seed=20 + i, auto_reset=False, planes=91)
+        if league:
+            # 評価モードの局（相手は Rust の戦略で、相手の手は step の中で進む）を自己対局の局と混ぜる
+            env = MultiEnv([tsuitate_rl.VecEnv(4, seed=20 + i, auto_reset=False, planes=91),
+                            tsuitate_rl.VecEnv(8, opponents=["heuristic", "rl_v15"], seed=30 + i,
+                                               auto_reset=False, planes=91)])
+        else:
+            env = tsuitate_rl.VecEnv(10, seed=20 + i, auto_reset=False, planes=91)
         out.append(collect(env, net, DEV, truth=truth, compact_legal=compact))
     return out
 
 
-def check(name, step, cfg, compact=True, packed=True, reward_scale=1.0):
+def check(name, step, cfg, compact=True, packed=True, reward_scale=1.0, league=False):
     base = make_base(step, cfg, packed)
-    bs = batches(base.net, compact, cfg.aux_truth > 0)
+    bs = batches(base.net, compact, cfg.aux_truth > 0, league=league)
     arms = {"fused": dict(fused=True)}
     if compact and packed:
         arms["device_batch"] = dict(device_batch=True)
@@ -109,6 +119,41 @@ def check(name, step, cfg, compact=True, packed=True, reward_scale=1.0):
     n = sum(len(b["action"]) for b in bs)
     print(f"{name}: {'/'.join(arms)} が従来とビット単位で一致（2更新、決定点 {n}、α {logs_ref[0]['alpha']:.2f}"
           f"{'、差し替えあり' if any(lg['reg_update'] for lg in logs_ref) else ''}）")
+
+
+def check_vtrace_chunk_synthetic():
+    g = torch.Generator().manual_seed(7)
+    cfgs = [RNaDConfig(), RNaDConfig(c_ply=(4, 0.8), inv_mu_cap=10.0), RNaDConfig(eta=0.5, c_vtrace=0.9),
+            RNaDConfig(c_ply=(0, 0.7))]
+    cases = 0
+    for trial in range(30):
+        B = int(torch.randint(1, 12, (1,), generator=g))
+        lengths = torch.randint(1, 15, (B,), generator=g)
+        T = int(lengths.max())
+        valid = torch.arange(T)[:, None] < lengths[None, :]
+        # 手番の色は乱数（反則で同じ側が続く・片方の手番が無い局も出る）。報酬は途中の手番にも置く
+        player = torch.randint(0, 2, (T, B), generator=g) * valid
+        reward = (torch.randn(T, B, 2, generator=g) * (torch.rand(T, B, 1, generator=g) < 0.3)) * valid[..., None]
+        t_idx, b_idx = valid.nonzero(as_tuple=True)  # 時刻の昇順（collect と同じ並び）
+        n = len(t_idx)
+        batch = {"t": t_idx, "b": b_idx, "valid": valid, "player": player, "reward": reward,
+                 "mu_a": 10.0 ** (-6 * torch.rand(n, generator=g)), "action": torch.zeros(n, dtype=torch.long)}
+        pi_a = 10.0 ** (-6 * torch.rand(n, generator=g))
+        ent = torch.randn(n, generator=g) * 0.1
+        v = torch.rand(n, generator=g) * 2 - 1
+        for cfg in cfgs:
+            vt_ref, s_ref = RNaDLearner._v_trace(None, batch, cfg, pi_a, ent, v)
+            c_ply = tuple(cfg.c_ply) != (0, 1.0)
+            for chunk in sorted({1, 2, 3, 7, B, n}):
+                carry = {k: [torch.zeros(B), torch.zeros(B), torch.zeros(B), torch.zeros(B), torch.ones(B)] for k in (0, 1)}
+                vt, s = torch.zeros(n), torch.zeros(n)
+                for i in reversed(range(0, n, chunk)):
+                    sl = slice(i, min(i + chunk, n))
+                    vt[sl], s[sl] = RNaDLearner._v_trace_chunk(cfg, carry, t_idx[sl], b_idx[sl], player, reward,
+                                                               pi_a[sl], batch["mu_a"][sl], ent[sl], v[sl], c_ply)
+                assert same_tensor(vt, vt_ref) and same_tensor(s, s_ref), f"v-trace のチャンク版が違う（試行 {trial}、チャンク {chunk}、{cfg}）"
+                cases += 1
+    print(f"_v_trace_chunk: 合成した batch の {cases} 通り（設定 × チャンクの大きさ）で v_trace_scalars とビット単位で一致")
 
 
 def check_rejects():
@@ -136,6 +181,7 @@ def check_rejects():
 
 if __name__ == "__main__":
     torch.set_num_threads(2)
+    check_vtrace_chunk_synthetic()
     check_rejects()
     common = dict(beta=16.0, lr=1e-3, schedule_sizes=(10,), schedule_repeats=(1,), chunk=97)
     check("α=0（段階の頭）", 10, RNaDConfig(**common))
@@ -150,3 +196,4 @@ if __name__ == "__main__":
     check("添字・packed なし", 13, RNaDConfig(**common), packed=False)
     check("チャンク1つ", 13, RNaDConfig(**{**common, "chunk": 100_000}))
     check("PG 型", 13, RNaDConfig(**common, policy_loss="pg"))
+    check("評価モードの局を混ぜた batch", 13, RNaDConfig(**common), league=True)
