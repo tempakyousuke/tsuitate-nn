@@ -45,7 +45,8 @@ ARENA_MATCH_SEED=20260927 cargo run --release --bin arena -- 100 "rl_policy:<pol
 | `fetch_records.py` | GitHub Actions の対局記録を取る |
 | `league.py` | リーグ学習の相手の選び方（負けやすい相手ほど多く当てる） |
 | `guard.py` | 防御特化（玉の周りの固め）の監視値の集計 |
-| `speedlab.py` | 学習の速さの比較: 固定パネル（`panel`）で run の書き出しを測り（`eval`、局ごとに鍵を決めた共通乱数）、腕ごとの学習曲線と対照とのペア差をまとめる（`report`）。締まりの効果を除いて比べるには `eval --decode greedy\|temp:<T>`（記録名 `<which>@greedy` など）、途中から始めた run の起点の書き出しは `export-ck`、起点を何度で指すと締まった腕にそろうかは `temp-match` |
+| `speedlab.py` | 学習の速さの比較: 固定パネル（`panel`）で run の書き出しを測り（`eval`、局ごとに鍵を決めた共通乱数）、腕ごとの学習曲線と対照とのペア差をまとめる（`report`）。締まりの効果を除いて比べるには `eval --decode greedy\|temp:<T>`（記録名 `<which>@greedy` など）、途中から始めた run の起点の書き出しは `export-ck`、起点を何度で指すと締まった腕にそろうかは `temp-match`（`--seed` を変えると別の局になる。パネルの評価の乱数は学習中のパネルの記録と対にするため変えない） |
+| `log_windows.py` | 学習ログ（log.jsonl）の見張りの値（エントロピー・π>0.999 の割合・手数・反則・磁石への KL など）を step の窓ごとに平均して並べる。MMD の中止の門の形の指標はこの 100更新の窓の平均で見る（中央値は締まりを小さく見せる） |
 | `gradsnr.py` | 学習なしの診断: 変種（クリップ・1/μ の上限・PG）ごとの局ごとの勾配の分散・期待勾配・雑音のスケール |
 | `bench_update.py` | 1更新の壁時計（従来 / `--packed` / 連続 / `--pipeline`）と、packed の勾配の一致。`--collect-arms` / `--update-arms` で `--fast-collect` / `--device-batch` / `--fused` を同じ batch・同じ乱数のペアで測り、結果がビット単位で同じかも出す（`--step` で α を選ぶ・`--precision`） |
 | `distill.py` | 方策ネットを小さいネットへ蒸留する（CPU の代理 P2 の出発点） |
@@ -104,7 +105,9 @@ ARENA_MATCH_SEED=20260927 cargo run --release --bin arena -- 100 "rl_policy:<pol
   （Ataraxos どおりの「|A| の 75%点以上だけ」はクーンで固定点を均衡から外すので、`--mmd-preset ataraxos` の腕に残す）
 - 1回の収集を 4 歩の Adam に分ける（行を無作為に並べて4等分）。段階（Δm）は無く、**磁石は既定でターゲット（現在のネットの
   EMA = 動く磁石）、温度は 0.05 固定**。設計の初版の「固定の磁石 ＋ 温度を下げる」形（`--mmd-preset mixinit`）は、クーンで
-  R-NaD の約8倍遅く、代理 P2 で自己対局が短い詰みの筋に固まった（tsuitate-bot の docs 10.4）
+  R-NaD の約8倍遅く、代理 P2 で自己対局が短い詰みの筋に固まった（tsuitate-bot の docs 10.4）。**この既定（温度 0.05・磁石 = 書き出しの
+  EMA）は 3070 の A/B（本線の 108,000 から）で 400更新のうちに方策が締まって中止の門に触れ、棄却した**。current の伸びは自分の系列に集中した
+  （tsuitate-bot の docs 10.7。再挑戦するなら温度 0.2・別のゆっくりした磁石 `--mmd-magnet-avg 0.0003` で、CI での追試が通ったときだけ）
 - `--pipeline` ではクリップと KL の中心を更新の頭の方策にし、μ との比を外側の重みにする（decoupled PPO）
 
 R-NaD の checkpoint から続ける（net ← 現在のネット、ターゲットと磁石 ← ターゲット、step の番号を続ける。Adam は新しく作る）:

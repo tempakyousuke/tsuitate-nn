@@ -116,8 +116,8 @@ def _splitmix(z):
 def seed_salt(seed: int) -> int:
     """seed を振って別の局を取りたいときの salt。`keyed_uniform` は salt と局番号を XOR で混ぜるので、局数より小さい桁だけが
     違う seed どうし（例えば 1 と 2、101 と 104）は同じ鍵の集まりを局番号を入れ替えて使い、同じ局の組になる。
-    局番号の桁と重ならないよう 32 ビット上へずらす"""
-    return int(seed) << 32
+    局番号の桁と重ならないよう 32 ビット上へずらす（2^32 の倍数だけ違う seed は同じになる。int64 に収めるため折り返す）"""
+    return _i64((int(seed) << 32) & _M64)
 
 
 def keyed_uniform(salt, games, decs, actions, device):
@@ -126,7 +126,9 @@ def keyed_uniform(salt, games, decs, actions, device):
 
     salt と局番号は XOR で混ぜる。局数より小さい桁だけが違う salt どうしは、同じ鍵の集まりを局番号を入れ替えて使う
     （パネルの相手の salt = EVAL_SEED + stable_seed(名前) は、名前の末尾の1文字違い〔rl_deduce_v1〜v9 など〕でほぼ連番になる）。
-    違う相手との局はすぐ分かれるので結果の相関は小さい（P2 の記録で rl_deduce_v3 と v4 の間 +0.03、ずらした対照 +0.003）。
+    salt の XOR が奇数の組は測られる側の手番の色が入れ替わるので局は重ならず、結果の相関はほぼ 0（P2 の記録で rl_deduce_v3 と v4 の間 +0.03、
+    ずらした対照 +0.003）。偶数の組は色も乱数も同じなので、似た相手ほど同じ筋を長くたどりうる（rl_v23 と v25 で +0.03〜+0.09、対照 −0.08〜+0.02。
+    同じ系列の近い版どうしは測っていない）。パネルの相手の組の小計を判断に使うなら、組の ± は少し小さく出うる。
     学習中のパネルの記録（train_rnad.py の --panel）と局ごとに対にするため、この混ぜ方は変えない。seed を振って別の局を
     取りたいときは `seed_salt` を通す"""
     g = torch.as_tensor(games, dtype=torch.int64, device=device)[:, None]

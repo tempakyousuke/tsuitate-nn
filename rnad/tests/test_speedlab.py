@@ -201,13 +201,56 @@ def check_seed_salt():
     assert raw[0] == raw[1]  # 同じ組（並びが違うだけ）。この性質を変えると記録と対にならない
     spread = [sorted(S.keyed_uniform(S.seed_salt(s), games, zero, 4, "cpu")[:, 0].tolist()) for s in (1, 2)]
     assert spread[0] != spread[1]
+    # int64 に収まる（大きい seed でも落ちない）
+    S.keyed_uniform(S.seed_salt(202610261200), games, zero, 4, "cpu")
+    # パネルの乱数の値そのものを固定する（混ぜ方・定数・名前の salt が変わると学習中のパネルの記録と対にならない）
+    assert S.EVAL_SEED == 777_000 and S.stable_seed("rl_deduce_v4") == 56079
+    got = S.keyed_uniform(S.EVAL_SEED + S.stable_seed("rl_v30"), [0, 1, 1023], [0, 3, 7], 4, "cpu").tolist()
+    want = [[0.5534499549817595, 0.5610912487390687, 0.5745616191889509, 0.657698376267789],
+            [0.5667035880278402, 0.4564721114720928, 0.1657893042420357, 0.7460447611434959],
+            [0.032622780917235084, 0.7279467137855173, 0.32516869738446635, 0.14315671828934756]]
+    assert got == want, got
     from model import NUM_PLANES, PolicyValueNet
     torch.manual_seed(5)
     net = PolicyValueNet(8, 1, NUM_PLANES).eval()
-    a = S.self_play_stats(net, 16, 1, NUM_PLANES, 1.0)
-    b = S.self_play_stats(net, 16, 2, NUM_PLANES, 1.0)
-    assert a != b and a == S.self_play_stats(net, 16, 1, NUM_PLANES, 1.0), (a, b)
-    print("seed_salt: 生の salt 1 と 2 は同じ鍵の組（変えない性質）、seed_salt を通すと違う局になる（self_play_stats の seed）")
+    # self_play_stats が seed_salt を通した salt を keyed_actions に渡す（局の並べ替えだけでは値がほぼ同じになり、値の比較では見分けられない）
+    salts = []
+    orig = S.keyed_actions
+
+    def spy(net_, obs, mask, games_, decs, salt, *args, **kw):
+        salts.append(salt)
+        return orig(net_, obs, mask, games_, decs, salt, *args, **kw)
+
+    S.keyed_actions = spy
+    try:
+        S.self_play_stats(net, 4, 3, NUM_PLANES, 1.0)
+    finally:
+        S.keyed_actions = orig
+    assert salts and set(salts) == {S.seed_salt(3)}, set(salts)
+    # π>0.999 の割合: 入力によらない固定のロジットで、記録した合法手から直接数えた値と一致する（温度 1 と 0.5）
+    base = torch.randn(139 * 81, generator=torch.Generator().manual_seed(9)) * 10
+
+    class Fixed(torch.nn.Module):
+        def forward(self, x):
+            return base.expand(x.shape[0], -1).clone(), torch.zeros(x.shape[0])
+    fixed = Fixed().eval()
+    for temp in (1.0, 0.5):
+        masks = []
+
+        def spy2(net_, obs, mask, *args, **kw):
+            masks.append(torch.from_numpy(mask))
+            return orig(net_, obs, mask, *args, **kw)
+        S.keyed_actions = spy2
+        try:
+            e, h, n = S.self_play_stats(fixed, 6, 4, NUM_PLANES, temp)
+        finally:
+            S.keyed_actions = orig
+        m = torch.cat(masks)
+        p_ = torch.softmax((base / temp).expand(m.shape[0], -1).masked_fill(~m, float("-inf")), -1)
+        want_h = int((p_.max(-1).values > 0.999).sum()) / m.shape[0]
+        assert n == m.shape[0] and abs(h - want_h) < 1e-12 and 0 < want_h < 1, (temp, h, want_h, n)
+    print("seed_salt: 生の salt 1 と 2 は同じ鍵の組（変えない性質。パネルの乱数の値も固定）、seed_salt を通すと違う局になり、"
+          "self_play_stats はそれを使う。π>0.999 の割合は合法手から直接数えた値と一致")
 
 
 def check_fit():
