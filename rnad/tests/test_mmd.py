@@ -673,8 +673,18 @@ def check_value_warmup_lr(tmp):
     run_train(tmp / "vw_r", *common, steps=3)
     run_train(tmp / "vw_r", *common, steps=5)
     assert read_log(tmp / "vw_r" / "log.jsonl") == lg, "価値の温めつきの再開でログが変わる"
+    # 温めの後で --reset-adam を付けて再開すると、Adam が空になるのでその頭から温め直す（付けなければ走り直さない）
+    run_train(tmp / "vw_reset", *common, steps=3)
+    run_train(tmp / "vw_reset", *common, "--reset-adam", steps=5)
+    got = [x["lr"] for x in read_log(tmp / "vw_reset" / "log.jsonl")]
+    assert got[:3] == [x["lr"] for x in lg[:3]] and abs(got[3] - 5e-5) <= 1e-12 and abs(got[4] - 1e-4) <= 1e-12, got
+    # 温めの途中で --reset-adam: 温めの終わり（方策が動き始める step）でもう一度数え直す
+    run_train(tmp / "vw_reset1", *common, steps=1)
+    run_train(tmp / "vw_reset1", *common, "--reset-adam", steps=5)
+    got = [x["lr"] for x in read_log(tmp / "vw_reset1" / "log.jsonl")]
+    assert all(abs(x - y) <= 1e-12 for x, y in zip(got, [5e-5, 5e-5, 5e-5, 1e-4, 1e-4])), got
     print("価値の温めと学習率の warmup: 温めの後に warmup を数え直す（学習率 "
-          f"{[f'{x:.0e}' for x in want]}）、再開しても同じ")
+          f"{[f'{x:.0e}' for x in want]}）、再開しても同じ。--reset-adam の再開はその頭から温め直す")
 
 
 def check_override_magnet(tmp):

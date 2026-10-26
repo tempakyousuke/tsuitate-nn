@@ -302,8 +302,8 @@ def main() -> None:
                          "（2次モーメントが古い勾配の大きさを b2 = 0.999 で何千更新も覚えているため）")
     ap.add_argument("--lr-warmup", type=int, default=0,
                     help="この実行の最初の N 更新で学習率を 0 から線形に上げる（--reset-adam の直後の2次モーメントは"
-                         "数回分の勾配だけから推定されて揺れるため）。--algo mmd では MMD を始めた step から数え、"
-                         "--mmd-value-warmup があれば温めが終わった step から数え直す")
+                         "数回分の勾配だけから推定されて揺れるため）。--algo mmd では MMD を始めた step から数え"
+                         "（--reset-adam を付けた実行はその頭から）、--mmd-value-warmup があれば温めが終わった step から数え直す")
     ap.add_argument("--compact-legal", action="store_true",
                     help="batch の合法手のマスクを添字で持つ（768局で約 0.79GB → 約 11MB。更新の結果は同じ。"
                          "--pipeline で batch が2つ同時にあるときのメモリ対策）")
@@ -581,8 +581,9 @@ def main() -> None:
     if args.reset_adam:
         learner.reset_optimizer_state()
         print(f"Adam の状態を捨てた（step {learner.step_count} から）", flush=True)
-    # warmup の起点。MMD は MMD を始めた step（checkpoint に入る）から数えるので、同じコマンドで再開しても走り直さない
-    warm_from = learner.mmd_t0 if args.algo == "mmd" else learner.step_count
+    # warmup の起点。MMD は MMD を始めた step（checkpoint に入る）から数えるので、同じコマンドで再開しても走り直さない。
+    # ただし --reset-adam で Adam を捨てたら、今の step から数え直す（R-NaD と同じく、その実行の頭で温め直す）
+    warm_from = learner.mmd_t0 if args.algo == "mmd" and not args.reset_adam else learner.step_count
 
     lr_min_frac = None
     if args.lr_sched:
@@ -596,11 +597,12 @@ def main() -> None:
             # MMD は学習器が予定の学習率を毎更新で入れる。ここは warmup の倍率だけ。
             # 価値の温め（--mmd-value-warmup）の間は価値の頭だけが Adam の歩を踏み、幹と方策の頭は温めの後に初めて踏む
             # （Adam の状態が空のまま）ので、warmup は温めが終わった step から数え直す。価値の頭の学習率もそこで一度下がって
-            # 上がり直す（価値の頭の Adam はもう温まっているので害は小さい）。温めが 0 なら MMD を始めた step から数えるだけ
+            # 上がり直す（価値の頭の Adam はもう温まっているので害は小さい）。温めが 0 なら MMD を始めた step から数えるだけ。
+            # --reset-adam で温めの後から数え始めた実行は、温めの終わりをもう跨がないのでそのまま数える
             t = learner.step_count - warm_from
-            vw = learner.cfg.value_warmup
-            if vw > 0 and t >= vw:
-                t -= vw
+            policy_from = learner.mmd_t0 + learner.cfg.value_warmup  # 方策が動き始める step
+            if learner.cfg.value_warmup > 0 and warm_from < policy_from <= learner.step_count:
+                t = learner.step_count - policy_from
             learner.lr_scale = min(1.0, (t + 1) / args.lr_warmup) if args.lr_warmup > 0 else 1.0
             return
         lr = cfg.lr
