@@ -146,6 +146,13 @@ def check_report():
         lines = S.vs_step_section(arms, "target", [100, 110, 120, 140], argparse.Namespace(**{**base, "vs_step": 100}))
         row = next(x for x in lines if x.startswith("| ab_mmd |"))
         assert row.split("|")[2].strip() == "" and row.split("|")[3].strip().startswith("+50.0"), row
+        # --vs-step と --groups: 組ごとの表（系列内の相手にだけ伸びた run なら、系列内 +50・系列外 +0、全体 +25）
+        write_run(tmp / "g_s1", 1.0, {100: {o: draw for o in opps}, 120: {"in1": win, "out1": draw}})
+        garms = {"g": [(tmp / "g_s1", S.load_eval(tmp / "g_s1", ratings), S.load_log(tmp / "g_s1"))]}
+        lines = S.vs_step_section(garms, "target", [100, 120], argparse.Namespace(**{**base, "vs_step": 100}))
+        cell = lambda label: next(x for x in lines if x.startswith(f"| {label} |")).split("|")[2].strip()  # noqa: E731
+        assert cell("g").startswith("+25.0") and cell("g（系列内）").startswith("+50.0"), lines
+        assert cell("g（系列外）").startswith("+0.0"), lines
         # コマンドとして（cmd_report の引数の配線）
         (tmp / "panel.json").write_text(json.dumps({"planes": 91, "members": [], "ratings": ratings}))
         # --sec-per-update で MMD を 5.5秒に上書きする（log の中央値 2.75 と違う値: 120 は対照の 120 と対になる）
@@ -206,7 +213,7 @@ def check_report():
         write_run(tmp / "x_s1", 1.0, {5: {"in1": win}}, fname="panel_eval_final.jsonl")
         assert S.load_eval(tmp / "x_s1", ratings) == {} and S.load_eval(tmp / "x_s1", ratings, "panel_eval_final.jsonl")
     print("report: 壁時計の対応・起点の除外・対照の seed の共用・起点とのペア差・組ごとの小計・評価のファイル名・"
-          "秒/更新の上書き・要約は起点から")
+          "秒/更新の上書き・要約は起点から・起点とのペア差の組ごとの表")
 
 
 if __name__ == "__main__":

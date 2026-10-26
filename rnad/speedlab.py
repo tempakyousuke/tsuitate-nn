@@ -544,14 +544,18 @@ def paired_section(arms, control, which, steps, args=None):
 
 def vs_step_section(arms, which, steps, args):
     """同じ run の中で、各 step を step N（--vs-step）と局ごとに対にした得点の差（pt）。起点からの伸びを、
-    起点の書き出しの評価の揺れごと打ち消して測る"""
+    起点の書き出しの評価の揺れごと打ち消して測る。`--groups` があれば相手の組ごとの表も出す（自分の系列の相手にだけ
+    伸びているのか、系列の外の相手にも伸びているのかを分ける）"""
     fname = getattr(args, "eval_file", "panel_eval.jsonl")
+    groups = json.loads(pathlib.Path(args.groups).read_text()) if getattr(args, "groups", "") else {}
     n0 = args.vs_step
     cols = [s for s in steps if s != n0 and s >= (getattr(args, "from_step", 0) or 0)]
     lines = [f"## step {n0} との局ごとのペア差（同じ run、得点の差、pt。{which}）", "",
              "| 腕 | " + " | ".join(str(s) for s in cols) + " |", "| --- |" + " --- |" * len(cols)]
+    group_rows = []
     for arm, rs in sorted(arms.items()):
         per = {s: {} for s in cols}
+        per_group = {g: {s: {} for s in cols} for g in groups}  # 組 → step → seed → 局ごとの差
         for run, _, _ in rs:
             out = load_outcomes(run, fname)
             sd = seed_of(run)
@@ -561,13 +565,26 @@ def vs_step_section(arms, which, steps, args):
                 c = out[(n0, w, opp)]
                 if len(c) != len(o):
                     continue
-                per[st].setdefault(sd, []).extend((((o + 1) / 2 - (c + 1) / 2) * 100).tolist())
+                diff = ((o + 1) / 2 - (c + 1) / 2) * 100
+                per[st].setdefault(sd, []).extend(diff.tolist())
+                for gname, members in groups.items():
+                    if opp in members:
+                        per_group[gname][st].setdefault(sd, []).extend(diff.tolist())
         cells = []
         for s in cols:
             xs = [v for vs in per[s].values() for v in vs]
             cells.append(_fmt_diff(xs, [np.mean(v) for v in per[s].values()]) or "")
         lines.append(f"| {arm} | " + " | ".join(cells) + " |")
+        for gname in groups:
+            gcells = []
+            for s in cols:
+                xs = [v for vs in per_group[gname][s].values() for v in vs]
+                gcells.append(_fmt_diff(xs, [np.mean(v) for v in per_group[gname][s].values()]) or "")
+            group_rows.append(f"| {arm}（{gname}） | " + " | ".join(gcells) + " |")
     lines.append("")
+    if groups:
+        lines += [f"### 相手の組ごと（step {n0} とのペア差）", "", "| 腕（組） | " + " | ".join(str(s) for s in cols) + " |",
+                  "| --- |" + " --- |" * len(cols), *group_rows, ""]
     return lines
 
 
