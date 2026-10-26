@@ -213,7 +213,7 @@ def main():
                     help="MMD の腕を pipeline と同じ持ち方（decoupled の近い方策の順伝播あり）で測る")
     ap.add_argument("--mmd-max-grad-norm", type=float, default=0.267, help="MMD の腕の勾配ノルムのクリップ")
     ap.add_argument("--mmd-chunk", type=int, default=2048, help="MMD の腕の逆伝播のチャンク")
-    ap.add_argument("--mmd-steps", type=int, default=8, help="MMD の腕の1更新の歩数")
+    ap.add_argument("--mmd-steps", type=int, default=4, help="MMD の腕の1更新の歩数（tsuitate preset の既定と同じ 4）")
     ap.add_argument("--loop-mmd", type=float, default=0.0,
                     help="sequential / pipelined の更新を MMD（この割合）にする（0 = R-NaD）")
     ap.add_argument("--calib", default="", help="価値の較正を測るネット（net / target をカンマ区切り。--ckpt が要る）")

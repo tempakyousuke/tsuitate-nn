@@ -98,11 +98,11 @@ ARENA_MATCH_SEED=20260927 cargo run --release --bin arena -- 100 "rl_policy:<pol
 
 - 損失は PPO の比クリップ ＋ 近い方策への逆KL ＋ 磁石への逆KL × 温度 ＋ 価値の MSE。**1/μ がどこにも無い**
   （R-NaD の勾配の雑音の 99.6〜99.9% は v-trace の s = (G − v)/μ）
-- アドバンテージは手番側ごとの GAE（λ_A）、価値の目標は TD(λ)。どちらも収集時の価値（`collect(actor_extras=True)` の
+- アドバンテージは手番側ごとの GAE（λ_A 0.5）、価値の目標は TD(λ 0.8)。どちらも収集時の価値（`collect(actor_extras=True)` の
   `v_actor`）で作る。反則で同じ側が続く手番も、`v_trace_scalars` を η=0・π=μ=1・c=λ で呼べばそのまま扱える
 - 学習に使う行は既定で **|A| に比例した確率の間引き（pps、割合 0.5）**。重み s̄/p で戻すので期待値は全行と同じ
   （Ataraxos どおりの「|A| の 75%点以上だけ」はクーンで固定点を均衡から外すので、`--mmd-preset ataraxos` の腕に残す）
-- 1回の収集を 8 歩の Adam に分ける（行を無作為に並べて8等分）。段階（Δm）は無く、**磁石は既定でターゲット（現在のネットの
+- 1回の収集を 4 歩の Adam に分ける（行を無作為に並べて4等分）。段階（Δm）は無く、**磁石は既定でターゲット（現在のネットの
   EMA = 動く磁石）、温度は 0.05 固定**。設計の初版の「固定の磁石 ＋ 温度を下げる」形（`--mmd-preset mixinit`）は、クーンで
   R-NaD の約8倍遅く、代理 P2 で自己対局が短い詰みの筋に固まった（tsuitate-bot の docs 10.4）
 - `--pipeline` ではクリップと KL の中心を更新の頭の方策にし、μ との比を外側の重みにする（decoupled PPO）
@@ -119,7 +119,7 @@ R-NaD の checkpoint から続ける（net ← 現在のネット、ターゲッ
 | --- | --- | --- | --- |
 | `--mmd-filter` | `pps:0.5,floor=0.05`（`mixinit` は 0.25） | `quantile:0.75,min=0.01` | 方策の行: `pps:<割合>[,floor=]` / `quantile:<分位>[,min=]` / `topk:<割合>`（ちょうどその割合、同値は乱数）/ `none` |
 | `--mmd-value-rows` | `auto` | `filtered` | 価値の行: `auto`（pps は方策と同じ行・重み、quantile は `uniform:0.25`）/ `all` / `uniform:<割合>` / `filtered` |
-| `--mmd-gae-lambda` / `--mmd-td-lambda` | 0.8 / 0.8 | 0.5 / 0.8 | A と価値の目標の λ |
+| `--mmd-gae-lambda` / `--mmd-td-lambda` | 0.5 / 0.8（`mixinit` は 0.8 / 0.8） | 0.5 / 0.8 | A と価値の目標の λ |
 | `--mmd-lambda-unit` | `attempt` | 同じ | λ を試行ごと（反則も1回）/ `turn`（受理された手ごと） |
 | `--mmd-magnet` | `target`（`mixinit` は `mix:init,0.03`） | `uniform` | `mix:init,<ε>` / `mix:target,<ε>` / `uniform` / `target` |
 | `--mmd-magnet-avg` | 0 | 0 | 動く磁石（`target` / `mix:target`）の EMA の係数。0 = 書き出しのターゲット（`--target-avg`）をそのまま磁石にする |
@@ -127,7 +127,7 @@ R-NaD の checkpoint から続ける（net ← 現在のネット、ターゲッ
 | `--mmd-lr` / `--mmd-lr-t-off` | `1e-4,0,1e-4,1e-4`（固定）/ 0 | `0.5,1.1,1e-4,5e-6` / 0 | 学習率の予定（同じ式）。`--lr-warmup` を掛ける |
 | `--mmd-clip` / `--mmd-kl` / `--mmd-vf` / `--mmd-pol-scale` | 0.2 / 0.1 / 1.0 / 1.0 | 同じ | 比のクリップ / 近い方策への KL / 価値 / 方策の項の係数 |
 | `--mmd-decoupled` / `--mmd-prox-cap` | on / 2.0 | off | pipeline の中心を更新の頭の方策にする / 外側の重みの上限 |
-| `--mmd-steps` / `--mmd-chunk` / `--mmd-epochs` | 8 / 2048 / 1 | 同じ | 1更新の Adam の歩数 / 逆伝播のチャンク / 何周するか |
+| `--mmd-steps` / `--mmd-chunk` / `--mmd-epochs` | 4（`mixinit` は 8）/ 2048 / 1 | 8 / 2048 / 1 | 1更新の Adam の歩数 / 逆伝播のチャンク / 何周するか |
 | `--mmd-max-grad-norm` / `--mmd-adam-b1` | 0.267 / 0.9 | 同じ | 勾配ノルムのクリップ（0 = なし）/ Adam の β1 |
 | `--mmd-value-warmup` / `--mmd-filt-window` / `--mmd-t-scale` | 0 / 1 / 1.0 | 同じ | 最初の N 更新は価値の頭だけ / quantile の窓 / 予定の t の刻み |
 | `--init-which` / `--init-step` | `target` / なし | — | `--init` の checkpoint のどのネットから始めるか（`both` 推奨）/ step の番号を続ける |

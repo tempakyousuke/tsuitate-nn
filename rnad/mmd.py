@@ -10,7 +10,7 @@
 - 学習に使う行を |A| に比例した確率で間引き（pps）、重み s̄/p で戻す（期待値は全行と同じ = 固定点を動かさない）。
   Ataraxos どおりの「|A| の 75%点以上だけ」（quantile）は、クーンポーカーで固定点を均衡から外す（NashConv は期待値の
   更新で 0.67〜0.71、標本ありで 0.60〜0.62。絞り込みなしは α-QRE の 0.038）ので既定にしない。`preset="ataraxos"` の腕として残す
-- 1回の収集を k 歩（既定 8）の Adam に分ける（行を無作為に並べて k 等分）。正則化の段階（Δm）は無い。磁石への KL の
+- 1回の収集を k 歩（既定 4）の Adam に分ける（行を無作為に並べて k 等分）。正則化の段階（Δm）は無い。磁石への KL の
   係数（温度）と学習率は、MMD を始めてからの更新回数 t の予定（`power_schedule`、Ataraxos の rl.py と同じ式）で決める
   （既定はどちらも固定。`preset="mixinit"` は温度を、`"ataraxos"` は温度と学習率を t のべき乗で下げる）
 - `--pipeline` では batch が1更新前のネットで集めたものなので、クリップと KL の中心を**更新の頭の方策**にし、μ との比は
@@ -63,7 +63,9 @@ class MMDConfig:
     decoupled: bool = True
     prox_cap: float = 2.0
     vf: float = 1.0
-    gae_lambda: float = 0.8
+    # A の λ_A は 0.5、価値の目標の λ は 0.8（2026-10-26。設計の規則〔λ 0.5 と 0.95 の期待勾配がどちらも検出でき、向きが
+    # そろう〕を v8 の 768局が満たし、代理 P2 で 0.8 より悪くなかった。docs/rl-learning-speed.md 10.4）
+    gae_lambda: float = 0.5
     td_lambda: float = 0.8
     # λ をかける単位: "attempt"（反則の試行も1回と数える）/ "turn"（受理された手ごと。反則の試行では λ をかけない）
     lambda_unit: str = "attempt"
@@ -79,8 +81,9 @@ class MMDConfig:
     lr_t_off: float = 0.0
     # t = (更新回数 − MMD を始めた更新回数) × t_scale
     t_scale: float = 1.0
-    # 1更新の Adam の歩数（行の数を k 等分）・逆伝播のチャンク・残した行を何周するか
-    steps: int = 8
+    # 1更新の Adam の歩数（行の数を k 等分）・逆伝播のチャンク・残した行を何周するか。k は 4（2026-10-26。A/B の割合では
+    # B_noise が 100〜768局で、設計の規則は k 2〜4。代理 P2 で 8 より悪くなかった。docs/rl-learning-speed.md 10.4）
+    steps: int = 4
     chunk: int = 2048
     epochs: int = 1
     max_grad_norm: float = 0.267
@@ -95,13 +98,13 @@ class MMDConfig:
 
 PRESETS = {
     "tsuitate": {},
-    # 設計の初版の既定（固定の混合磁石・温度を t で下げる・起点 2,000・pps 0.25）。代理 P2 で崩れた形の再現用
+    # 設計の初版の既定（固定の混合磁石・温度を t で下げる・起点 2,000・pps 0.25・λ_A 0.8・8歩）。代理 P2 で崩れた形の再現用
     "mixinit": {"filter": "pps:0.25,floor=0.05", "magnet": "mix:init,0.03", "temp": (0.05, 0.3, 0.1, 0.001),
-                "temp_t_off": 2000.0},
+                "temp_t_off": 2000.0, "gae_lambda": 0.8, "steps": 8},
     # Ataraxos のコードの既定（scripts/train/rl_main.py・pyengine/core/rl.py）。pipeline でも μ を中心にする
     "ataraxos": {"filter": "quantile:0.75,min=0.01", "value_rows": "filtered", "magnet": "uniform",
                  "gae_lambda": 0.5, "lr": (0.5, 1.1, 1e-4, 5e-6), "temp": (0.05, 0.3, 0.1, 0.001), "temp_t_off": 0.0,
-                 "decoupled": False},
+                 "decoupled": False, "steps": 8},
 }
 
 

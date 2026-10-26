@@ -388,7 +388,7 @@ def check_end_to_end(net0, batch):
     assert rel <= 1e-4, f"端から端の勾配が参照と違う（相対差 {rel:.2e}）"
 
     # 8個のミニバッチ: 各ミニバッチの損失（÷ その行の数）に行の数の割合を掛けて足すと、全体の損失
-    cfg8 = make_config("tsuitate", filter="none", magnet="uniform", chunk=37)
+    cfg8 = make_config("tsuitate", filter="none", magnet="uniform", chunk=37, steps=8)
     L8 = MMDLearner(copy.deepcopy(net0), cfg8, DEV)
     keep = torch.ones(n, dtype=torch.bool)
     st, _ = L8.prepare(batch, adv, ret, v, keep, torch.ones(n), keep, torch.ones(n))
@@ -480,6 +480,11 @@ def check_schedules():
         assert L.temperature(step) == ataraxos_power_schedule(0.05, t + 2000, 0.3, 0.1, 0.001)
         assert L.scheduled_lr(step) == ataraxos_power_schedule(0.5, t + 100, 1.1, 1e-4, 5e-6)
     assert abs(make_config("ataraxos").temp_t_off) == 0 and make_config("tsuitate").lr == (1e-4, 0.0, 1e-4, 1e-4)
+    # 既定の λ_A・k（10.4 で変えたもの）と、設計の初版・Ataraxos の preset は回したときの値のまま
+    d, mi, at = make_config("tsuitate"), make_config("mixinit"), make_config("ataraxos")
+    assert (d.gae_lambda, d.td_lambda, d.steps) == (0.5, 0.8, 4)
+    assert (mi.gae_lambda, mi.steps, mi.filter, mi.magnet) == (0.8, 8, "pps:0.25,floor=0.05", "mix:init,0.03")
+    assert (at.gae_lambda, at.td_lambda, at.steps) == (0.5, 0.8, 8)
     # 既定の温度は 0.05 固定（t によらない）
     Ld = MMDLearner(PolicyValueNet(8, 1, 91), make_config("tsuitate"), DEV)
     assert Ld.temperature(0) == Ld.temperature(10_000) == 0.05
