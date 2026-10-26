@@ -113,9 +113,22 @@ def _splitmix(z):
     return z ^ _shr(z, 31)
 
 
+def seed_salt(seed: int) -> int:
+    """seed を振って別の局を取りたいときの salt。`keyed_uniform` は salt と局番号を XOR で混ぜるので、局数より小さい桁だけが
+    違う seed どうし（例えば 1 と 2、101 と 104）は同じ鍵の集まりを局番号を入れ替えて使い、同じ局の組になる。
+    局番号の桁と重ならないよう 32 ビット上へずらす"""
+    return int(seed) << 32
+
+
 def keyed_uniform(salt, games, decs, actions, device):
     """(salt, 局, その局の何番目の手番か, 行動) だけで決まる (0, 1) の一様乱数（splitmix64 のハッシュ。
-    CPU でも GPU でも同じ値）。`actions` は行動の番号 [行, K]（合法手だけ渡せば速い）か、行動の総数（全部）"""
+    CPU でも GPU でも同じ値）。`actions` は行動の番号 [行, K]（合法手だけ渡せば速い）か、行動の総数（全部）。
+
+    salt と局番号は XOR で混ぜる。局数より小さい桁だけが違う salt どうしは、同じ鍵の集まりを局番号を入れ替えて使う
+    （パネルの相手の salt = EVAL_SEED + stable_seed(名前) は、名前の末尾の1文字違い〔rl_deduce_v1〜v9 など〕でほぼ連番になる）。
+    違う相手との局はすぐ分かれるので結果の相関は小さい（P2 の記録で rl_deduce_v3 と v4 の間 +0.03、ずらした対照 +0.003）。
+    学習中のパネルの記録（train_rnad.py の --panel）と局ごとに対にするため、この混ぜ方は変えない。seed を振って別の局を
+    取りたいときは `seed_salt` を通す"""
     g = torch.as_tensor(games, dtype=torch.int64, device=device)[:, None]
     k = torch.as_tensor(decs, dtype=torch.int64, device=device)[:, None]
     if isinstance(actions, int):
@@ -404,7 +417,7 @@ def self_play_stats(net, games, seed, planes, temp, device=DEV):
             hi += len(idx)
         n += len(idx)
         actions = np.full(games, -1, dtype=np.int64)
-        actions[idx] = keyed_actions(net, obs[idx], mask[idx], idx, dec[idx], seed, device, temp=temp)
+        actions[idx] = keyed_actions(net, obs[idx], mask[idx], idx, dec[idx], seed_salt(seed), device, temp=temp)
         dec[alive] += 1
         env.step(actions)
     return ent_sum / max(n, 1), hi / max(n, 1), n

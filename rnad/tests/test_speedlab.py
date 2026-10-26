@@ -171,13 +171,43 @@ def check_decode():
                                           decode=dec))
         rows = [json.loads(line) for line in open(run / "panel_eval.jsonl")]
         assert sorted(r["which"] for r in rows) == ["current", "current@greedy"], rows
-        # temp-match: 温度 0 は π>0.999 が全部、温度を下げるとエントロピーが下がる
-        e1, h1, n1 = S.self_play_stats(a_net, 6, 5, planes, 1.0)
-        e5, h5, _ = S.self_play_stats(a_net, 6, 5, planes, 0.5)
-        e0, h0, _ = S.self_play_stats(a_net, 6, 5, planes, 0.0)
-        assert n1 > 0 and e1 > e5 > 0 and h0 == 1.0 and h5 >= h1, (e1, e5, h1, h5, h0)
+        # temp-match: 温度 0 は π>0.999 が全部、温度を下げるとエントロピーが下がる。値はそれぞれの温度の自己対局の局面で
+        # 測るので、乱数初期化のほぼ平らな方策（エントロピー ≈ log 合法手数）では温度の差が局面の違いに埋もれる。
+        # ロジットを大きくした方策で測る
+        class Peaked(torch.nn.Module):
+            def __init__(self, net):
+                super().__init__()
+                self.net = net
+
+            def forward(self, x):
+                logits, v = self.net(x)
+                return logits * 8, v
+        peaked = Peaked(a_net).eval()
+        e1, h1, n1 = S.self_play_stats(peaked, 6, 5, planes, 1.0)
+        e5, h5, _ = S.self_play_stats(peaked, 6, 5, planes, 0.5)
+        e0, h0, _ = S.self_play_stats(peaked, 6, 5, planes, 0.0)
+        # π>0.999 の割合は温度 1 と 0.5 ではどちらもほぼ 0 なので比べない（6局の揺れで逆転する）
+        assert n1 > 0 and e1 > e5 > 0 and h0 == 1.0, (e1, e5, h1, h5, h0)
     print("締まりを除いた比べ方: play_vs の温度は測られる側だけ・greedy は決定的・eval --decode の記録名・"
           f"export-ck（出力の差 < 1e-4）・temp-match（エントロピー T1 {e1:.2f} > T0.5 {e5:.2f}、T0 は π>0.999 が 100%）")
+
+
+def check_seed_salt():
+    """keyed_uniform は salt と局番号を XOR で混ぜるので、局数より小さい桁だけが違う salt は同じ鍵の組を使う（学習中のパネルの
+    記録と対にするため変えない）。seed を振るときは seed_salt を通し、違う seed で違う局になる（temp-match の --seed）"""
+    games = torch.arange(16)
+    zero = torch.zeros(16, dtype=torch.int64)
+    raw = [sorted(S.keyed_uniform(s, games, zero, 4, "cpu")[:, 0].tolist()) for s in (1, 2)]
+    assert raw[0] == raw[1]  # 同じ組（並びが違うだけ）。この性質を変えると記録と対にならない
+    spread = [sorted(S.keyed_uniform(S.seed_salt(s), games, zero, 4, "cpu")[:, 0].tolist()) for s in (1, 2)]
+    assert spread[0] != spread[1]
+    from model import NUM_PLANES, PolicyValueNet
+    torch.manual_seed(5)
+    net = PolicyValueNet(8, 1, NUM_PLANES).eval()
+    a = S.self_play_stats(net, 16, 1, NUM_PLANES, 1.0)
+    b = S.self_play_stats(net, 16, 2, NUM_PLANES, 1.0)
+    assert a != b and a == S.self_play_stats(net, 16, 1, NUM_PLANES, 1.0), (a, b)
+    print("seed_salt: 生の salt 1 と 2 は同じ鍵の組（変えない性質）、seed_salt を通すと違う局になる（self_play_stats の seed）")
 
 
 def check_fit():
@@ -368,5 +398,6 @@ if __name__ == "__main__":
     check_keyed_actions()
     check_keyed_temp()
     check_decode()
+    check_seed_salt()
     check_fit()
     check_report()
