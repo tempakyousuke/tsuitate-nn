@@ -18,7 +18,7 @@
 - 再開: 6更新を続けたものと 3更新 → 保存 → 読み込み → 3更新がビット単位で同じ（学習器・pipeline なしの train_rnad.py の両方）。
   学習率の warmup は MMD を始めた step から数え、再開で走り直さない
 - R-NaD の checkpoint からの始め方（--init-which both --init-step）と、使えない組み合わせの停止
-- train_rnad.py の煙テスト（pipeline・fast py・device_batch、preset 2つ）と stage_log.py が読めること
+- train_rnad.py の煙テスト（pipeline・fast py・device_batch、preset 3つ）と stage_log.py が読めること
 """
 
 import copy
@@ -513,7 +513,64 @@ def check_moving_magnet(net0, batch):
         except ValueError:
             continue
         raise AssertionError(f"magnet_avg を {bad['magnet']} と通した")
-    print("動く磁石: magnet_avg の EMA で磁石だけが動き（書き出しのターゲットとは別）、磁石の対数確率はそのネットから作る")
+    # 既定（magnet target・magnet_avg 0）の磁石は書き出しのターゲット。1更新でターゲットが動き、magnet_net（始めたときの
+    # 写し）とずれた状態で、磁石の対数確率がターゲットから作られる（magnet_net から作ると固定の磁石に戻ってしまう）
+    for magnet in ("target", "mix:target,0.2"):
+        cfg = make_config("tsuitate", magnet=magnet, target_avg=0.1, filter="none", chunk=10_000)
+        assert make_config("tsuitate").magnet == "target" and cfg.magnet_avg == 0
+        L = MMDLearner(copy.deepcopy(net0), cfg, DEV)
+        L.update(batch)
+        assert any(not torch.equal(a, b) for a, b in zip(L.target.parameters(), L.magnet_net.parameters()))
+        st, _ = L.prepare(batch, torch.zeros(n), torch.zeros(n), batch["v_actor"].float(), keep, torch.ones(n), keep,
+                          torch.ones(n))
+        obs, pmask, apos, idx, pos = st.view(rows)
+        with torch.no_grad():
+            def lp_of(m):
+                return torch.log_softmax(m(obs)[0].gather(1, idx).masked_fill(~pmask, float("-inf")), -1)
+            lt, lm = lp_of(L.target), lp_of(L.magnet_net)
+        if magnet != "target":
+            cnt = pmask.sum(1, keepdim=True).float()
+            lt, lm = torch.log(0.8 * lt.exp() + 0.2 / cnt), torch.log(0.8 * lm.exp() + 0.2 / cnt)
+        assert float((st.lrho[pos] - lt[pmask]).abs().max()) < 1e-5, magnet
+        assert float((st.lrho[pos] - lm[pmask]).abs().max()) > 1e-4, magnet
+    print("動く磁石: magnet_avg の EMA で磁石だけが動き（書き出しのターゲットとは別）、磁石の対数確率はそのネットから作る。"
+          "既定（magnet_avg 0）と mix:target はターゲットから作る")
+
+
+def check_apply_cfg(net0, batch):
+    """再開時の設定の上書き: 別の EMA の磁石へ切り替えると現在のターゲットから始める、mix:init へは途中から切り替えない、
+    分位の窓は新しい長さに切り詰める。train_rnad.py と同じ順（新しい設定で作る → checkpoint を読む → 上書き）で見る"""
+    cfg = make_config("tsuitate", target_avg=0.1, filter="quantile:0.5", filt_window=3, chunk=10_000)
+    L = MMDLearner(copy.deepcopy(net0), cfg, DEV)
+    L.update(batch)
+    L.update(batch)
+    assert len(L.filt_hist) == 2
+    ck = L.state_dict()
+    new = make_config("tsuitate", target_avg=0.1, filter="quantile:0.5", filt_window=2, chunk=10_000, magnet_avg=0.5)
+
+    def resumed(with_old):
+        L2 = MMDLearner(copy.deepcopy(net0), new, DEV)
+        L2.load_state_dict(ck)
+        L2.apply_cfg(new, **({"old": ck["cfg"]} if with_old else {}))
+        return L2
+
+    def same(a, b):
+        return all(torch.equal(x, y) for x, y in zip(a.state_dict().values(), b.state_dict().values()))
+
+    L2 = resumed(True)
+    assert len(L2.filt_hist) == 1 and same(L2.magnet_net, L2.target)
+    # 検査の検査: 再開では学習器が新しい設定で作られているので、old を渡さないと切り替えに気づかない
+    assert not same(resumed(False).magnet_net, L2.target)
+    L2.apply_cfg(make_config("tsuitate", target_avg=0.1, filter="quantile:0.5", filt_window=1, chunk=10_000))
+    assert L2.filt_hist == []
+    try:
+        L2.apply_cfg(make_config("tsuitate", magnet="mix:init,0.03"))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("途中から mix:init へ切り替えた")
+    print("設定の上書き: 別の EMA の磁石はターゲットから始め（train_rnad.py と同じ順で、checkpoint の設定と比べる）、"
+          "mix:init へは途中から切り替えず、分位の窓を切り詰める")
 
 
 # ---------------------------------------------------------------- 再開
@@ -543,7 +600,7 @@ def check_resume(net0):
     torch.save(b.state_dict(), buf)
     buf.seek(0)
     c = MMDLearner(PolicyValueNet(16, 2, 91), cfg, DEV, seed=99)
-    c.load_state_dict(torch.load(buf))
+    c.load_state_dict(torch.load(buf, map_location="cpu"))
     logs_b += [strip(c.update(x)) for x in batches[3:]]
     for name in ("net", "target", "magnet_net"):
         for (k, x), (_, y) in zip(getattr(a, name).state_dict().items(), getattr(c, name).state_dict().items()):
@@ -561,7 +618,8 @@ def check_resume(net0):
 def run_train(out, *extra, steps, check=True):
     cmd = [sys.executable, str(TRAIN), "--algo", "mmd", "--anchor", "none", "--batch", "6", "--steps", str(steps),
            "--channels", "16", "--blocks", "1", "--planes", "91", "--compact-legal", "--eval-every", "0",
-           "--export-every", "3", "--checkpoint-every", "3", "--out", str(out), "--threads", "2", *extra]
+           "--export-every", "3", "--checkpoint-every", "3", "--out", str(out), "--threads", "2", "--device", "cpu",
+           *extra]
     if "--init" not in extra:
         cmd += ["--init", "none"]
     r = subprocess.run(cmd, capture_output=True, text=True)
@@ -589,8 +647,8 @@ def check_resume_train(tmp):
     want = [1e-4 * min(1.0, (s + 1) / 4) for s in range(6)]
     assert all(abs(x - y) <= 1e-12 for x, y in zip(lrs, want)), (lrs, want)
     assert [x["temperature"] for x in la] == [power_schedule(0.05, s + 2000, 0.3, 0.1, 0.001) for s in range(6)]
-    ca = torch.load(tmp / "straight" / "checkpoint.pt")
-    cb = torch.load(tmp / "resumed" / "checkpoint.pt")
+    ca = torch.load(tmp / "straight" / "checkpoint.pt", map_location="cpu")
+    cb = torch.load(tmp / "resumed" / "checkpoint.pt", map_location="cpu")
     for name in ("net", "target", "magnet_net"):
         for k in ca[name]:
             assert same_tensor(ca[name][k], cb[name][k]), f"train_rnad.py の再開で {name}.{k} が違う"
@@ -598,16 +656,37 @@ def check_resume_train(tmp):
           f"{[f'{x:.1e}' for x in lrs]}（再開で走り直さない）、温度は予定どおり")
 
 
+def check_override_magnet(tmp):
+    """train_rnad.py の再開で --override-config --mmd-magnet-avg 0.5 にすると、磁石の EMA は再開した時点のターゲットから始まる
+    （始めたときの写しからではない）。train_rnad.py が checkpoint の設定を apply_cfg に渡す配線を見る"""
+    out = tmp / "override"
+    run_train(out, "--seed", "5", "--mmd-chunk", "50", "--target-avg", "0.2", steps=3)
+    ck3 = torch.load(out / "checkpoint.pt", map_location="cpu")
+    r = run_train(out, "--seed", "5", "--mmd-chunk", "50", "--target-avg", "0.2", "--mmd-magnet-avg", "0.5",
+                  "--override-config", "--checkpoint-every", "1", steps=4)
+    assert "再開時に設定を上書き" in r.stdout and "magnet_avg" in r.stdout, r.stdout[-800:]
+    ck4 = torch.load(out / "checkpoint.pt", map_location="cpu")
+    assert ck4["step"] == 4
+    for k, t3 in ck3["target"].items():
+        if not t3.is_floating_point() or k not in dict(PolicyValueNet(16, 1, 91).named_parameters()):
+            continue
+        want = t3 + 0.5 * (ck4["net"][k] - t3)
+        assert torch.allclose(ck4["magnet_net"][k], want, atol=1e-6), k
+        stale = ck3["magnet_net"][k] + 0.5 * (ck4["net"][k] - ck3["magnet_net"][k])
+        assert not torch.allclose(stale, want, atol=1e-6) or torch.equal(ck3["magnet_net"][k], t3), k
+    print("T13 再開で磁石の EMA に切り替える（--override-config --mmd-magnet-avg）: 再開した時点のターゲットから始まる")
+
+
 def check_init_from_rnad(tmp):
     """R-NaD の checkpoint から --init-which both --init-step で始める"""
     r = subprocess.run([sys.executable, str(TRAIN), "--init", "none", "--anchor", "none", "--batch", "4", "--steps", "2",
                         "--channels", "16", "--blocks", "1", "--planes", "91", "--compact-legal", "--eval-every", "0",
                         "--export-every", "2", "--checkpoint-every", "2", "--out", str(tmp / "rnad_src"),
-                        "--threads", "2", "--schedule", "1"],
+                        "--threads", "2", "--schedule", "1", "--device", "cpu"],
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr[-1500:]
     src = tmp / "rnad_src" / "checkpoint.pt"
-    ck = torch.load(src)
+    ck = torch.load(src, map_location="cpu")
     sys.path.insert(0, str(TRAIN.parent))
     import train_rnad
     net = PolicyValueNet(16, 1, 91)
@@ -630,8 +709,11 @@ def check_init_from_rnad(tmp):
     # checkpoint があれば --init* は使わない（表示して続ける）
     r = run_train(tmp / "from_rnad", "--init", str(src), "--init-which", "both", "--init-step", steps=4)
     assert "--init / --init-which / --init-step は使わない" in r.stdout
+    # 再開の記録にも出どころ（checkpoint から戻した init_from）が残る
+    rec = json.loads((tmp / "from_rnad" / "config_resume_3.json").read_text())
+    assert rec["init_from"] == cfg["init_from"], rec["init_from"]
     print("T12 R-NaD の checkpoint から: net・ターゲット・磁石・step が ck と同じ、Adam は空、番号が続く。"
-          "再開では --init* を使わない")
+          "再開では --init* を使わず、再開の記録に出どころが残る")
 
 
 def check_rejects(tmp):
@@ -648,32 +730,37 @@ def check_rejects(tmp):
         r = run_train(tmp / "rej", *extra, steps=1, check=False)
         assert r.returncode != 0 and msg in (r.stderr + r.stdout), (extra, r.stderr[-500:])
     r = subprocess.run([sys.executable, str(TRAIN), "--algo", "mmd", "--init", "none", "--anchor", "none",
-                        "--out", str(tmp / "rej2")], capture_output=True, text=True)
+                        "--device", "cpu", "--out", str(tmp / "rej2")], capture_output=True, text=True)
     assert r.returncode != 0 and "--compact-legal" in r.stderr
     r = subprocess.run([sys.executable, str(TRAIN), "--mmd-filter", "none", "--init", "none", "--anchor", "none",
-                        "--out", str(tmp / "rej3")], capture_output=True, text=True)
+                        "--device", "cpu", "--out", str(tmp / "rej3")], capture_output=True, text=True)
     assert r.returncode != 0 and "--algo mmd のときだけ" in r.stderr
     # R-NaD の out に MMD で再開しない
     run_train(tmp / "x", steps=1)
     r = subprocess.run([sys.executable, str(TRAIN), "--init", "none", "--anchor", "none", "--batch", "4",
-                        "--steps", "2", "--channels", "16", "--blocks", "1", "--planes", "91", "--out", str(tmp / "x")],
+                        "--steps", "2", "--channels", "16", "--blocks", "1", "--planes", "91", "--device", "cpu",
+                        "--out", str(tmp / "x")],
                        capture_output=True, text=True)
     assert r.returncode != 0 and "別の学習器" in r.stderr
     print(f"T11 使えない組み合わせ: {len(cases) + 3} 通りとも起動時に止まる")
 
 
 def check_smoke(tmp):
-    """pipeline・fast py・device_batch で2つの preset を回し、NaN なし・ログのキーあり・stage_log.py が読める"""
+    """pipeline・fast py・device_batch で3つの preset を回し、NaN なし・ログのキーあり・stage_log.py が読める"""
     for preset in ("tsuitate", "mixinit", "ataraxos"):
         out = tmp / f"smoke_{preset}"
         run_train(out, "--mmd-preset", preset, "--pipeline", "--fast-collect", "py", "--device-batch",
                   "--mmd-chunk", "64", "--lr-warmup", "2", steps=4)
         lg = read_log(out / "log.jsonl")
+        raw = [json.loads(line) for line in open(out / "log.jsonl") if line.strip()]
         assert len(lg) == 4
-        for x in lg:
+        for x, xr in zip(lg, raw):
             for k in ("loss_v", "loss_nerd", "loss_kl", "loss_mag", "temperature", "clip_frac", "kl_mu_unkept",
-                      "grad_norm_p50", "calib_band", "resid_band", "entropy_mean", "collect_busy_sec"):
-                assert k in x or k.endswith("_sec"), (preset, k)
+                      "grad_norm_p50", "calib_band", "resid_band", "entropy_mean"):
+                assert k in x, (preset, k)
+            # 時間のキーは read_log が落とすので生の行で見る（律速の判定に使う）
+            for k in ("collect_busy_sec", "collect_sec", "update_sec", "train_sec"):
+                assert k in xr, (preset, k)
             for k in ("loss_v", "loss_nerd", "loss_kl", "loss_mag", "grad_norm_max"):
                 assert math.isfinite(x[k]), (preset, k, x[k])
         r = subprocess.run([sys.executable, str(HERE.parent / "stage_log.py"), str(out / "log.jsonl"), "--dm", "2",
@@ -694,10 +781,12 @@ if __name__ == "__main__":
     check_end_to_end(net0, batch)
     check_first_step(net0, batch)
     check_moving_magnet(net0, batch)
+    check_apply_cfg(net0, batch)
     check_resume(net0)
     with tempfile.TemporaryDirectory() as d:
         tmp = pathlib.Path(d)
         check_resume_train(tmp)
+        check_override_magnet(tmp)
         check_init_from_rnad(tmp)
         check_rejects(tmp)
         check_smoke(tmp)

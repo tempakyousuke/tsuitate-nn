@@ -476,6 +476,8 @@ def main() -> None:
             raise SystemExit(f"checkpoint と設定が違う: {diff}（(保存, 今)）。"
                              "意図した変更なら --override-config を付ける")
         learner.load_state_dict(ck)
+        if args.algo == "mmd":
+            record["init_from"] = learner.init_from  # checkpoint から戻した値（record を作った時点ではまだ None）
         if args.reseed:
             torch.manual_seed(args.seed)
             if device.type == "cuda":
@@ -484,7 +486,7 @@ def main() -> None:
                 learner.reseed(args.seed)
             print(f"乱数を --seed {args.seed} で作り直した（checkpoint の乱数状態は使わない）", flush=True)
         if diff:
-            learner.apply_cfg(learner_cfg)
+            learner.apply_cfg(learner_cfg, **({"old": ck["cfg"]} if args.algo == "mmd" else {}))
             print(f"再開時に設定を上書き: {diff}")
         elif args.algo == "mmd":
             pass  # MMD の学習率は毎更新で予定から入れ直す

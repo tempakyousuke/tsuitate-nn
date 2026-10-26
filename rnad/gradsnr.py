@@ -92,6 +92,25 @@ def mmd_rows(var, batch, v_net, n_games, seed):
             float(keep_p.float().mean()))
 
 
+def u_stat_jackknife(Sblk, cross, nk):
+    """変種どうしの期待勾配の内積の U 統計量と、その標準誤差（局を K 組に分けた1組抜きのジャックナイフ）。
+
+    Sblk[k] = 組 k の局ごとの勾配の和（変種 × パラメータ）、cross[k] = 組 k の Σ_i g_a,i·g_b,i（変種 × 変種）、
+    nk[k] = 組 k の局数。U = (S·Sᵀ − Σ_i g_i·g_iᵀ) / (N(N−1))（同じ局どうしの項を除く）。
+    組ごとの U のばらつき / √K は、雑音が勝つとき（B_noise が局数と同程度以上）に U の分散の 1/N² の項
+    （2·tr(Σ²)/(N(N−1))）を K 倍に数えて過大になる（模擬で K 4 のとき 1.0〜1.6倍、K 32 で 2〜5倍）。
+    ジャックナイフは模擬で真の値の 1.0〜1.4倍（やや保守的）"""
+    K = len(nk)
+    N = float(nk.sum())
+    S = Sblk.sum(0)
+    C = cross.sum(0)
+    U = (S @ S.T - C) / (N * (N - 1))
+    M = N - nk
+    U_del = torch.stack([((S - Sblk[k]) @ (S - Sblk[k]).T - (C - cross[k])) / (M[k] * (M[k] - 1)) for k in range(K)])
+    U_se = torch.sqrt((K - 1) / K * ((U_del - U_del.mean(0)) ** 2).sum(0))
+    return U, U_se
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--weights", required=True)
@@ -102,7 +121,9 @@ def main():
     ap.add_argument("--variant", action="append", required=True,
                     help="最初の変種が ref（向きの基準）。例 ref:clip=10000")
     ap.add_argument("--threads", type=int, default=0)
-    ap.add_argument("--blocks", type=int, default=4, help="U 統計量の標準誤差を出すための局の組の数")
+    ap.add_argument("--blocks", type=int, default=32,
+                    help="U 統計量の標準誤差（1組抜きのジャックナイフ）の局の組の数。16 以上を勧める。組ごとの勾配の和を持つので"
+                         "メモリは 組数 × 変種の数 × パラメータ数 × 8 バイト（64ch×6・14変種・32組で約2GB）")
     ap.add_argument("--check-batched", type=int, default=0,
                     help="最初の N 局で、MMD の変種の束ねた逆伝播を変種ごとの素直な逆伝播と突き合わせる")
     ap.add_argument("--out", default="")
@@ -287,14 +308,9 @@ def main():
 
     ref = variants[0]["name"]
     out = {"weights": args.weights, "games": n_games, "samples": n, "s_stats": s_stats, "variants": {}}
-    # U 統計量: G_a·G_b ≈ (S_a·S_b − Σ_i g_a,i·g_b,i) / (N(N−1))
     N_g = acc[ref]["nA"] + acc[ref]["nB"]
-    S = Sblk.sum(0)
-    U = (S @ S.T - cross.sum(0)) / (N_g * (N_g - 1))
-    # 標準誤差の目安: 局を K 組に分け、組ごとの U（n/K 局）のばらつき / √K（主の項の分散は局数に反比例するので）
     nk = torch.bincount(torch.arange(N_g) % K, minlength=K).double()
-    Uk = torch.stack([(Sblk[k] @ Sblk[k].T - cross[k]) / (nk[k] * (nk[k] - 1)) for k in range(K)])
-    U_se = Uk.std(0) / math.sqrt(K)
+    U, U_se = u_stat_jackknife(Sblk, cross, nk)
     out["u_stat_se"] = U_se.tolist()
     d = U.diag()
     cos_u = U / torch.sqrt(torch.clamp(d[:, None] * d[None, :], min=1e-300))

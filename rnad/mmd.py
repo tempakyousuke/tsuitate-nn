@@ -8,10 +8,11 @@
   の `v_actor`）で作り、学習時に計算し直さない（Ataraxos と同じ）。反則で同じ側が続く手番も、既存の `v_trace_scalars` を
   η=0・π=μ=1・c=λ で呼べばそのまま扱える（λ は試行ごと。`lambda_unit="turn"` なら反則の試行では λ をかけない）
 - 学習に使う行を |A| に比例した確率で間引き（pps）、重み s̄/p で戻す（期待値は全行と同じ = 固定点を動かさない）。
-  Ataraxos どおりの「|A| の 75%点以上だけ」（quantile）は、クーンポーカーで固定点を均衡から外す（NashConv 0.46〜0.68、
-  絞り込みなしは α-QRE の 0.038）ので既定にしない。`preset="ataraxos"` の腕として残す
-- 1回の収集を k 歩（既定 8）の Adam に分ける（行を無作為に並べて k 等分）。正則化の段階（Δm）は無く、磁石への KL の
-  係数（温度）を MMD を始めてからの更新回数 t のべき乗で下げる（`power_schedule`、Ataraxos の rl.py と同じ式）
+  Ataraxos どおりの「|A| の 75%点以上だけ」（quantile）は、クーンポーカーで固定点を均衡から外す（NashConv は期待値の
+  更新で 0.67〜0.71、標本ありで 0.60〜0.62。絞り込みなしは α-QRE の 0.038）ので既定にしない。`preset="ataraxos"` の腕として残す
+- 1回の収集を k 歩（既定 8）の Adam に分ける（行を無作為に並べて k 等分）。正則化の段階（Δm）は無い。磁石への KL の
+  係数（温度）と学習率は、MMD を始めてからの更新回数 t の予定（`power_schedule`、Ataraxos の rl.py と同じ式）で決める
+  （既定はどちらも固定。`preset="mixinit"` は温度を、`"ataraxos"` は温度と学習率を t のべき乗で下げる）
 - `--pipeline` では batch が1更新前のネットで集めたものなので、クリップと KL の中心を**更新の頭の方策**にし、μ との比は
   外側の重要度（上限 `prox_cap`）にする（decoupled PPO、Hilton ら 2021）
 - 書き出すのは現在のネットの EMA（ターゲット、target_avg）。学習には使わない。BN は R-NaD と同じく eval モードのまま
@@ -354,8 +355,11 @@ REMAIN_BANDS = (0, 10, 40, 80, 10_000)
 
 
 class MMDLearner:
-    """現在のネット・ターゲット（書き出し用の EMA）・磁石のネット（始めたときのターゲットの凍結した写し）を持ち、
+    """現在のネット・ターゲット（書き出し用の EMA）・磁石のネット（`magnet_net`）を持ち、
     1つの batch（`collect(compact_legal=True, actor_extras=True)`）で `steps` 歩の Adam を進める。
+
+    磁石: 既定の動く磁石（magnet target / mix:target、magnet_avg 0）はターゲットそのもの。`magnet_net` は始めたときの
+    ターゲットの写しで、mix:init の磁石はこれを動かさずに使い、magnet_avg > 0 ならこれを別の EMA で動かす。
 
     `stale_actor` = batch を1更新前のネットで集める（`--pipeline`）。設定（cfg）には入れない（R-NaD の packed と同じく
     計算の持ち方の指定）。`device_batch` = 残した行の観測を更新の頭で1回だけデバイスへ送る。
@@ -672,9 +676,30 @@ class MMDLearner:
     def reseed(self, seed):
         self.gen.manual_seed(seed)
 
-    def apply_cfg(self, cfg: MMDConfig):
-        """設定を差し替える（再開時に明示的に上書きするとき）。学習率は毎更新で予定から入れ直す"""
-        self.parsed = parse_config(cfg)
+    def apply_cfg(self, cfg: MMDConfig, old=None):
+        """設定を差し替える（再開時に明示的に上書きするとき）。学習率は毎更新で予定から入れ直す。
+        `old` = 差し替える前の設定（checkpoint の cfg の dict。再開では学習器を新しい設定で作ってから読むので要る。
+        None なら今の self.cfg）。
+
+        magnet_net は magnet_avg 0 のあいだ始めたときの写しのまま動かないので、別の EMA（magnet_avg > 0）へ切り替えるときは
+        現在のターゲットから始め直す（そのままだと始めの方策へ引き戻す）。mix:init への途中からの切り替えは、magnet_net が
+        始めたときの写しのままとは限らないので止める。分位の窓は新しい窓の長さに切り詰める"""
+        prev = dict(self.cfg.__dict__) if old is None else {**MMDConfig().__dict__, **old}
+        parsed = parse_config(cfg)
+
+        def is_init(magnet):
+            kind, pos, _ = _spec(magnet)
+            return kind == "mix" and pos[:1] == ["init"]
+
+        if is_init(cfg.magnet) and not is_init(prev["magnet"]) and self.step_count > self.mmd_t0:
+            raise ValueError("MMD の途中から mix:init の磁石には切り替えられない（始めたときの写しが残っているとは限らない）")
+        if cfg.magnet_avg > 0 and not prev["magnet_avg"] > 0:
+            self.magnet_net.load_state_dict(self.target.state_dict())
+        if parsed["filter"][0] == "quantile" and cfg.filt_window > 1:
+            self.filt_hist = self.filt_hist[-(cfg.filt_window - 1):]
+        else:
+            self.filt_hist = []
+        self.parsed = parsed
         self.cfg = cfg
         for g in self.opt.param_groups:
             g["betas"] = (cfg.adam_b1, g["betas"][1])

@@ -28,11 +28,12 @@
   `--device-batch` / `--fused` を付けるとこのループにも使う。`--loop-mmd <割合>` なら更新を MMD 学習器にする
   （pipelined は decoupled の近い方策の順伝播も入る）
 
-MMD 学習器（`--algo mmd`。docs/rl-learning-speed.md 10節）の A/B の前に決めること（6.0c）:
+MMD 学習器（`--algo mmd`。tsuitate-bot の docs/rl-learning-speed.md 10.5）の A/B の前に決めること（tsuitate-bot の
+docs/rl-mmd-design.md 6.0c）:
 
-    .venv/bin/python rnad/bench_update.py --ckpt out_rnad/ab_base_98000.pt --batch 768 --compact-legal \\
-        --collect-arms rust,rust+extras --mmd-arms 0.25,0.5,1 --fast-collect rust --device-batch --precision tf32 \\
-        --calib net,target --loop-mmd 0.25
+    .venv/bin/python rnad/bench_update.py --ckpt out_rnad/ab_base_108000.pt --batch 768 --compact-legal \\
+        --collect-arms rust,rust+extras --mmd-arms 0.5,1 --fast-collect rust --device-batch --precision tf32 \\
+        --calib net,target --loop-mmd 0.5 --mmd-stale
 
 - `--collect-arms` に `+extras` の腕（`collect(actor_extras=True)`）: 既存のキーが extras なしとビット単位で同じか
 - `--mmd-arms`: 行を残す割合ごと（1 = 絞り込みなし）の MMD の1更新の秒、クリップ前の勾配ノルムの分位（歩ごと）、

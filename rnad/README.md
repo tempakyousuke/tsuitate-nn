@@ -110,7 +110,7 @@ ARENA_MATCH_SEED=20260927 cargo run --release --bin arena -- 100 "rl_policy:<pol
 R-NaD の checkpoint から続ける（net ← 現在のネット、ターゲットと磁石 ← ターゲット、step の番号を続ける。Adam は新しく作る）:
 
 ```sh
-.venv/bin/python -u rnad/train_rnad.py --algo mmd --init out_rnad/ab_base_98000.pt --init-which both --init-step \
+.venv/bin/python -u rnad/train_rnad.py --algo mmd --init out_rnad/ab_base_108000.pt --init-which both --init-step \
     --out out_rnad/ab_mmd_s1 --seed <本線と同じ> --steps <終わりの step> --batch 768 --anchor <本線と同じ> \
     --pipeline --compact-legal --fast-collect rust --device-batch --precision tf32 --lr-warmup 100
 ```
@@ -150,8 +150,9 @@ R-NaD の checkpoint から続ける（net ← 現在のネット、ターゲッ
   `ratio_dev_first` `prox_is_capped`、勾配の `grad_norm_p50/p90/max`（クリップ前）`clip_rate`、方策の `entropy_mean`
   `pi_top_mean` `pi_top_gt_0999`（収集方策の値）`magnet_kl`、価値の `calib_band`（|v| の帯ごとの mean(z·sign v)・mean|v|）
   `calib_slope_by_remain`（終局までの手番数の帯ごとの傾き）`resid_band`（V の帯ごとの mean(G_td − v)）
-- `bench_update.py --mmd-arms 0.25,0.5,1 --calib net,target --loop-mmd <割合>` で割合ごとの1更新の秒・勾配ノルムの分位・
-  GPU のメモリ・価値の較正を測る（A/B の前の 6.0c）
+- `bench_update.py --mmd-arms 0.5,1 --calib net,target --loop-mmd <割合> --mmd-stale` で割合ごとの1更新の秒・勾配ノルムの
+  分位・GPU のメモリ・価値の較正を測る（A/B の前に決めること。tsuitate-bot の `docs/rl-mmd-design.md` 6.0c。コマンドの全体は
+  `docs/rl-learning-speed.md` 10.5）
 - テスト: `tests/test_mmd.py`（λ-return と素直なループ・閉形式、extras の収集、Ataraxos の式の密な参照との損失と勾配、
   decoupled PPO、端から端の勾配、行の選び方の不偏性、予定、再開のビット一致、R-NaD の checkpoint からの始め方、
   止める組み合わせ、煙テスト）

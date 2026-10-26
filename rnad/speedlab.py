@@ -580,11 +580,15 @@ def cmd_report(args):
     ratings = panel["ratings"]
     runs = [pathlib.Path(r) for r in args.runs if (pathlib.Path(r) / "log.jsonl").exists()]
     arms = {}
+    base = args.from_step or 0
+    origins = {}  # run → 起点（--from-step、無ければ step 0）の Elo。--exclude-step で表から外しても伸びの基準に使う
     for run in runs:
         ev = load_eval(run, ratings, args.eval_file)
-        # --from-step より前と --exclude-step は表から外す（step 0 は起点として曲線と要約に残す）
+        if (base, args.which) in ev:
+            origins[run] = ev[(base, args.which)][0]
+        # --from-step より前と --exclude-step は表から外す（--from-step が無ければ step 0 は起点として曲線と要約に残す）
         ev = {k: v for k, v in ev.items()
-              if k[0] == 0 or (k[0] >= args.from_step and k[0] not in set(args.exclude_step or []))}
+              if (k[0] == 0 and base == 0) or (k[0] >= base and k[0] not in set(args.exclude_step or []))}
         cum = load_log(run)
         arms.setdefault(arm_of(run), []).append((run, ev, cum))
     lines = [f"パネル: " + ", ".join(f"{n} {r:.0f}" for n, r in sorted(ratings.items(), key=lambda x: x[1])), ""]
@@ -617,6 +621,11 @@ def cmd_report(args):
     lines.append(f"| 腕 | seed | 最後の Elo | 平均 Elo（曲線下の面積 / 更新回数） | 起点 +{args.gain:g} に届いた更新回数 | "
                  "同・局数 | 同・壁時計（分） | 1更新の秒 |")
     lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
+
+    def cum_at(cum, st):
+        """st の時点の累積（その step の行が無ければ手前の最後の行。途中から分けた run は起点で (0, 0)）"""
+        return cum[max(k for k in cum if k <= st)]
+
     for arm, rs in sorted(arms.items()):
         finals, aucs, hits, hit_games, hit_secs, per = [], [], [], [], [], []
         for run, ev, cum in rs:
@@ -624,18 +633,22 @@ def cmd_report(args):
             if not pts:
                 continue
             finals.append(pts[-1][1])
-            xs = [0] + [s for s, _ in pts] if pts[0][0] != 0 else [s for s, _ in pts]
-            ys = ([pts[0][1]] if pts[0][0] != 0 else []) + [e for _, e in pts]
-            aucs.append(float(np.trapezoid(ys, xs) / max(xs[-1] - xs[0], 1)))
-            # しきい値は起点（step 0）からの伸び（パネルの絶対値はパネル込みでしか意味を持たないため）
-            hit = next((s for s, e in pts if e >= pts[0][1] + args.gain), None)
-            hits.append(hit)
+            # 曲線は起点（--from-step、無ければ 0）から。起点の Elo が無ければ最初の点の値で埋める
+            y0 = origins.get(run, pts[0][1])
+            xs = [base] + [s for s, _ in pts] if pts[0][0] != base else [s for s, _ in pts]
+            ys = ([y0] if pts[0][0] != base else []) + [e for _, e in pts]
+            # 点が起点だけ（始めたばかりの run）なら面積は起点の Elo そのもの
+            aucs.append(float(np.trapezoid(ys, xs) / (xs[-1] - xs[0])) if len(xs) > 1 else float(ys[0]))
+            # しきい値は起点からの伸び（パネルの絶対値はパネル込みでしか意味を持たないため）。更新回数・局数・壁時計も起点から
+            hit = next((s for s, e in pts if e >= y0 + args.gain), None)
+            hits.append(None if hit is None else hit - base)
+            c0 = cum_at(cum, base)
             if hit is not None and hit in cum:
-                hit_games.append(cum[hit][0])
-                hit_secs.append(cum[hit][1] / 60)
+                hit_games.append(cum[hit][0] - c0[0])
+                hit_secs.append((cum[hit][1] - c0[1]) / 60)
             last = max(cum)
-            if last:
-                per.append(cum[last][1] / last)
+            if last > base:
+                per.append((cum[last][1] - c0[1]) / (last - base))
 
         def fmt(xs, f="{:.0f}"):
             xs = [x for x in xs if x is not None]
@@ -647,10 +660,15 @@ def cmd_report(args):
         n_hit = sum(h is not None for h in hits)
         lines.append(f"| {arm} | {len(finals)} | {fmt(finals)} | {fmt(aucs)} | {fmt(hits)}（{n_hit}/{len(hits)}） | "
                      f"{fmt(hit_games)} | {fmt(hit_secs, '{:.1f}')} | {fmt(per, '{:.1f}')} |")
+    if base:
+        lines += ["", f"（--from-step {base}: 更新回数・局数・壁時計・1更新の秒は起点 {base} からの差。"
+                      f"起点の Elo は --exclude-step で表から外していても基準に使う）"]
     lines.append("")
     # 対照とのペア差（同じ seed・同じ書き出しの step どうし。共通乱数の評価なので局ごとの差は取らず Elo の差）
     if args.control and args.control in arms:
-        lines.append(f"## 対照（{args.control}）との差（同じ seed どうしの Elo の差の平均 ± 標準誤差、step ごと）")
+        pr = Pairing(arms, args.control, args)
+        title = "同じ壁時計の書き出しと" if pr.by == "wallclock" else "step ごと"
+        lines.append(f"## 対照（{args.control}）との差（同じ seed どうしの Elo の差の平均 ± 標準誤差、{title}）")
         lines.append("")
         lines.append("| 腕 | " + " | ".join(str(s) for s in steps) + " | 全 step 平均 |")
         lines.append("| --- |" + " --- |" * (len(steps) + 1))
@@ -658,6 +676,17 @@ def cmd_report(args):
         if args.control_any_seed and len(ctrl) == 1:
             only = next(iter(ctrl.values()))
             ctrl = {seed_of(r): only for rs_ in arms.values() for r, _, _ in rs_}
+
+        def ctrl_at(arm, seed, st):
+            """対照の Elo（--pair-by wallclock なら同じ壁時計に最も近い書き出し）。無ければ None。
+            step 0（出発点）は step 0 とだけ対にする（下の局ごとのペア差と同じく、対照の候補から外す）"""
+            c = ctrl.get(seed)
+            if c is None:
+                return None
+            if st == 0:
+                return c[(0, which)][0] if (0, which) in c else None
+            cs = pr.control_step(arm, st, sorted(s_ for s_, w in c if w == which and step_ok(s_, args)))
+            return c[(cs, which)][0] if cs is not None else None
         for arm, rs in sorted(arms.items()):
             if arm == args.control:
                 continue
@@ -668,8 +697,9 @@ def cmd_report(args):
                 for run, ev, _ in rs:
                     m = re.search(r"_s(\d+)$", run.name)
                     seed = m.group(1) if m else "0"
-                    if seed in ctrl and (s, which) in ev and (s, which) in ctrl[seed]:
-                        ds.append(ev[(s, which)][0] - ctrl[seed][(s, which)][0])
+                    cv = ctrl_at(arm, seed, s) if (s, which) in ev else None
+                    if cv is not None:
+                        ds.append(ev[(s, which)][0] - cv)
                 allds.append(ds)
                 if not ds:
                     cells.append("")
@@ -684,8 +714,8 @@ def cmd_report(args):
                 seed = m.group(1) if m else "0"
                 if seed not in ctrl:
                     continue
-                ds = [ev[(s, which)][0] - ctrl[seed][(s, which)][0] for s in steps
-                      if (s, which) in ev and (s, which) in ctrl[seed]]
+                ds = [ev[(s, which)][0] - cv for s in steps
+                      if (s, which) in ev and (cv := ctrl_at(arm, seed, s)) is not None]
                 if ds:
                     per_seed[seed] = float(np.mean(ds))
             v = list(per_seed.values())
@@ -733,7 +763,7 @@ def main():
     p.add_argument("runs", nargs="+")
     p.add_argument("--panel", required=True)
     p.add_argument("--which", default="current", help="target / current / ema<係数>")
-    p.add_argument("--gain", type=float, default=50.0, help="起点（step 0）からこの Elo だけ伸びた更新回数を数える")
+    p.add_argument("--gain", type=float, default=50.0, help="起点（--from-step、無ければ step 0）の Elo からこの値だけ伸びるまでの更新回数を数える")
     p.add_argument("--control", default="")
     p.add_argument("--out", default="")
     p.add_argument("--json", default="")
