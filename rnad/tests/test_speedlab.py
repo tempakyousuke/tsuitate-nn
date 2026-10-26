@@ -227,6 +227,14 @@ def check_seed_salt():
     finally:
         S.keyed_actions = orig
     assert salts and set(salts) == {S.seed_salt(3)}, set(salts)
+    # play_vs（eval・train_rnad.py の --panel）は seed をそのまま salt にする（seed_salt を通すと記録と対にならない）
+    salts.clear()
+    S.keyed_actions = spy
+    try:
+        S.play_vs(net, S.Member("random", NUM_PLANES), 4, S.EVAL_SEED + S.stable_seed("rl_v30"), NUM_PLANES)
+    finally:
+        S.keyed_actions = orig
+    assert salts and set(salts) == {S.EVAL_SEED + S.stable_seed("rl_v30")}, set(salts)
     # π>0.999 の割合: 入力によらない固定のロジットで、記録した合法手から直接数えた値と一致する（温度 1 と 0.5）
     base = torch.randn(139 * 81, generator=torch.Generator().manual_seed(9)) * 10
 

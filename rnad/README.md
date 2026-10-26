@@ -107,7 +107,7 @@ ARENA_MATCH_SEED=20260927 cargo run --release --bin arena -- 100 "rl_policy:<pol
   EMA = 動く磁石）、温度は 0.05 固定**。設計の初版の「固定の磁石 ＋ 温度を下げる」形（`--mmd-preset mixinit`）は、クーンで
   R-NaD の約8倍遅く、代理 P2 で自己対局が短い詰みの筋に固まった（tsuitate-bot の docs 10.4）。**この既定（温度 0.05・磁石 = 書き出しの
   EMA）は 3070 の A/B（本線の 108,000 から）で 400更新のうちに方策が締まって中止の門に触れ、棄却した**。current の伸びは自分の系列に集中した
-  （tsuitate-bot の docs 10.7。再挑戦するなら温度 0.2・別のゆっくりした磁石 `--mmd-magnet-avg 0.0003` で、CI での追試が通ったときだけ）
+  （tsuitate-bot の docs 10.7。再挑戦するなら温度 0.2・別のゆっくりした磁石 `--mmd-magnet-avg 0.0003` で1回だけ。いつ回すかの条件は 10.7）
 - `--pipeline` ではクリップと KL の中心を更新の頭の方策にし、μ との比を外側の重みにする（decoupled PPO）
 
 R-NaD の checkpoint から続ける（net ← 現在のネット、ターゲットと磁石 ← ターゲット、step の番号を続ける。Adam は新しく作る）:
