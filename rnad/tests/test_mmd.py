@@ -706,9 +706,11 @@ def check_init_from_rnad(tmp):
     # 目に見える違い: R-NaD の net と target は違う（同じだと both の検査にならない）
     assert any(not torch.equal(ck["net"][k], ck["target"][k]) for k in ck["net"] if ck["net"][k].is_floating_point())
     # train_rnad.py で1更新進める（番号が続く）
-    run_train(tmp / "from_rnad", "--init", str(src), "--init-which", "both", "--init-step", steps=3)
+    run_train(tmp / "from_rnad", "--init", str(src), "--init-which", "both", "--init-step", "--export-current", steps=3)
     lg = read_log(tmp / "from_rnad" / "log.jsonl")
     assert [x["step"] for x in lg] == [3] and lg[0]["mmd_t"] == 0
+    # 起点の書き出しは始めた番号（step 2）で書く（speedlab eval --decode で起点を同じ指し方で測り直せるように）
+    assert (tmp / "from_rnad" / "current_2.bin").exists() and (tmp / "from_rnad" / "policy_2.bin").exists()
     cfg = json.loads((tmp / "from_rnad" / "config.json").read_text())
     assert cfg["init_from"]["step"] == 2 and cfg["mmd"]["filter"] == "pps:0.5,floor=0.05" and cfg["mmd"]["magnet"] == "target"
     # checkpoint があれば --init* は使わない（表示して続ける）
@@ -717,8 +719,8 @@ def check_init_from_rnad(tmp):
     # 再開の記録にも出どころ（checkpoint から戻した init_from）が残る
     rec = json.loads((tmp / "from_rnad" / "config_resume_3.json").read_text())
     assert rec["init_from"] == cfg["init_from"], rec["init_from"]
-    print("T12 R-NaD の checkpoint から: net・ターゲット・磁石・step が ck と同じ、Adam は空、番号が続く。"
-          "再開では --init* を使わず、再開の記録に出どころが残る")
+    print("T12 R-NaD の checkpoint から: net・ターゲット・磁石・step が ck と同じ、Adam は空、番号が続く、起点を始めた番号で"
+          "書き出す。再開では --init* を使わず、再開の記録に出どころが残る")
 
 
 def check_rejects(tmp):

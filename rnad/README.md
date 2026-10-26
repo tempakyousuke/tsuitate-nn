@@ -45,7 +45,7 @@ ARENA_MATCH_SEED=20260927 cargo run --release --bin arena -- 100 "rl_policy:<pol
 | `fetch_records.py` | GitHub Actions の対局記録を取る |
 | `league.py` | リーグ学習の相手の選び方（負けやすい相手ほど多く当てる） |
 | `guard.py` | 防御特化（玉の周りの固め）の監視値の集計 |
-| `speedlab.py` | 学習の速さの比較: 固定パネル（`panel`）で run の書き出しを測り（`eval`、局ごとに鍵を決めた共通乱数）、腕ごとの学習曲線と対照とのペア差をまとめる（`report`） |
+| `speedlab.py` | 学習の速さの比較: 固定パネル（`panel`）で run の書き出しを測り（`eval`、局ごとに鍵を決めた共通乱数）、腕ごとの学習曲線と対照とのペア差をまとめる（`report`）。締まりの効果を除いて比べるには `eval --decode greedy\|temp:<T>`（記録名 `<which>@greedy` など）、途中から始めた run の起点の書き出しは `export-ck`、起点を何度で指すと締まった腕にそろうかは `temp-match` |
 | `gradsnr.py` | 学習なしの診断: 変種（クリップ・1/μ の上限・PG）ごとの局ごとの勾配の分散・期待勾配・雑音のスケール |
 | `bench_update.py` | 1更新の壁時計（従来 / `--packed` / 連続 / `--pipeline`）と、packed の勾配の一致。`--collect-arms` / `--update-arms` で `--fast-collect` / `--device-batch` / `--fused` を同じ batch・同じ乱数のペアで測り、結果がビット単位で同じかも出す（`--step` で α を選ぶ・`--precision`） |
 | `distill.py` | 方策ネットを小さいネットへ蒸留する（CPU の代理 P2 の出発点） |

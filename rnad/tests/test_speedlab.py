@@ -1,4 +1,4 @@
-"""speedlab の鍵つきの乱数と Elo の当てはめの検査（tsuitate_rl は要らない）。
+"""speedlab の鍵つきの乱数と Elo の当てはめの検査（`check_decode` だけ tsuitate_rl で数局指す）。
 
     .venv/bin/python rnad/tests/test_speedlab.py
 
@@ -8,6 +8,8 @@
 - report の A/B 用の比べ方（MMD の A/B。docs/rl-learning-speed.md 10節）: 対照の名前 `ab_rnad_s1` と `ab_mmd_s1`・`ab_mmd_s2` で
   対照の節が出る、`--pair-by wallclock` で秒が最も近い書き出しどうしが対になる、`--exclude-step` で起点が消える、
   `--control-any-seed` で seed 2 も対になる、`--vs-step` で同じ run の起点と対になる、`--groups` の小計、`--eval-file`
+- 締まりを除いた比べ方: keyed_actions の温度（同じ乱数のまま softmax(logits/T) から引く。0 は greedy）、play_vs の温度が
+  測られる側だけに掛かること、eval --decode の記録名、export-ck（checkpoint → 書き出し）、temp-match の値
 """
 
 import argparse
@@ -63,6 +65,101 @@ def check_keyed_actions():
     assert np.array_equal(got, want.numpy()), (got, want)
     assert mask[np.arange(n), got].all()
     print("keyed_actions: 合法手だけで乱数を作っても全行動の場合と同じ手")
+
+
+def check_keyed_temp():
+    """温度: 1 は従来と同じ手、0 は最大の手、T は同じ乱数のまま softmax(logits / T) から引く（多くの局で頻度を見る）"""
+    torch.manual_seed(1)
+    n, a = 40, 11259
+    logits = torch.randn(n, a) * 3
+    mask = np.random.default_rng(1).random((n, a)) < 0.01
+    mask[:, 5] = True
+    obs = np.zeros((n, 1, 9, 9), dtype=np.float32)
+    games, decs = np.arange(n), np.arange(n) * 3
+    net = FixedNet(logits)
+    base = S.keyed_actions(net, obs, mask, games, decs, 11, DEV)
+    assert np.array_equal(S.keyed_actions(net, obs, mask, games, decs, 11, DEV, temp=1.0), base)
+    greedy = logits.masked_fill(~torch.from_numpy(mask), float("-inf")).argmax(1).numpy()
+    assert np.array_equal(S.keyed_actions(net, obs, mask, games, decs, 11, DEV, temp=0.0), greedy)
+    # 1つの局面を 20,000局の鍵で引くと、頻度が softmax(logits / T) に合う
+    g = 20_000
+    l1 = torch.tensor([[1.0, 0.5, 0.0, -0.5, -1.0] + [0.0] * (a - 5)])
+    m1 = np.zeros((1, a), dtype=bool)
+    m1[0, :5] = True
+    one = FixedNet(l1.expand(g, a))
+    for t in (0.5, 2.0):
+        got = S.keyed_actions(one, np.zeros((g, 1, 9, 9), dtype=np.float32), np.repeat(m1, g, 0), np.arange(g),
+                              np.zeros(g, dtype=np.int64), 3, DEV, temp=t)
+        freq = np.bincount(got, minlength=5)[:5] / g
+        want = torch.softmax(l1[0, :5] / t, -1).numpy()
+        assert np.abs(freq - want).max() < 0.012, (t, freq, want)
+    print("keyed_actions の温度: 1 は従来と同じ手、0 は最大の手、T は頻度が softmax(logits/T) に合う")
+
+
+def check_decode():
+    """play_vs の温度は測られる側だけに掛かる・eval --decode の記録名・export-ck・temp-match（tsuitate_rl で数局指す）"""
+    from model import NUM_PLANES, PolicyValueNet
+    from export_weights import tiny_net
+    planes = NUM_PLANES
+    torch.manual_seed(2)
+    a_net = PolicyValueNet(8, 1, planes).eval()
+    b = S.Member("random", planes)
+    # 温度の配線: keyed_actions を包んで、どちらのネットにどの温度が渡ったかを記録する
+    seen = []
+    orig = S.keyed_actions
+
+    def spy(net, *args, temp=1.0, **kw):
+        seen.append((net is a_net, temp))
+        return orig(net, *args, temp=temp, **kw)
+
+    S.keyed_actions = spy
+    try:
+        o_greedy = S.play_vs(a_net, b, 6, 99, planes, per_game=True, a_temp=0.0)
+    finally:
+        S.keyed_actions = orig
+    assert {t for is_a, t in seen if is_a} == {0.0} and {t for is_a, t in seen if not is_a} == {1.0}, set(seen)
+    assert np.array_equal(S.play_vs(a_net, b, 6, 99, planes, per_game=True, a_temp=0.0), o_greedy)  # 決定的
+    assert np.array_equal(S.play_vs(a_net, b, 6, 99, planes, per_game=True),
+                          S.play_vs(a_net, b, 6, 99, planes, per_game=True, a_temp=1.0))
+    assert S.parse_decode("sample") == (1.0, "") and S.parse_decode("greedy") == (0.0, "@greedy")
+    assert S.parse_decode("temp:0.7") == (0.7, "@t0.7")
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = pathlib.Path(tmp)
+        # export-ck: checkpoint の net → current_<step>.bin、target → policy_<step>.bin（BatchNorm を畳んでも出力は同じ）
+        net, tgt = tiny_net(3), tiny_net(4)
+        if net.config["planes"] != planes:
+            net, tgt = PolicyValueNet(8, 1, planes).eval(), PolicyValueNet(8, 1, planes).eval()
+        torch.save({"net": net.state_dict(), "target": tgt.state_dict(), "config": dict(net.config), "step": 123},
+                   tmp / "ck.pt")
+        run = tmp / "run_s1"
+        S.cmd_export_ck(argparse.Namespace(checkpoint=str(tmp / "ck.pt"), run=str(run), step=None, force=False))
+        x = torch.rand(3, net.config["planes"], 9, 9)
+        for name, src in (("current_123.bin", net), ("policy_123.bin", tgt)):
+            back = S.read_weights(run / name).eval()
+            with torch.no_grad():
+                d = max(float((u - v).abs().max()) for u, v in zip(back(x), src.eval()(x)))
+            assert d < 1e-4, (name, d)
+        try:
+            S.cmd_export_ck(argparse.Namespace(checkpoint=str(tmp / "ck.pt"), run=str(run), step=None, force=False))
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("書き出しを黙って上書きした")
+        # eval --decode greedy: which に @greedy を付けて記録し、sample の行とは別に持つ
+        (tmp / "panel.json").write_text(json.dumps({"planes": planes, "members": ["random"], "ratings": {"random": 0.0}}))
+        for dec in ("greedy", "sample"):
+            S.cmd_eval(argparse.Namespace(runs=[str(run)], panel=str(tmp / "panel.json"), games=4, which=["current"],
+                                          every=0, only=None, device="cpu", out_file="panel_eval.jsonl", steps="",
+                                          decode=dec))
+        rows = [json.loads(line) for line in open(run / "panel_eval.jsonl")]
+        assert sorted(r["which"] for r in rows) == ["current", "current@greedy"], rows
+        # temp-match: 温度 0 は π>0.999 が全部、温度を下げるとエントロピーが下がる
+        e1, h1, n1 = S.self_play_stats(a_net, 6, 5, planes, 1.0)
+        e5, h5, _ = S.self_play_stats(a_net, 6, 5, planes, 0.5)
+        e0, h0, _ = S.self_play_stats(a_net, 6, 5, planes, 0.0)
+        assert n1 > 0 and e1 > e5 > 0 and h0 == 1.0 and h5 >= h1, (e1, e5, h1, h5, h0)
+    print("締まりを除いた比べ方: play_vs の温度は測られる側だけ・greedy は決定的・eval --decode の記録名・"
+          f"export-ck（出力の差 < 1e-4）・temp-match（エントロピー T1 {e1:.2f} > T0.5 {e5:.2f}、T0 は π>0.999 が 100%）")
 
 
 def check_fit():
@@ -153,6 +250,17 @@ def check_report():
         cell = lambda label: next(x for x in lines if x.startswith(f"| {label} |")).split("|")[2].strip()  # noqa: E731
         assert cell("g").startswith("+25.0") and cell("g（系列内）").startswith("+50.0"), lines
         assert cell("g（系列外）").startswith("+0.0"), lines
+        # --vs-which: 起点の側だけ別の記録名（締まりをそろえた起点 target@t0.9 = 両方の相手に全敗）と対にする
+        with open(tmp / "g_s1" / "panel_eval.jsonl", "a") as f:
+            for opp in opps:
+                f.write(json.dumps({"step": 100, "which": "target@t0.9", "opponent": opp, "w": 0, "l": n, "d": 0,
+                                    "games": n, "outcomes": lose.tolist()}) + "\n")
+        lines = S.vs_step_section(garms, "target", [100, 120],
+                                  argparse.Namespace(**{**base, "vs_step": 100, "vs_which": "target@t0.9"}))
+        row = [c.strip() for c in next(x for x in lines if x.startswith("| g |")).split("|")[1:-1]]
+        # 列は 100（起点そのもの〔引き分け〕と温度をそろえた起点〔全敗〕の差 +50）と 120（勝ち・引き分けと全敗の差 +75）
+        assert row[1].startswith("+50.0") and row[2].startswith("+75.0"), row
+        assert cell("g（系列内）").startswith("+50.0"), lines  # 100 の列（系列内: 引き分け − 全敗）
         # コマンドとして（cmd_report の引数の配線）
         (tmp / "panel.json").write_text(json.dumps({"planes": 91, "members": [], "ratings": ratings}))
         # --sec-per-update で MMD を 5.5秒に上書きする（log の中央値 2.75 と違う値: 120 は対照の 120 と対になる）
@@ -219,5 +327,7 @@ def check_report():
 if __name__ == "__main__":
     check_uniform()
     check_keyed_actions()
+    check_keyed_temp()
+    check_decode()
     check_fit()
     check_report()

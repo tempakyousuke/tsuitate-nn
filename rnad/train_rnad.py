@@ -703,13 +703,13 @@ def main() -> None:
 
     if panel is not None and not (out / "panel_eval.jsonl").exists():
         panel_eval(learner.step_count)  # 起点（再開でも最初の1回は測る）
-    if learner.step_count == 0:
-        if args.eval_every:
-            evaluate(0)
-        if args.export_current:
-            # 学習前の点（speedlab の曲線の起点）
-            write_weights(learner.target, out / "policy_0.bin")
-            write_weights(learner.net, out / "current_0.bin")
+    if learner.step_count == 0 and args.eval_every:
+        evaluate(0)
+    if ck is None and args.export_current:
+        # 学習前の点（speedlab の曲線の起点）。--init-step で途中の番号から始めた run も、その番号で書く
+        # （起点を同じ指し方〔speedlab eval --decode〕で測り直せるように）
+        write_weights(learner.target, out / f"policy_{learner.step_count}.bin")
+        write_weights(learner.net, out / f"current_{learner.step_count}.bin")
     while learner.step_count < args.steps:
         t0 = time.time()
         lam = lam_at(learner.step_count)

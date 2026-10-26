@@ -11,6 +11,12 @@
     python rnad/speedlab.py eval --panel lab/panel.json lab/runs/base_s0 lab/runs/base_s1 ...
     # 3) 腕ごとにまとめる（run のディレクトリ名の最後の `_s<seed>` を落とした名前を腕とみなす）
     python rnad/speedlab.py report lab/runs/* --panel lab/panel.json --control base --gain 50 --out lab/report.md
+    # 締まりの効果を除いて比べる: 測られる側を greedy（または温度 T）で指させ、`<which>@greedy` の名前で記録する。
+    # 途中から始めた run の起点（--init-step）は checkpoint から書き出しておく（export-ck）。起点を何度で指すと
+    # 締まった腕のエントロピー・π>0.999 の割合にそろうかは temp-match で測る
+    python rnad/speedlab.py export-ck out/ab_base_108000.pt out/ab_mmd_s1 --step 108000
+    python rnad/speedlab.py eval out/ab_mmd_s1 --panel panel_v2.json --which current --decode greedy --steps 108000,108500
+    python rnad/speedlab.py temp-match out/ab_mmd_s1/current_108000.bin --temps 1,0.8,0.7,0.6 --like out/ab_mmd_s1/current_108500.bin
     # 途中の checkpoint から分けた2つの学習法を「同じ壁時計」で比べる（MMD の A/B。docs/rl-learning-speed.md 10節）
     python rnad/speedlab.py report out/ab_rnad_s1 out/ab_mmd_s1 --panel panel_v2.json --control ab_rnad --which target \
         --pair-by wallclock --sec-per-update ab_rnad=5.5,ab_mmd=3.9 --from-step 108000 --exclude-step 108000 \
@@ -121,12 +127,13 @@ def keyed_uniform(salt, games, decs, actions, device):
 
 
 @torch.no_grad()
-def keyed_actions(net, obs, mask, games, decs, salt, device=DEV):
+def keyed_actions(net, obs, mask, games, decs, salt, device=DEV, temp=1.0):
     """**局ごとに鍵を決めた** Gumbel-max のサンプリング（共通乱数）。
 
     一様乱数は (salt, 局, 手番) だけで決まり、バッチの並びや他の局の進み方に依らない。同じ局を2つの書き出しで
     測ると、両者が同じ手を選ぶ限り同じ局面が続き、違いが出るのは方策が実際に違う手を選んだところからになる
-    （`sample_actions` は1バッチ分の乱数をまとめて引くので、どこかの局で反則が起きるだけで全局の乱数がずれる）"""
+    （`sample_actions` は1バッチ分の乱数をまとめて引くので、どこかの局で反則が起きるだけで全局の乱数がずれる）。
+    `temp` は方策の温度（softmax(logits / temp) から引く。同じ乱数のまま温度だけを変える）。0 なら最大の手（greedy）"""
     x = torch.from_numpy(obs).to(device).half().float()
     logits, _ = net(x)
     legal = torch.from_numpy(mask).to(device)
@@ -135,14 +142,21 @@ def keyed_actions(net, obs, mask, games, decs, salt, device=DEV):
     u = keyed_uniform(salt, games, decs, idx, device)
     gumbel = (-torch.log(-torch.log(u))).float()
     masked = logits.float().gather(1, idx).masked_fill(~pmask, float("-inf"))
-    return idx.gather(1, (masked + gumbel).argmax(-1, keepdim=True)).squeeze(1).cpu().numpy()
+    if temp == 0:
+        score = masked
+    elif temp == 1:
+        score = masked + gumbel
+    else:
+        score = masked / temp + gumbel
+    return idx.gather(1, score.argmax(-1, keepdim=True)).squeeze(1).cpu().numpy()
 
 
 @torch.no_grad()
-def play_vs(a_net, b: Member, games: int, seed: int, planes: int, per_game: bool = False, device=DEV):
+def play_vs(a_net, b: Member, games: int, seed: int, planes: int, per_game: bool = False, device=DEV, a_temp=1.0):
     """a_net（PyTorch）と b を games 局（偶数番の局で a が先手）。a から見た (勝, 負, 分)（per_game なら局番号ごとの
     結果 1 / 0 / −1 の配列）。
-    手は `keyed_actions`（局ごとの共通乱数）で選ぶので、同じ (b, games, seed) で測った書き出しどうしは局ごとに対になる"""
+    手は `keyed_actions`（局ごとの共通乱数）で選ぶので、同じ (b, games, seed) で測った書き出しどうしは局ごとに対になる。
+    `a_temp` は a だけの温度（0 = greedy）。相手はいつも温度 1"""
     salt = seed
     dec = np.zeros(games, dtype=np.int64)  # 局ごとの手番の数（反則で指し直した手番も数える）
     if b.net is not None:
@@ -169,7 +183,8 @@ def play_vs(a_net, b: Member, games: int, seed: int, planes: int, per_game: bool
                       (b.net, np.flatnonzero(alive & (pl != a_color)))]
         for net, idx in groups:
             if len(idx):
-                actions[idx] = keyed_actions(net, obs[idx], mask[idx], idx, dec[idx], salt, device)
+                actions[idx] = keyed_actions(net, obs[idx], mask[idx], idx, dec[idx], salt, device,
+                                             temp=a_temp if net is a_net else 1.0)
         dec[alive] += 1
         rew, done = env.step(actions)
         for i in np.flatnonzero(done):
@@ -278,8 +293,23 @@ def pick_device(name):
     return torch.device(name)
 
 
+def parse_decode(spec):
+    """`--decode` の指定 → (温度, 記録する which の後ろに付ける名前)。sample = 温度 1（名前は付けない）"""
+    if spec in ("", "sample"):
+        return 1.0, ""
+    if spec == "greedy":
+        return 0.0, "@greedy"
+    if spec.startswith("temp:"):
+        t = float(spec[5:])
+        if not t > 0:
+            raise SystemExit("--decode temp:<T> の T は正（0 なら greedy）")
+        return t, f"@t{t:g}"
+    raise SystemExit(f"--decode {spec}（sample / greedy / temp:<T>）")
+
+
 def cmd_eval(args):
     panel = json.loads(pathlib.Path(args.panel).read_text())
+    temp, suffix = parse_decode(args.decode)
     planes = panel["planes"]
     device = pick_device(args.device)
     members = [Member(s, planes, device) for s in panel["members"]]
@@ -293,9 +323,10 @@ def cmd_eval(args):
                 r = json.loads(line)
                 done.add((r["step"], r["which"], r["opponent"]))
         with open(path, "a") as f:
-            for step, which, wpath in step_files(run):
-                if args.which and which not in args.which:
+            for step, base_which, wpath in step_files(run):
+                if args.which and base_which not in args.which:
                     continue
+                which = base_which + suffix
                 if args.every and step % args.every:
                     continue
                 if only_steps is not None and step not in only_steps:
@@ -309,13 +340,87 @@ def cmd_eval(args):
                     t0 = time.time()
                     # 相手ごとに seed を固定 = どの書き出しも同じ対局条件（共通乱数）
                     o = play_vs(net, m, args.games, EVAL_SEED + stable_seed(m.name), planes, per_game=True,
-                                device=device)
+                                device=device, a_temp=temp)
                     w, l, d = int((o > 0).sum()), int((o < 0).sum()), int((o == 0).sum())
                     rec = {"step": step, "which": which, "opponent": m.name, "w": w, "l": l, "d": d,
                            "games": args.games, "outcomes": o.tolist(), "sec": round(time.time() - t0, 2)}
                     f.write(json.dumps(rec) + "\n")
                     f.flush()
                 print(f"{run.name} {which} {step}: 済", flush=True)
+
+
+def cmd_export_ck(args):
+    """R-NaD / MMD の checkpoint の現在のネットとターゲットを、run の書き出しの形（current_<step>.bin・policy_<step>.bin）で
+    書く。--init-step で途中から始めた run の起点を、同じ指し方（--decode）で測り直すため"""
+    from export_weights import write as write_weights
+    ck = torch.load(args.checkpoint, map_location="cpu")
+    if "net" not in ck or "target" not in ck:
+        raise SystemExit(f"{args.checkpoint} は R-NaD / MMD の checkpoint でない（net / target が無い）")
+    step = args.step if args.step is not None else int(ck["step"])
+    cfg = ck["config"]
+    out = pathlib.Path(args.run)
+    out.mkdir(parents=True, exist_ok=True)
+    for key, name in (("net", "current"), ("target", "policy")):
+        net = PolicyValueNet(cfg["channels"], cfg["blocks"], cfg["planes"])
+        net.load_state_dict(ck[key])
+        path = out / f"{name}_{step}.bin"
+        if path.exists() and not args.force:
+            raise SystemExit(f"{path} がもうある（上書きするなら --force）")
+        write_weights(net.eval(), path)
+        print(f"書き出し: {path}（checkpoint の {key}、step {step}）")
+
+
+@torch.no_grad()
+def self_play_stats(net, games, seed, planes, temp, device=DEV):
+    """net を温度 temp で自分自身と games 局指させ、その局面での方策（同じ温度）のエントロピーの平均と、
+    最大の手の確率が 0.999 を超える局面の割合（train_rnad.py のログの entropy_mean / pi_top_gt_0999 と同じ定義。
+    反則で指し直した手番も数える）"""
+    env = tsuitate_rl.VecEnv(games, seed=seed, auto_reset=False, **planes_kw(planes))
+    env.reset()
+    dec = np.zeros(games, dtype=np.int64)
+    ent_sum, hi, n = 0.0, 0, 0
+    while True:
+        alive = env.alive()
+        if not alive.any():
+            break
+        obs, mask, _ = env.observe()
+        idx = np.flatnonzero(alive)
+        x = torch.from_numpy(obs[idx]).to(device).half().float()
+        logits, _ = net(x)
+        legal = torch.from_numpy(mask[idx]).to(device)
+        lg = logits.float().masked_fill(~legal, float("-inf"))
+        if temp > 0:
+            lp = torch.log_softmax(lg / temp, -1)
+            p = lp.exp()
+            ent_sum += float(-(p * lp.masked_fill(~legal, 0.0)).sum(-1).sum())
+            hi += int((p.max(-1).values > 0.999).sum())
+        else:
+            hi += len(idx)
+        n += len(idx)
+        actions = np.full(games, -1, dtype=np.int64)
+        actions[idx] = keyed_actions(net, obs[idx], mask[idx], idx, dec[idx], seed, device, temp=temp)
+        dec[alive] += 1
+        env.step(actions)
+    return ent_sum / max(n, 1), hi / max(n, 1), n
+
+
+def cmd_temp_match(args):
+    """起点のネットを温度 T で指したときの自己対局の entropy_mean・pi_top_gt_0999 を並べ、--like のネット（温度 1）の値と
+    比べる。締まった腕と「同じだけ締めた起点」を比べる対照（`eval --decode temp:<T>`）の T を決めるため"""
+    device = pick_device(args.device)
+    ref = read_weights(args.ref).eval().to(device)
+    planes = ref.config["planes"]
+    rows = []
+    for t in [float(x) for x in args.temps.split(",")]:
+        e, h, n = self_play_stats(ref, args.games, args.seed, planes, t, device)
+        rows.append((f"{pathlib.Path(args.ref).name} @T{t:g}", e, h, n))
+    for path in args.like or []:
+        net = read_weights(path).eval().to(device)
+        e, h, n = self_play_stats(net, args.games, args.seed, planes, 1.0, device)
+        rows.append((f"{pathlib.Path(path).name}（温度 1）", e, h, n))
+    print(f"自己対局 {args.games}局（seed {args.seed}）の局面での方策の entropy_mean / pi_top_gt_0999:")
+    for name, e, h, n in rows:
+        print(f"  {name:40s} entropy {e:.3f}  π>0.999 {h * 100:5.1f}%  （決定点 {n}）")
 
 
 def load_eval(run: pathlib.Path, ratings, fname="panel_eval.jsonl"):
@@ -545,12 +650,15 @@ def paired_section(arms, control, which, steps, args=None):
 def vs_step_section(arms, which, steps, args):
     """同じ run の中で、各 step を step N（--vs-step）と局ごとに対にした得点の差（pt）。起点からの伸びを、
     起点の書き出しの評価の揺れごと打ち消して測る。`--groups` があれば相手の組ごとの表も出す（自分の系列の相手にだけ
-    伸びているのか、系列の外の相手にも伸びているのかを分ける）"""
+    伸びているのか、系列の外の相手にも伸びているのかを分ける）。`--vs-which` で起点の側だけ別の記録名と対にできる
+    （例: 腕は current、起点は締まりをそろえた current@t0.8。`eval --decode temp:0.8 --steps <起点>` で測っておく）"""
     fname = getattr(args, "eval_file", "panel_eval.jsonl")
     groups = json.loads(pathlib.Path(args.groups).read_text()) if getattr(args, "groups", "") else {}
     n0 = args.vs_step
-    cols = [s for s in steps if s != n0 and s >= (getattr(args, "from_step", 0) or 0)]
-    lines = [f"## step {n0} との局ごとのペア差（同じ run、得点の差、pt。{which}）", "",
+    base_which = getattr(args, "vs_which", "") or which
+    cols = [s for s in steps if (s != n0 or base_which != which) and s >= (getattr(args, "from_step", 0) or 0)]
+    label = which if base_which == which else f"{which}、起点は {base_which}"
+    lines = [f"## step {n0} との局ごとのペア差（同じ run、得点の差、pt。{label}）", "",
              "| 腕 | " + " | ".join(str(s) for s in cols) + " |", "| --- |" + " --- |" * len(cols)]
     group_rows = []
     for arm, rs in sorted(arms.items()):
@@ -560,9 +668,9 @@ def vs_step_section(arms, which, steps, args):
             out = load_outcomes(run, fname)
             sd = seed_of(run)
             for (st, w, opp), o in out.items():
-                if w != which or st not in per or (n0, w, opp) not in out:
+                if w != which or st not in per or (n0, base_which, opp) not in out:
                     continue
-                c = out[(n0, w, opp)]
+                c = out[(n0, base_which, opp)]
                 if len(c) != len(o):
                     continue
                 diff = ((o + 1) / 2 - (c + 1) / 2) * 100
@@ -776,6 +884,21 @@ def main():
     p.add_argument("--out-file", default="panel_eval.jsonl",
                    help="結果を書く run の中のファイル名（局数の違う測り直しはループ内の 1,024局と混ぜない）")
     p.add_argument("--steps", default="", help="この step だけ測る（カンマ区切り）")
+    p.add_argument("--decode", default="sample",
+                   help="測られる側の指し方: sample（温度 1、既定）/ greedy / temp:<T>。sample 以外は which を "
+                        "<which>@greedy / <which>@t<T> の名前で記録する（report --which current@greedy で読む）")
+    p = sub.add_parser("export-ck", help="checkpoint の現在のネットとターゲットを run の書き出しの形で書く（起点の測り直し用）")
+    p.add_argument("checkpoint")
+    p.add_argument("run")
+    p.add_argument("--step", type=int, default=None, help="書き出しの番号（省くと checkpoint の step）")
+    p.add_argument("--force", action="store_true")
+    p = sub.add_parser("temp-match", help="起点を温度 T で指したときのエントロピー・π>0.999 の割合を、締まった腕と比べる")
+    p.add_argument("ref", help="起点の重み（TSRLPV01）")
+    p.add_argument("--temps", default="1,0.9,0.8,0.7,0.6,0.5")
+    p.add_argument("--like", action="append", help="比べる腕の重み（温度 1 で測る）")
+    p.add_argument("--games", type=int, default=64)
+    p.add_argument("--seed", type=int, default=12345)
+    p.add_argument("--device", default="cpu")
     p = sub.add_parser("report", help="腕ごとにまとめる")
     p.add_argument("runs", nargs="+")
     p.add_argument("--panel", required=True)
@@ -794,10 +917,13 @@ def main():
     p.add_argument("--control-any-seed", action="store_true",
                    help="対照の seed が1つなら、どの seed の run とも対にする（パネルの乱数は相手の名前だけで決まる）")
     p.add_argument("--vs-step", type=int, default=None, help="同じ run の中で各 step をこの step と局ごとに対にする")
+    p.add_argument("--vs-which", default="",
+                   help="--vs-step の起点の側の記録名（省くと --which と同じ。締まりをそろえた起点 current@t<T> と対にするとき）")
     p.add_argument("--groups", default="", help="相手の組 {組名: [相手の名前, ...]} の JSON（ペア差の小計を出す）")
     args = ap.parse_args()
     torch.set_num_threads(int(__import__("os").environ.get("OMP_NUM_THREADS", "1")))
-    {"panel": cmd_panel, "eval": cmd_eval, "report": cmd_report}[args.cmd](args)
+    {"panel": cmd_panel, "eval": cmd_eval, "report": cmd_report, "export-ck": cmd_export_ck,
+     "temp-match": cmd_temp_match}[args.cmd](args)
 
 
 if __name__ == "__main__":
