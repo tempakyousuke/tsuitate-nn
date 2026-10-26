@@ -82,7 +82,8 @@ class MMDConfig:
     # t = (更新回数 − MMD を始めた更新回数) × t_scale
     t_scale: float = 1.0
     # 1更新の Adam の歩数（行の数を k 等分）・逆伝播のチャンク・残した行を何周するか。k は 4（2026-10-26。A/B の割合では
-    # B_noise が 100〜768局で、設計の規則は k 2〜4。代理 P2 で 8 より悪くなかった。docs/rl-learning-speed.md 10.4）
+    # B_noise が設計の規則の「100〜768局 → k 2〜4」の帯に入るか近い〔pps 1 は約260〜500局、pps 0.5 は未計測〕。
+    # 代理 P2 で 8 より悪くなかった。docs/rl-learning-speed.md 10.4）
     steps: int = 4
     chunk: int = 2048
     epochs: int = 1

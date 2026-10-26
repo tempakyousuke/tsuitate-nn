@@ -176,6 +176,8 @@ def check_report():
         row = [c.strip() for c in next(x for x in diff.splitlines() if x.startswith("| ab_mmd |")).split("|")[1:-1]]
         Em = {st: e for (st, w), (e, *_) in S.load_eval(runs[1], ratings).items()}
         assert row[2] == "+0±0" and row[3] == f"{Em[140] - E[120]:+.0f}±0", row  # 列は 110 / 120 / 140
+        # 全 step 平均（seed ごとに step の差を平均）も同じ対応: (0 + (140 の差)) / 2
+        assert row[4] == f"{(Em[140] - E[120]) / 2:+.0f}±0（2 seed）", row
         # 起点しか測っていない run（始めたばかり）の平均 Elo は起点の Elo（面積 0 にしない）
         write_run(tmp / "solo_s1", 2.75, {100: {o: draw for o in opps}})
         r = __import__("subprocess").run(

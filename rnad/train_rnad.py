@@ -336,9 +336,9 @@ def main() -> None:
                          "温度・学習率の予定と --lr-warmup はこの step から数える")
     mg = ap.add_argument_group("MMD（--algo mmd のときだけ。指定しなければ --mmd-preset の値）")
     mg.add_argument("--mmd-preset", choices=list(MMD_PRESETS), default="tsuitate",
-                    help="tsuitate = 本線向けの既定（pps 0.5・動く磁石〔ターゲット〕・温度 0.05 固定・λ_A 0.8・学習率固定）/ "
-                         "mixinit = 設計の初版（pps 0.25・始めの方策の固定の混合磁石・温度を下げる。代理で崩れた形）/ "
-                         "ataraxos = Ataraxos のコードの既定（|A| の 75%%点で切る・一様な磁石・λ_A 0.5・学習率も下げる）")
+                    help="tsuitate = 本線向けの既定（pps 0.5・動く磁石〔ターゲット〕・温度 0.05 固定・λ_A 0.5・1更新 4歩・学習率固定）/ "
+                         "mixinit = 設計の初版（pps 0.25・始めの方策の固定の混合磁石・温度を下げる・λ_A 0.8・8歩。代理で崩れた形）/ "
+                         "ataraxos = Ataraxos のコードの既定（|A| の 75%%点で切る・一様な磁石・λ_A 0.5・8歩・学習率も下げる）")
     mg.add_argument("--mmd-filter", default=None,
                     help="方策の行の選び方: pps:<割合>[,floor=<下限>] / quantile:<分位>[,min=<下限>] / topk:<割合> / none")
     mg.add_argument("--mmd-value-rows", default=None, help="価値の行: auto / all / filtered / uniform:<割合>")
