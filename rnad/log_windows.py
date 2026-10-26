@@ -7,12 +7,13 @@
     .venv/bin/python rnad/log_windows.py out_rnad/deduce_s10000/log.jsonl --from-step 98000 --to-step 98600 --width 100
 
 窓は (from + i·width, from + (i+1)·width]（更新の行の step は更新の後の番号）。無いキーは空欄。
+ログは stage_log.load_log で読む（読めない行は飛ばし、checkpoint.pt から再開して step が戻った run は後の行を使う）。
 """
 
 import argparse
-import json
 import math
-import pathlib
+
+from stage_log import load_log
 
 DEFAULT_KEYS = "entropy_mean,pi_top_gt_0999,plies,fouls_per_side,magnet_kl,grad_norm_p50,clip_rate"
 
@@ -34,14 +35,8 @@ def windows(rows, keys, start, stop, width):
 
 
 def read_rows(path):
-    """更新の行だけ（評価の行・パネルの行は除く）"""
-    rows = []
-    for line in pathlib.Path(path).read_text().splitlines():
-        r = json.loads(line)
-        if "eval" in r or "collect_sec" not in r or "step" not in r:
-            continue
-        rows.append(r)
-    return rows
+    """更新の行だけ（評価の行は除く。再開で重なった step は後の run の行）"""
+    return load_log(path)[0]
 
 
 def main():

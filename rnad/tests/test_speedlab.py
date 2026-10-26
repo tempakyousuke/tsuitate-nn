@@ -13,6 +13,8 @@
 """
 
 import argparse
+import contextlib
+import io
 import json
 import pathlib
 import sys
@@ -145,6 +147,22 @@ def check_decode():
             pass
         else:
             raise AssertionError("書き出しを黙って上書きした")
+        # policy_<step>.bin だけが既にあるフォルダ（--export-current なしの書き出し）でも、current を書く前に止まる
+        half = tmp / "half_s1"
+        half.mkdir()
+        (half / "policy_123.bin").write_bytes(b"old")
+        try:
+            S.cmd_export_ck(argparse.Namespace(checkpoint=str(tmp / "ck.pt"), run=str(half), step=None, force=False))
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("書き出しを黙って上書きした")
+        assert not (half / "current_123.bin").exists() and (half / "policy_123.bin").read_bytes() == b"old"
+        # --step が checkpoint の step と違えば注意を出す（写した checkpoint.pt が書き直された後のこともある）
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            S.cmd_export_ck(argparse.Namespace(checkpoint=str(tmp / "ck.pt"), run=str(tmp / "lbl_s1"), step=100, force=False))
+        assert "checkpoint の step は 123" in err.getvalue() and (tmp / "lbl_s1" / "current_100.bin").exists(), err.getvalue()
         # eval --decode greedy: which に @greedy を付けて記録し、sample の行とは別に持つ
         (tmp / "panel.json").write_text(json.dumps({"planes": planes, "members": ["random"], "ratings": {"random": 0.0}}))
         for dec in ("greedy", "sample"):
@@ -261,6 +279,14 @@ def check_report():
         # 列は 100（起点そのもの〔引き分け〕と温度をそろえた起点〔全敗〕の差 +50）と 120（勝ち・引き分けと全敗の差 +75）
         assert row[1].startswith("+50.0") and row[2].startswith("+75.0"), row
         assert cell("g（系列内）").startswith("+50.0"), lines  # 100 の列（系列内: 引き分け − 全敗）
+        # 局数が起点の側と違う組は対にできないので、数を出して飛ばす（黙って空欄にしない）
+        with open(tmp / "g_s1" / "panel_eval.jsonl", "a") as f:
+            for opp in opps:
+                f.write(json.dumps({"step": 100, "which": "target@t0.8", "opponent": opp, "w": 0, "l": 4, "d": 0,
+                                    "games": 4, "outcomes": [-1] * 4}) + "\n")
+        lines = S.vs_step_section(garms, "target", [100, 120],
+                                  argparse.Namespace(**{**base, "vs_step": 100, "vs_which": "target@t0.8"}))
+        assert any("比べなかった組: 4" in x for x in lines), lines
         # コマンドとして（cmd_report の引数の配線）
         (tmp / "panel.json").write_text(json.dumps({"planes": 91, "members": [], "ratings": ratings}))
         # --sec-per-update で MMD を 5.5秒に上書きする（log の中央値 2.75 と違う値: 120 は対照の 120 と対になる）
@@ -317,11 +343,24 @@ def check_report():
         Ec = {st: e for (st, w), (e, *_) in S.load_eval(tmp / "w0" / "c_s1", ratings).items()}
         Ea = {st: e for (st, w), (e, *_) in S.load_eval(tmp / "w0" / "a_s1", ratings).items()}
         assert row[1] == "+0" and row[2] == f"{Ea[10] - Ec[10]:+.0f}", (row, Ea, Ec)  # 列は 0 / 10 / 20
+        # log.jsonl の無いフォルダ（export-ck で起点だけ書き出して eval したもの）も落とさない。どちらも無ければ名前を出して飛ばす
+        write_run(tmp / "nolog_s1", 1.0, {100: {o: draw for o in opps}, 120: {o: win for o in opps}})
+        (tmp / "nolog_s1" / "log.jsonl").unlink()
+        (tmp / "empty_s1").mkdir()
+        r = __import__("subprocess").run(
+            [sys.executable, str(HERE.parent / "speedlab.py"), "report", str(tmp / "nolog_s1"), str(tmp / "empty_s1"),
+             "--panel", str(tmp / "panel.json"), "--which", "target", "--from-step", "100", "--vs-step", "100"],
+            capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr[-1500:]
+        vs = r.stdout[r.stdout.index("との局ごとのペア差"):]
+        row = [c.strip() for c in next(x for x in vs.splitlines() if x.startswith("| nolog |")).split("|")[1:-1]]
+        assert row[1].startswith("+50.0"), (row, r.stdout)  # 列は 120（起点 100 の引き分けと全勝の差）
+        assert "empty_s1" in r.stderr and "| empty |" not in r.stdout, (r.stdout, r.stderr)
         # --eval-file: 別のファイルの評価だけを読む
         write_run(tmp / "x_s1", 1.0, {5: {"in1": win}}, fname="panel_eval_final.jsonl")
         assert S.load_eval(tmp / "x_s1", ratings) == {} and S.load_eval(tmp / "x_s1", ratings, "panel_eval_final.jsonl")
     print("report: 壁時計の対応・起点の除外・対照の seed の共用・起点とのペア差・組ごとの小計・評価のファイル名・"
-          "秒/更新の上書き・要約は起点から・起点とのペア差の組ごとの表")
+          "秒/更新の上書き・要約は起点から・起点とのペア差の組ごとの表・局数違いの組の数・log.jsonl の無いフォルダ")
 
 
 if __name__ == "__main__":

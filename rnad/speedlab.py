@@ -14,7 +14,7 @@
     # 締まりの効果を除いて比べる: 測られる側を greedy（または温度 T）で指させ、`<which>@greedy` の名前で記録する。
     # 途中から始めた run の起点（--init-step）は checkpoint から書き出しておく（export-ck）。起点を何度で指すと
     # 締まった腕のエントロピー・π>0.999 の割合にそろうかは temp-match で測る
-    python rnad/speedlab.py export-ck out/ab_base_108000.pt out/ab_mmd_s1 --step 108000
+    python rnad/speedlab.py export-ck out/ab_base_108000.pt out/ab_mmd_s1
     python rnad/speedlab.py eval out/ab_mmd_s1 --panel panel_v2.json --which current --decode greedy --steps 108000,108500
     python rnad/speedlab.py temp-match out/ab_mmd_s1/current_108000.bin --temps 1,0.8,0.7,0.6 --like out/ab_mmd_s1/current_108500.bin
     # 途中の checkpoint から分けた2つの学習法を「同じ壁時計」で比べる（MMD の A/B。docs/rl-learning-speed.md 10節）
@@ -356,18 +356,24 @@ def cmd_export_ck(args):
     ck = torch.load(args.checkpoint, map_location="cpu")
     if "net" not in ck or "target" not in ck:
         raise SystemExit(f"{args.checkpoint} は R-NaD / MMD の checkpoint でない（net / target が無い）")
-    step = args.step if args.step is not None else int(ck["step"])
+    ck_step = int(ck["step"])
+    step = args.step if args.step is not None else ck_step
+    if step != ck_step:
+        # checkpoint.pt は --checkpoint-every ごとに書き直されるので、写した時点の step がラベルとずれていることがある
+        print(f"注意: checkpoint の step は {ck_step} だが、--step {step} の名前で書く", file=sys.stderr)
     cfg = ck["config"]
     out = pathlib.Path(args.run)
+    pairs = [(key, out / f"{name}_{step}.bin") for key, name in (("net", "current"), ("target", "policy"))]
+    # 片方だけ書いてから止まらないよう、書く前に両方を確かめる
+    taken = [str(path) for _, path in pairs if path.exists()]
+    if taken and not args.force:
+        raise SystemExit(f"{'・'.join(taken)} がもうある（上書きするなら --force）")
     out.mkdir(parents=True, exist_ok=True)
-    for key, name in (("net", "current"), ("target", "policy")):
+    for key, path in pairs:
         net = PolicyValueNet(cfg["channels"], cfg["blocks"], cfg["planes"])
         net.load_state_dict(ck[key])
-        path = out / f"{name}_{step}.bin"
-        if path.exists() and not args.force:
-            raise SystemExit(f"{path} がもうある（上書きするなら --force）")
         write_weights(net.eval(), path)
-        print(f"書き出し: {path}（checkpoint の {key}、step {step}）")
+        print(f"書き出し: {path}（checkpoint の {key}、checkpoint の step {ck_step}）")
 
 
 @torch.no_grad()
@@ -651,7 +657,8 @@ def vs_step_section(arms, which, steps, args):
     """同じ run の中で、各 step を step N（--vs-step）と局ごとに対にした得点の差（pt）。起点からの伸びを、
     起点の書き出しの評価の揺れごと打ち消して測る。`--groups` があれば相手の組ごとの表も出す（自分の系列の相手にだけ
     伸びているのか、系列の外の相手にも伸びているのかを分ける）。`--vs-which` で起点の側だけ別の記録名と対にできる
-    （例: 腕は current、起点は締まりをそろえた current@t0.8。`eval --decode temp:0.8 --steps <起点>` で測っておく）"""
+    （例: 腕は current、起点は締まりをそろえた current@t0.8。`eval --decode temp:0.8 --steps <起点> --games <学習中の
+    パネルと同じ局数（--panel-games）>` で測っておく。局数が違う組は対にできないので数だけ出して飛ばす）"""
     fname = getattr(args, "eval_file", "panel_eval.jsonl")
     groups = json.loads(pathlib.Path(args.groups).read_text()) if getattr(args, "groups", "") else {}
     n0 = args.vs_step
@@ -661,6 +668,7 @@ def vs_step_section(arms, which, steps, args):
     lines = [f"## step {n0} との局ごとのペア差（同じ run、得点の差、pt。{label}）", "",
              "| 腕 | " + " | ".join(str(s) for s in cols) + " |", "| --- |" + " --- |" * len(cols)]
     group_rows = []
+    skipped = []  # 局数が起点の側と違うので対にしなかった (腕, step, 相手)
     for arm, rs in sorted(arms.items()):
         per = {s: {} for s in cols}
         per_group = {g: {s: {} for s in cols} for g in groups}  # 組 → step → seed → 局ごとの差
@@ -672,6 +680,7 @@ def vs_step_section(arms, which, steps, args):
                     continue
                 c = out[(n0, base_which, opp)]
                 if len(c) != len(o):
+                    skipped.append((arm, st, opp, len(o), len(c)))
                     continue
                 diff = ((o + 1) / 2 - (c + 1) / 2) * 100
                 per[st].setdefault(sd, []).extend(diff.tolist())
@@ -689,6 +698,10 @@ def vs_step_section(arms, which, steps, args):
                 xs = [v for vs in per_group[gname][s].values() for v in vs]
                 gcells.append(_fmt_diff(xs, [np.mean(v) for v in per_group[gname][s].values()]) or "")
             group_rows.append(f"| {arm}（{gname}） | " + " | ".join(gcells) + " |")
+    if skipped:
+        ex = skipped[0]
+        lines += ["", f"局数が step {n0}（{base_which}）と違うため比べなかった組: {len(skipped)}（腕・step・相手。"
+                      f"例: {ex[0]} の {ex[1]}・{ex[2]} は {ex[3]} 局、起点は {ex[4]} 局。起点の側を同じ --games で測り直す）"]
     lines.append("")
     if groups:
         lines += [f"### 相手の組ごと（step {n0} とのペア差）", "", "| 腕（組） | " + " | ".join(str(s) for s in cols) + " |",
@@ -703,7 +716,13 @@ def arm_of(run: pathlib.Path):
 def cmd_report(args):
     panel = json.loads(pathlib.Path(args.panel).read_text())
     ratings = panel["ratings"]
-    runs = [pathlib.Path(r) for r in args.runs if (pathlib.Path(r) / "log.jsonl").exists()]
+    # log.jsonl が無くても評価の記録があれば残す（export-ck で起点だけ書き出したフォルダ。局数・壁時計の列は空になる）
+    runs = []
+    for r in map(pathlib.Path, args.runs):
+        if (r / "log.jsonl").exists() or (r / args.eval_file).exists():
+            runs.append(r)
+        else:
+            print(f"飛ばす: {r} に log.jsonl も {args.eval_file} も無い", file=sys.stderr)
     arms = {}
     base = args.from_step or 0
     origins = {}  # run → 起点（--from-step、無ければ step 0）の Elo。--exclude-step で表から外しても伸びの基準に使う
@@ -890,7 +909,8 @@ def main():
     p = sub.add_parser("export-ck", help="checkpoint の現在のネットとターゲットを run の書き出しの形で書く（起点の測り直し用）")
     p.add_argument("checkpoint")
     p.add_argument("run")
-    p.add_argument("--step", type=int, default=None, help="書き出しの番号（省くと checkpoint の step）")
+    p.add_argument("--step", type=int, default=None,
+                   help="書き出しの番号（省くと checkpoint の step。違う番号を与えると注意を出す）")
     p.add_argument("--force", action="store_true")
     p = sub.add_parser("temp-match", help="起点を温度 T で指したときのエントロピー・π>0.999 の割合を、締まった腕と比べる")
     p.add_argument("ref", help="起点の重み（TSRLPV01）")
