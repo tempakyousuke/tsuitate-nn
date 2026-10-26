@@ -302,7 +302,8 @@ def main() -> None:
                          "（2次モーメントが古い勾配の大きさを b2 = 0.999 で何千更新も覚えているため）")
     ap.add_argument("--lr-warmup", type=int, default=0,
                     help="この実行の最初の N 更新で学習率を 0 から線形に上げる（--reset-adam の直後の2次モーメントは"
-                         "数回分の勾配だけから推定されて揺れるため）")
+                         "数回分の勾配だけから推定されて揺れるため）。--algo mmd では MMD を始めた step から数え、"
+                         "--mmd-value-warmup があれば温めが終わった step から数え直す")
     ap.add_argument("--compact-legal", action="store_true",
                     help="batch の合法手のマスクを添字で持つ（768局で約 0.79GB → 約 11MB。更新の結果は同じ。"
                          "--pipeline で batch が2つ同時にあるときのメモリ対策）")
@@ -592,9 +593,15 @@ def main() -> None:
 
     def set_warmup_lr():
         if args.algo == "mmd":
-            # MMD は学習器が予定の学習率を毎更新で入れる。ここは warmup の倍率だけ
-            learner.lr_scale = (min(1.0, (learner.step_count - warm_from + 1) / args.lr_warmup)
-                                if args.lr_warmup > 0 else 1.0)
+            # MMD は学習器が予定の学習率を毎更新で入れる。ここは warmup の倍率だけ。
+            # 価値の温め（--mmd-value-warmup）の間は価値の頭だけが Adam の歩を踏み、幹と方策の頭は温めの後に初めて踏む
+            # （Adam の状態が空のまま）ので、warmup は温めが終わった step から数え直す。価値の頭の学習率もそこで一度下がって
+            # 上がり直す（価値の頭の Adam はもう温まっているので害は小さい）。温めが 0 なら MMD を始めた step から数えるだけ
+            t = learner.step_count - warm_from
+            vw = learner.cfg.value_warmup
+            if vw > 0 and t >= vw:
+                t -= vw
+            learner.lr_scale = min(1.0, (t + 1) / args.lr_warmup) if args.lr_warmup > 0 else 1.0
             return
         lr = cfg.lr
         if lr_min_frac is not None:

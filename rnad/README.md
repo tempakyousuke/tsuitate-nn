@@ -143,7 +143,8 @@ R-NaD の checkpoint から続ける（net ← 現在のネット、ターゲッ
   （現在のネットの EMA）。**本線と同じ step 番号になるので、Release のタグには `mmd` を入れる**
 - 再開: pipeline なしなら、続けて回した run とビット単位で同じ（`tests/test_mmd.py`）。pipeline では再開すると収集が
   `seed*1_000_003 + 17 + step` から始まるので、続けた run とは別の局になる（R-NaD と同じ）。`--lr-warmup` は MMD を
-  始めた step から数えるので、同じコマンドで再開しても走り直さない
+  始めた step から数えるので、同じコマンドで再開しても走り直さない。`--mmd-value-warmup` があれば、温めが終わった step（幹と方策の頭が
+  初めて Adam の歩を踏む）から数え直す（2026-10-26 から。それまでは温めの間に使い切っていた）
 - ログ（log.jsonl）: R-NaD と共通の `samples` `loss_v` `loss_nerd`（方策の項）`alpha`（1.0）`reg_update`（false）`lr`
   `collect_sec` `update_sec` に加え、`temperature` `mmd_t` `rows_kept` `keep_rate` `pps_c` `w_max`、信頼領域の
   `kl_prox_mean` / `kl_prox_last`（中心への KL）`kl_mu_unkept`（残さなかった行の更新後の KL(π‖μ)）`clip_frac`

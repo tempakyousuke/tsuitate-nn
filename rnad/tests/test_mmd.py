@@ -661,6 +661,22 @@ def check_resume_train(tmp):
           f"{[f'{x:.1e}' for x in lrs]}（再開で走り直さない）、温度は予定どおり")
 
 
+def check_value_warmup_lr(tmp):
+    """価値の温めの後に幹と方策の頭が初めて Adam の歩を踏むので、学習率の warmup はそこから数え直す（2026-10-26。
+    3070 の A/B では warmup を温めの間に使い切り、方策は Adam の状態が空のまま学習率いっぱいで動き始めた）。再開しても同じ"""
+    common = ["--seed", "6", "--mmd-chunk", "50", "--lr-warmup", "2", "--mmd-value-warmup", "2"]
+    run_train(tmp / "vw", *common, steps=5)
+    lg = read_log(tmp / "vw" / "log.jsonl")
+    assert [x["value_only"] for x in lg] == [True, True, False, False, False], [x["value_only"] for x in lg]
+    want = [5e-5, 1e-4, 5e-5, 1e-4, 1e-4]
+    assert all(abs(x["lr"] - y) <= 1e-12 for x, y in zip(lg, want)), [x["lr"] for x in lg]
+    run_train(tmp / "vw_r", *common, steps=3)
+    run_train(tmp / "vw_r", *common, steps=5)
+    assert read_log(tmp / "vw_r" / "log.jsonl") == lg, "価値の温めつきの再開でログが変わる"
+    print("価値の温めと学習率の warmup: 温めの後に warmup を数え直す（学習率 "
+          f"{[f'{x:.0e}' for x in want]}）、再開しても同じ")
+
+
 def check_override_magnet(tmp):
     """train_rnad.py の再開で --override-config --mmd-magnet-avg 0.5 にすると、磁石の EMA は再開した時点のターゲットから始まる
     （始めたときの写しからではない）。train_rnad.py が checkpoint の設定を apply_cfg に渡す配線を見る"""
@@ -793,6 +809,7 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as d:
         tmp = pathlib.Path(d)
         check_resume_train(tmp)
+        check_value_warmup_lr(tmp)
         check_override_magnet(tmp)
         check_init_from_rnad(tmp)
         check_rejects(tmp)
