@@ -12,11 +12,16 @@ R-NaD の損失で1ステップ。学習の進み具合は**錨（既定は模�
 防御特化（玉の周りの固め）は `--guard λ --league <本命> --league-frac 1`（rnad/README.md）。
 速攻特化（決着の速さ）は `--speed λ`（自己対局＋リーグ。rnad/README.md）。
 
+`--algo mmd` で学習器を Ataraxos 型（PPO の比クリップ ＋ 磁石への KL。rnad/mmd.py）に替える（既定は R-NaD のまま）。
+R-NaD の checkpoint から続けるなら `--init <checkpoint.pt> --init-which both --init-step`（tsuitate-bot の
+docs/rl-learning-speed.md 10節）。
+
 記録: <out>/log.jsonl（更新ごと・評価ごとに1行）、<out>/checkpoint.pt、<out>/policy_<step>.bin
 """
 
 import argparse
 import copy
+import hashlib
 import json
 import math
 import pathlib
@@ -34,6 +39,9 @@ from guard import summarize as summarize_guard
 from speed import summarize as summarize_speed
 from model import NUM_PLANES, PolicyValueNet
 from league import League
+from mmd import PRESETS as MMD_PRESETS
+from mmd import MMDLearner
+from mmd import make_config as make_mmd_config
 from rnad import (PRECISIONS, MultiEnv, OpponentPool, PipelinedCollector, RNaDConfig, RNaDLearner, cfg_diff,
                   collect, play_match, set_precision)
 
@@ -64,6 +72,8 @@ def load_net(path: str, channels: int, blocks: int, which: str = "target", plane
         net = PolicyValueNet(channels, blocks)
     else:
         raise SystemExit(f"{path} は checkpoint として読めない")
+    if "state_dict" not in ck and which not in ck:
+        raise SystemExit(f"{path} に {which} が無い")
     net.load_state_dict(ck["state_dict"] if "state_dict" in ck else ck[which])
     return net
 
@@ -98,6 +108,72 @@ def save_checkpoint(learner, path: pathlib.Path) -> None:
     tmp = path.with_suffix(".tmp")
     torch.save(learner.state_dict(), tmp)
     tmp.replace(path)
+
+
+# R-NaD だけの設定（--algo mmd で既定以外なら止める。黙って無視すると取り違える）
+RNAD_ONLY = ("lr", "eta", "beta", "neurd_clip", "inv_mu_cap", "policy_loss", "c_vtrace", "c_ply", "schedule",
+             "schedule_start", "adam_b1")
+
+
+def _floats4(spec, name):
+    if spec is None:
+        return None
+    vals = tuple(float(x) for x in spec.split(","))
+    if len(vals) != 4:
+        raise SystemExit(f"--{name} は 'coef,decay,ceil,floor' の4つ")
+    return vals
+
+
+def check_algo_args(ap, args):
+    """--algo と、学習器ごとの設定の組み合わせを検査する。MMD なら MMDConfig を返す（R-NaD なら None）"""
+    mmd_given = sorted(k for k, v in vars(args).items() if k.startswith("mmd_") and k != "mmd_preset" and v is not None)
+    if args.algo == "rnad":
+        if mmd_given or args.mmd_preset != "tsuitate" or args.init_which != "target" or args.init_step:
+            raise SystemExit("--mmd-* / --init-which / --init-step は --algo mmd のときだけ使う")
+        return None
+    if not args.compact_legal:
+        raise SystemExit("--algo mmd は --compact-legal と一緒に使う（収集方策の対数確率を合法手の添字の並びで持つ）")
+    bad = [f for f, on in (("--fused", args.fused), ("--reuse", args.reuse != 1), ("--lr-sched", args.lr_sched),
+                           ("--tail-avg", args.tail_avg), ("--league", args.league), ("--nyugyoku", args.nyugyoku),
+                           ("--guard", args.guard), ("--speed", args.speed), ("--aux-truth", args.aux_truth > 0)) if on]
+    bad += ["--" + k.replace("_", "-") for k in RNAD_ONLY if getattr(args, k) != ap.get_default(k)]
+    if bad:
+        raise SystemExit(f"--algo mmd では使えない: {' '.join(bad)}（学習率は --mmd-lr、1つの batch を何周するかは "
+                         "--mmd-epochs。自己対局だけ・ボーナスなしで使う。docs/rl-learning-speed.md 10節）")
+    try:
+        return make_mmd_config(
+            args.mmd_preset, filter=args.mmd_filter, value_rows=args.mmd_value_rows, filt_window=args.mmd_filt_window,
+            pol_scale=args.mmd_pol_scale, clip=args.mmd_clip, kl=args.mmd_kl,
+            decoupled=None if args.mmd_decoupled is None else args.mmd_decoupled == "on",
+            prox_cap=args.mmd_prox_cap, vf=args.mmd_vf, gae_lambda=args.mmd_gae_lambda, td_lambda=args.mmd_td_lambda,
+            lambda_unit=args.mmd_lambda_unit, magnet=args.mmd_magnet, magnet_avg=args.mmd_magnet_avg,
+            temp=_floats4(args.mmd_temp, "mmd-temp"),
+            temp_t_off=args.mmd_temp_t_off, lr=_floats4(args.mmd_lr, "mmd-lr"), lr_t_off=args.mmd_lr_t_off,
+            t_scale=args.mmd_t_scale, steps=args.mmd_steps, chunk=args.mmd_chunk, epochs=args.mmd_epochs,
+            max_grad_norm=args.mmd_max_grad_norm, adam_b1=args.mmd_adam_b1, value_warmup=args.mmd_value_warmup,
+            target_avg=args.target_avg)
+    except ValueError as e:
+        raise SystemExit(f"MMD の設定: {e}") from e
+
+
+def start_mmd_from_init(learner, args):
+    """--init の checkpoint から MMD を始める（--init-which both なら net ← 現在のネット、ターゲットと磁石 ← ターゲット。
+    --init-step なら step の番号を続ける）。Adam の状態・正則化方策・乱数状態は持ち込まない"""
+    ick = torch.load(args.init, map_location="cpu")
+    step = int(ick.get("step", 0)) if args.init_step else 0
+    if args.init_step and "step" not in ick:
+        raise SystemExit(f"{args.init} に step が無い（--init-step は R-NaD / MMD の checkpoint に使う）")
+    if args.init_which == "both":
+        if "net" not in ick or "target" not in ick:
+            raise SystemExit(f"{args.init} に net と target が無い（--init-which both は R-NaD / MMD の checkpoint に使う）")
+        net_sd, target_sd = ick["net"], ick["target"]
+    else:
+        net_sd = target_sd = learner.net.state_dict()
+    sha = hashlib.sha256(pathlib.Path(args.init).read_bytes()).hexdigest()
+    learner.start_from(net_sd, target_sd, step,
+                       source={"path": str(args.init), "step": ick.get("step"), "which": args.init_which,
+                               "algo": ick.get("algo", "rnad" if "prev" in ick else "bc"), "sha256": sha})
+    print(f"MMD を {args.init}（{args.init_which}、step {ick.get('step')}）から始める。番号は step {step} から", flush=True)
 
 
 def main() -> None:
@@ -226,7 +302,8 @@ def main() -> None:
                          "（2次モーメントが古い勾配の大きさを b2 = 0.999 で何千更新も覚えているため）")
     ap.add_argument("--lr-warmup", type=int, default=0,
                     help="この実行の最初の N 更新で学習率を 0 から線形に上げる（--reset-adam の直後の2次モーメントは"
-                         "数回分の勾配だけから推定されて揺れるため）")
+                         "数回分の勾配だけから推定されて揺れるため）。--algo mmd では MMD を始めた step から数え"
+                         "（--reset-adam を付けた実行はその頭から）、--mmd-value-warmup があれば温めが終わった step から数え直す")
     ap.add_argument("--compact-legal", action="store_true",
                     help="batch の合法手のマスクを添字で持つ（768局で約 0.79GB → 約 11MB。更新の結果は同じ。"
                          "--pipeline で batch が2つ同時にあるときのメモリ対策）")
@@ -248,6 +325,52 @@ def main() -> None:
                     help="1回目の現在のネットの順伝播を2回目へまとめる（決定点あたり順伝播1回分が減る。結果は同じ。"
                          "--league-device gpu とは使えない。勾配をチャンクごとに取っておくので GPU のメモリを約130MB 使う。"
                          "v-trace を CPU でチャンクごとに進めるので、--device-batch と併用してもチャンクごとに1回の同期は残る）")
+    # ---- 学習器（docs/rl-learning-speed.md 10節）。既定は R-NaD のまま
+    ap.add_argument("--algo", choices=["rnad", "mmd"], default="rnad",
+                    help="rnad = R-NaD（従来）/ mmd = Ataraxos 型（PPO の比クリップ ＋ 近い方策と磁石への KL。rnad/mmd.py）。"
+                         "mmd は自己対局だけ・ボーナスなし・--compact-legal が要る")
+    ap.add_argument("--init-which", choices=["target", "net", "both"], default="target",
+                    help="（--algo mmd）--init の checkpoint のどのネットから始めるか。target = ターゲット（従来と同じ）/ "
+                         "net = 現在のネット / both = 現在のネットを学び、ターゲットと磁石はターゲットから（R-NaD の続きにする推奨）")
+    ap.add_argument("--init-step", action="store_true",
+                    help="（--algo mmd）--init の checkpoint の step から番号を続ける（書き出しの名前とパネルの横軸が本線とそろう）。"
+                         "温度・学習率の予定と --lr-warmup はこの step から数える")
+    mg = ap.add_argument_group("MMD（--algo mmd のときだけ。指定しなければ --mmd-preset の値）")
+    mg.add_argument("--mmd-preset", choices=list(MMD_PRESETS), default="tsuitate",
+                    help="tsuitate = 本線向けの既定（pps 0.5・動く磁石〔ターゲット〕・温度 0.05 固定・λ_A 0.5・1更新 4歩・学習率固定）/ "
+                         "mixinit = 設計の初版（pps 0.25・始めの方策の固定の混合磁石・温度を下げる・λ_A 0.8・8歩。代理で崩れた形）/ "
+                         "ataraxos = Ataraxos のコードの既定（|A| の 75%%点で切る・一様な磁石・λ_A 0.5・8歩・学習率も下げる）")
+    mg.add_argument("--mmd-filter", default=None,
+                    help="方策の行の選び方: pps:<割合>[,floor=<下限>] / quantile:<分位>[,min=<下限>] / topk:<割合> / none")
+    mg.add_argument("--mmd-value-rows", default=None, help="価値の行: auto / all / filtered / uniform:<割合>")
+    mg.add_argument("--mmd-filt-window", type=int, default=None, help="quantile の分位点に入れる過去の更新の数")
+    mg.add_argument("--mmd-pol-scale", type=float, default=None, help="方策の項の倍率")
+    mg.add_argument("--mmd-clip", type=float, default=None, help="比のクリップ ε")
+    mg.add_argument("--mmd-kl", type=float, default=None, help="近い方策（pipeline なしなら収集方策）への逆KL の係数")
+    mg.add_argument("--mmd-decoupled", choices=["on", "off"], default=None,
+                    help="--pipeline でクリップと KL の中心を更新の頭の方策にする（decoupled PPO）")
+    mg.add_argument("--mmd-prox-cap", type=float, default=None, help="decoupled の外側の重要度の上限")
+    mg.add_argument("--mmd-vf", type=float, default=None, help="価値の損失の係数")
+    mg.add_argument("--mmd-gae-lambda", type=float, default=None, help="アドバンテージ（GAE）の λ")
+    mg.add_argument("--mmd-td-lambda", type=float, default=None, help="価値の目標（TD(λ)）の λ")
+    mg.add_argument("--mmd-lambda-unit", choices=["attempt", "turn"], default=None,
+                    help="λ をかける単位（attempt = 反則の試行も1回 / turn = 受理された手ごと）")
+    mg.add_argument("--mmd-magnet", default=None, help="磁石: mix:init,<ε> / mix:target,<ε> / uniform / target")
+    mg.add_argument("--mmd-magnet-avg", type=float, default=None,
+                    help="動く磁石の EMA の係数（0 = 書き出しのターゲット〔--target-avg〕をそのまま磁石にする）")
+    mg.add_argument("--mmd-temp", default=None, help="温度（磁石への KL の係数）の予定 'coef,decay,ceil,floor'")
+    mg.add_argument("--mmd-temp-t-off", type=float, default=None, help="温度の予定の起点のずらし")
+    mg.add_argument("--mmd-lr", default=None,
+                    help="学習率の予定 'coef,decay,ceil,floor'（clip(coef/(t+1)^decay, floor, ceil)。固定なら '<lr>,0,<lr>,<lr>'）")
+    mg.add_argument("--mmd-lr-t-off", type=float, default=None, help="学習率の予定の起点のずらし")
+    mg.add_argument("--mmd-t-scale", type=float, default=None, help="予定の t の刻み（t = MMD の更新回数 × これ）")
+    mg.add_argument("--mmd-steps", type=int, default=None, help="1更新の Adam の歩数（残した行を k 等分）")
+    mg.add_argument("--mmd-chunk", type=int, default=None, help="逆伝播のチャンク（勾配を足してから1歩）")
+    mg.add_argument("--mmd-epochs", type=int, default=None, help="残した行を何周するか")
+    mg.add_argument("--mmd-max-grad-norm", type=float, default=None, help="勾配ノルムのクリップ（0 = なし）")
+    mg.add_argument("--mmd-adam-b1", type=float, default=None, help="Adam の β1（R-NaD の --adam-b1 とは別）")
+    mg.add_argument("--mmd-value-warmup", type=int, default=None,
+                    help="最初の N 更新は価値の頭だけを全行で学ぶ（幹と方策は止める）")
     ap.add_argument("--threads", type=int, default=0, help="torch のスレッド数（0 = 既定）")
     ap.add_argument("--planes", type=int, default=NUM_PLANES,
                     help="--init none のときの入力のプレーン数（86 = v1 / 91 = v2 確定事実つき）")
@@ -265,8 +388,9 @@ def main() -> None:
     if args.fast_collect == "rust" and not hasattr(tsuitate_rl.VecEnv, "observe_alive_f16_csr"):
         raise SystemExit("--fast-collect rust には VecEnv.observe_alive_f16_csr が要る（tsuitate-bot の rl-env を "
                          "maturin develop で作り直す）")
-    if args.device_batch and not (args.packed and args.compact_legal):
-        raise SystemExit("--device-batch は --packed --compact-legal と一緒に使う")
+    if args.device_batch and not (args.compact_legal and (args.packed or args.algo == "mmd")):
+        raise SystemExit("--device-batch は --packed --compact-legal と一緒に使う（--algo mmd は --compact-legal だけ）")
+    mcfg = check_algo_args(ap, args)
     if args.fused and args.league and args.league_device == "gpu":
         raise SystemExit("--fused は --league-device gpu とは使えない（相手の手番が batch の隙間になる）")
     if args.threads:
@@ -317,13 +441,25 @@ def main() -> None:
         raise SystemExit("--eval-games は偶数にする（先後を同数にするため）")
     ck_path = out / "checkpoint.pt"
     ck = torch.load(ck_path, map_location=device) if ck_path.exists() else None
+    if ck is not None and ck.get("algo", "rnad") != args.algo:
+        raise SystemExit(f"{ck_path} は --algo {ck.get('algo', 'rnad')} の checkpoint（今は --algo {args.algo}）。"
+                         "別の学習器として黙って再開しない")
     if ck is not None and "config" in ck:
         # 再開: ネットの形は checkpoint から（--init には依存しない）
         init_net = PolicyValueNet(ck["config"]["channels"], ck["config"]["blocks"], ck["config"]["planes"])
+        if args.algo == "mmd" and (args.init_which != "target" or args.init_step):
+            print("checkpoint から再開するので --init / --init-which / --init-step は使わない", flush=True)
     else:
-        init_net = load_net(args.init, args.channels, args.blocks, planes=args.planes)
-    learner = RNaDLearner(init_net, cfg, device, packed=args.packed, device_batch=args.device_batch,
-                          fused=args.fused)
+        init_net = load_net(args.init, args.channels, args.blocks, planes=args.planes,
+                            which=("net" if args.init_which in ("net", "both") else "target"))
+    if args.algo == "mmd":
+        learner = MMDLearner(init_net, mcfg, device, seed=args.seed, device_batch=args.device_batch,
+                             stale_actor=args.pipeline)
+        if ck is None and args.init != "none":
+            start_mmd_from_init(learner, args)
+    else:
+        learner = RNaDLearner(init_net, cfg, device, packed=args.packed, device_batch=args.device_batch,
+                              fused=args.fused)
     # 観測のプレーン数は学習するネットの形で決まる（v2 = 確定事実のプレーンつきの checkpoint は
     # widen_planes.py で作る）。錨・リーグの相手が v1 のネットでも、v2 の観測の先頭が v1 なので読める
     # （PolicyValueNet.trunk が切る）。v1 のときは引数を渡さない（planes の無い古い tsuitate_rl でも動くように）
@@ -331,21 +467,30 @@ def main() -> None:
     anchor = load_net(args.anchor, args.channels, args.blocks, planes=init_net.config["planes"]).to(device).eval()
     eval_gen = torch.Generator(device=device)
     eval_gen.manual_seed(args.seed + 20_000)
-    record = {"args": vars(args), "rnad": dict(cfg.__dict__), "net": learner.net.config}
+    learner_cfg = mcfg if args.algo == "mmd" else cfg
+    record = {"args": vars(args), "net": learner.net.config,
+              **({"mmd": dict(mcfg.__dict__), "init_from": learner.init_from} if args.algo == "mmd"
+                 else {"rnad": dict(cfg.__dict__)})}
     if ck is not None:
-        diff = cfg_diff(ck["cfg"], cfg)
+        diff = cfg_diff(ck["cfg"], learner_cfg)
         if diff and not args.override_config:
             raise SystemExit(f"checkpoint と設定が違う: {diff}（(保存, 今)）。"
                              "意図した変更なら --override-config を付ける")
         learner.load_state_dict(ck)
+        if args.algo == "mmd":
+            record["init_from"] = learner.init_from  # checkpoint から戻した値（record を作った時点ではまだ None）
         if args.reseed:
             torch.manual_seed(args.seed)
             if device.type == "cuda":
                 torch.cuda.manual_seed_all(args.seed)
+            if args.algo == "mmd":
+                learner.reseed(args.seed)
             print(f"乱数を --seed {args.seed} で作り直した（checkpoint の乱数状態は使わない）", flush=True)
         if diff:
-            learner.apply_cfg(cfg)
+            learner.apply_cfg(learner_cfg, **({"old": ck["cfg"]} if args.algo == "mmd" else {}))
             print(f"再開時に設定を上書き: {diff}")
+        elif args.algo == "mmd":
+            pass  # MMD の学習率は毎更新で予定から入れ直す
         else:
             # 学習率は optimizer の状態として checkpoint に入るので、--lr-warmup / --lr-sched で下げた値のまま止めた run を
             # そのフラグなしで再開すると、下がった学習率が黙って使われ続ける。設定の学習率へ戻す（フラグがあれば毎更新で上書き）
@@ -436,7 +581,9 @@ def main() -> None:
     if args.reset_adam:
         learner.reset_optimizer_state()
         print(f"Adam の状態を捨てた（step {learner.step_count} から）", flush=True)
-    warm_from = learner.step_count
+    # warmup の起点。MMD は MMD を始めた step（checkpoint に入る）から数えるので、同じコマンドで再開しても走り直さない。
+    # ただし --reset-adam で Adam を捨てたら、今の step から数え直す（R-NaD と同じく、その実行の頭で温め直す）
+    warm_from = learner.mmd_t0 if args.algo == "mmd" and not args.reset_adam else learner.step_count
 
     lr_min_frac = None
     if args.lr_sched:
@@ -446,6 +593,18 @@ def main() -> None:
         lr_min_frac = float(frac_s or 0.1)
 
     def set_warmup_lr():
+        if args.algo == "mmd":
+            # MMD は学習器が予定の学習率を毎更新で入れる。ここは warmup の倍率だけ。
+            # 価値の温め（--mmd-value-warmup）の間は価値の頭だけが Adam の歩を踏み、幹と方策の頭は温めの後に初めて踏む
+            # （Adam の状態が空のまま）ので、warmup は温めが終わった step から数え直す。価値の頭の学習率もそこで一度下がって
+            # 上がり直す（価値の頭の Adam はもう温まっているので害は小さい）。温めが 0 なら MMD を始めた step から数えるだけ。
+            # --reset-adam で温めの後から数え始めた実行は、温めの終わりをもう跨がないのでそのまま数える
+            t = learner.step_count - warm_from
+            policy_from = learner.mmd_t0 + learner.cfg.value_warmup  # 方策が動き始める step
+            if learner.cfg.value_warmup > 0 and warm_from < policy_from <= learner.step_count:
+                t = learner.step_count - policy_from
+            learner.lr_scale = min(1.0, (t + 1) / args.lr_warmup) if args.lr_warmup > 0 else 1.0
+            return
         lr = cfg.lr
         if lr_min_frac is not None:
             start, size = learner.schedule.position(learner.step_count)
@@ -491,7 +650,7 @@ def main() -> None:
         pipe = PipelinedCollector(
             lambda: tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False, **obs_kw), device,
             seed=args.seed * 1_000_003 + 17 + learner.step_count, compact_legal=args.compact_legal,
-            fast=args.fast_collect)
+            fast=args.fast_collect, actor_extras=args.algo == "mmd")
         pipe.submit(learner.net)
 
     # 学習には使わない追加の指数移動平均（--extra-ema）。現在のネットの写しを係数ごとに持つ
@@ -553,13 +712,13 @@ def main() -> None:
 
     if panel is not None and not (out / "panel_eval.jsonl").exists():
         panel_eval(learner.step_count)  # 起点（再開でも最初の1回は測る）
-    if learner.step_count == 0:
-        if args.eval_every:
-            evaluate(0)
-        if args.export_current:
-            # 学習前の点（speedlab の曲線の起点）
-            write_weights(learner.target, out / "policy_0.bin")
-            write_weights(learner.net, out / "current_0.bin")
+    if learner.step_count == 0 and args.eval_every:
+        evaluate(0)
+    if ck is None and args.export_current:
+        # 学習前の点（speedlab の曲線の起点）。--init-step で途中の番号から始めた run も、その番号で書く
+        # （起点を同じ指し方〔speedlab eval --decode〕で測り直せるように）
+        write_weights(learner.target, out / f"policy_{learner.step_count}.bin")
+        write_weights(learner.net, out / f"current_{learner.step_count}.bin")
     while learner.step_count < args.steps:
         t0 = time.time()
         lam = lam_at(learner.step_count)
@@ -604,7 +763,8 @@ def main() -> None:
                             nyugyoku_win_only=args.nyugyoku_cond == "win",
                             opponents=(None if league_games is None else [None] * n_self + league_games),
                             opp_nets=(opp_nets if league_games is not None else None),
-                            truth=cfg.aux_truth > 0, compact_legal=args.compact_legal, fast=args.fast_collect)
+                            truth=cfg.aux_truth > 0, compact_legal=args.compact_legal, fast=args.fast_collect,
+                            actor_extras=args.algo == "mmd")
             t1 = time.time()
             finished = env.pop_finished() if env is not None else []
             league_finished = league_env.pop_finished() if league_env is not None else []
@@ -677,6 +837,11 @@ def main() -> None:
               f"α {info['alpha']:.2f}{' [正則化更新]' if info['reg_update'] else ''} "
               f"{nyugyoku}(λ {lam}) "
               f"({t1 - t0:.1f}s + {t2 - t1:.1f}s)", flush=True)
+        if args.algo == "mmd" and info.get("minibatches"):
+            print(f"  MMD: 温度 {info['temperature']:.4f} 行 {info['rows_kept']}/{info['samples']} "
+                  f"KL(中心) {info['kl_prox_last']:.4f} 未使用の行の KL(μ) {info['kl_mu_unkept']:.4f} "
+                  f"clip {info['clip_frac']:.2f} |g| p50 {info['grad_norm_p50']:.2f}（クリップ {info['clip_rate']:.0%}）"
+                  f" エントロピー {info['entropy_mean']:.3f}", flush=True)
         if args.guard and crossed(step, 10):
             g = rec.get("guard_league") or rec.get("guard_self") or {}
             key = f"guard_r{args.guard_radius}"

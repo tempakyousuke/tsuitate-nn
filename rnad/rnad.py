@@ -875,7 +875,7 @@ def cfg_diff(saved: dict, cfg: RNaDConfig) -> dict:
     """checkpoint の設定と今の設定の差（tuple / list の違いは無視する）。
     checkpoint に無い項目（後から足した設定）は既定値だったものとして比べる"""
     now = cfg.__dict__
-    default = RNaDConfig().__dict__
+    default = type(cfg)().__dict__
     norm = lambda v: list(v) if isinstance(v, (tuple, list)) else v  # noqa: E731
     return {k: (saved.get(k, default[k]), now[k]) for k in now
             if norm(saved.get(k, default[k])) != norm(now[k])}
@@ -918,6 +918,18 @@ def sample_actions(net, obs, mask, device, generator=None):
     logits, _ = forward(net, x)
     legal = torch.from_numpy(mask).to(device, non_blocking=True)
     return _gumbel_sample(logits, legal, generator)
+
+
+@torch.no_grad()
+def _sample_actions_extras(net, obs, mask, device, generator=None):
+    """`sample_actions` と同じ手と確率（同じ乱数の消費）に加えて、行動したネットの価値と合法手全体の対数確率
+    （行ごとに行動番号の昇順でつなげた CSR の並び）を返す（`collect(actor_extras=True)`。MMD 学習器が使う）"""
+    x = torch.from_numpy(obs).to(device, non_blocking=True).half().float()
+    logits, v = forward(net, x)
+    legal = torch.from_numpy(mask).to(device, non_blocking=True)
+    a, mu = _gumbel_sample(logits, legal, generator)
+    lsm = logits.float().masked_fill(~legal, float("-inf")).log_softmax(-1)
+    return a, mu, v.float().cpu(), lsm[legal].cpu()
 
 
 def _gumbel_sample(logits, legal, generator):
@@ -1041,7 +1053,7 @@ class MultiEnv:
 
 def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode="enter",
             nyugyoku_zero_sum=True, opponents=None, opp_nets=None, nyugyoku_win_only=False, truth=False,
-            generator=None, compact_legal=False, fast=""):
+            generator=None, compact_legal=False, fast="", actor_extras=False):
     """`env`（auto_reset=False の VecEnv）の全局を1局ずつ最後まで自己対局し、学習用に並べる。
 
     戻り値の obs / legal / action / mu_a / t / b は有効なステップだけを平らにしたもの、
@@ -1088,10 +1100,16 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
     `generator` を渡すと学習側の手のサンプリングはその乱数列を使う（`PipelinedCollector` が別スレッドでも
     再現するように。渡さなければ従来どおり torch の大域の乱数）
 
+    `actor_extras=True` なら、学習側の各手番について**行動したネットの価値** `v_actor` [N] と**合法手全体の対数確率**
+    `mu_logp`（`legal_cols` と同じ CSR の並び）も返す（MMD 学習器〔`mmd.py`〕が使う。`compact_legal=True` に限り、
+    相手のネットに指させる局〔opponents〕とは使えない）。乱数は消費しないので、ほかのキーは付けないときと同じ
+
     `fast="py"` / `"rust"` は**同じ batch をビット単位で同じに作る、CPU の仕事を減らした経路**（`_collect_fast`。
     docs/rl-learning-speed.md「さらに速くする」の S1）。自己対局（opponents なし）・入玉ボーナスなし・truth なし・
     `compact_legal=True` に限る。"rust" は `VecEnv.observe_alive_f16_csr`（rl-env を作り直した tsuitate_rl）を使う
     """
+    if actor_extras and (not compact_legal or opponents is not None):
+        raise ValueError("collect(actor_extras=True) は compact_legal=True で、opponents なしに限る")
     if fast:
         if fast not in ("py", "rust"):
             raise ValueError(f"fast {fast!r}（'py' か 'rust'）")
@@ -1101,10 +1119,11 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
         if fast == "rust" and not all(hasattr(e, "observe_alive_f16_csr") for e in getattr(env, "envs", [env])):
             raise ValueError("collect(fast='rust') には VecEnv.observe_alive_f16_csr が要る（tsuitate-bot の rl-env を"
                              " maturin develop で作り直す）")
-        return _collect_fast(env, net, device, max_steps, generator, rust=fast == "rust")
+        return _collect_fast(env, net, device, max_steps, generator, rust=fast == "rust", extras=actor_extras)
     env.reset()
     B = env.num_envs
     obs_l, legal_l, act_l, mu_l, t_l, b_l, truth_l = [], [], [], [], [], [], []
+    v_l, lp_l = [], []  # actor_extras
     valid = torch.zeros(max_steps, B, dtype=torch.bool)
     player = torch.zeros(max_steps, B, dtype=torch.long)
     reward = torch.zeros(max_steps, B, 2)
@@ -1160,7 +1179,12 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
             last_act[b, p] = t
         actions = np.full(B, -1, dtype=np.int64)
         if len(idx):
-            a, mu = sample_actions(net, obs[idx], mask[idx], device, generator)
+            if actor_extras:
+                a, mu, v_a, lp_a = _sample_actions_extras(net, obs[idx], mask[idx], device, generator)
+                v_l.append(v_a)
+                lp_l.append(lp_a)
+            else:
+                a, mu = sample_actions(net, obs[idx], mask[idx], device, generator)
             actions[idx] = a.numpy()
         if opp_by:
             groups = {name: np.array(bs, dtype=np.int64) for name, bs in opp_by.items()}
@@ -1209,6 +1233,8 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
                 reward[t0, b, 1 - p] -= bonus
     T = t + 1
     extra = {"truth": torch.cat(truth_l)} if truth else {}
+    if actor_extras:
+        extra.update(v_actor=torch.cat(v_l), mu_logp=torch.cat(lp_l))
     return {**extra,
         **({"legal_cols": torch.cat([c for c, _ in legal_l]), "legal_counts": torch.cat([n for _, n in legal_l])}
            if compact_legal else {"legal": torch.cat(legal_l)}),
@@ -1220,7 +1246,7 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
 
 
 @torch.no_grad()
-def _collect_fast(env, net, device, max_steps, generator, rust):
+def _collect_fast(env, net, device, max_steps, generator, rust, extras=False):
     """`collect(..., compact_legal=True)`（自己対局・入玉ボーナスなし・truth なし）と**ビット単位で同じ batch** を返す。
 
     数式と乱数の消費の順は同じで、CPU の仕事だけを減らす（2026-10-24 の計測で、768局の収集の CPU 時間の半分が
@@ -1231,10 +1257,12 @@ def _collect_fast(env, net, device, max_steps, generator, rust):
       「float32 を送ってデバイスで .half().float()」と同じ。fp16 への丸めはどちらも最近接偶数）
     - 合法手の添字（CSR）を1回だけ作り、batch とデバイス上の密なマスク（scatter で作る。密なマスクを送らない）の両方に使う
     - 入玉・前進の記帳（λ=0 では entered / advance を付けるだけ）を局ごとの Python ループからベクトル演算にする
+    `extras` なら `collect(actor_extras=True)` と同じ `v_actor` / `mu_logp` も返す（乱数は消費しない）
     """
     env.reset()
     B = env.num_envs
     obs_l, cols_l, cnt_l, act_l, mu_l, t_l, b_l = [], [], [], [], [], [], []
+    v_l, lp_l = [], []
     valid = torch.zeros(max_steps, B, dtype=torch.bool)
     player = torch.zeros(max_steps, B, dtype=torch.long)
     reward = torch.zeros(max_steps, B, 2)
@@ -1271,12 +1299,17 @@ def _collect_fast(env, net, device, max_steps, generator, rust):
         entered[idx, p_sel] |= adv_now >= 6
         advance[idx, p_sel] = np.maximum(advance[idx, p_sel], adv_now)
 
-        logits, _ = forward(net, oh.to(device, non_blocking=True).float())
+        logits, v_a = forward(net, oh.to(device, non_blocking=True).float())
         rows = torch.repeat_interleave(torch.arange(n, device=device), counts32.to(device, non_blocking=True).long(),
                                        output_size=len(cols16))  # output_size が無いと CUDA で同期が入る
+        cols_d = cols16.to(device, non_blocking=True).long()
         legal = torch.zeros((n, NUM_ACTIONS), dtype=torch.bool, device=device)
-        legal[rows, cols16.to(device, non_blocking=True).long()] = True
+        legal[rows, cols_d] = True
         a, mu = _gumbel_sample(logits, legal, generator)
+        if extras:
+            lsm = logits.float().masked_fill(~legal, float("-inf")).log_softmax(-1)
+            v_l.append(v_a.float().cpu())
+            lp_l.append(lsm[rows, cols_d].cpu())
         actions = np.full(B, -1, dtype=np.int64)
         actions[idx] = a.numpy()
         rew, done = env.step(actions)
@@ -1295,6 +1328,7 @@ def _collect_fast(env, net, device, max_steps, generator, rust):
         raise RuntimeError(f"{max_steps} 手で終わらない局がある")
     T = t + 1
     return {
+        **({"v_actor": torch.cat(v_l), "mu_logp": torch.cat(lp_l)} if extras else {}),
         "legal_cols": torch.cat(cols_l), "legal_counts": torch.cat(cnt_l),
         "obs": torch.cat(obs_l), "action": torch.cat(act_l),
         "mu_a": torch.cat(mu_l), "t": torch.cat(t_l), "b": torch.cat(b_l),
