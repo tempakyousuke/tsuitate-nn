@@ -47,6 +47,8 @@ ARENA_MATCH_SEED=20260927 cargo run --release --bin arena -- 100 "rl_policy:<pol
 | `guard.py` | 防御特化（玉の周りの固め）の監視値の集計 |
 | `speedlab.py` | 学習の速さの比較: 固定パネル（`panel`）で run の書き出しを測り（`eval`、局ごとに鍵を決めた共通乱数）、腕ごとの学習曲線と対照とのペア差をまとめる（`report`）。締まりの効果を除いて比べるには `eval --decode greedy\|temp:<T>`（記録名 `<which>@greedy` など）、途中から始めた run の起点の書き出しは `export-ck`、起点を何度で指すと締まった腕にそろうかは `temp-match`（`--seed` を変えると別の局になる。パネルの評価の乱数は学習中のパネルの記録と対にするため変えない） |
 | `log_windows.py` | 学習ログ（log.jsonl）の見張りの値（エントロピー・π>0.999 の割合・手数・反則・磁石への KL など）を step の窓ごとに平均して並べる。MMD の中止の門の形の指標はこの 100更新の窓の平均で見る（中央値は締まりを小さく見せる） |
+| `openings.py` | 序盤の強制の定跡ブック（tsuitate-bot の `joseki.json` の形式）の読み込み・系統ごとの重み・env へ渡す引数・ログの監視値（`train_rnad.py --open-book`） |
+| `opening_eval.py` | 序盤の多様さ（`entropy`: 初期局面の方策・最初の k 手の並びのエントロピー）と、序盤を強制した対局（`robust`: 相手 / 自分 / 両者の序盤を定跡に強制したときの得点・接触の前の反則を系統ごとに） |
 | `gradsnr.py` | 学習なしの診断: 変種（クリップ・1/μ の上限・PG）ごとの局ごとの勾配の分散・期待勾配・雑音のスケール |
 | `bench_update.py` | 1更新の壁時計（従来 / `--packed` / 連続 / `--pipeline`）と、packed の勾配の一致。`--collect-arms` / `--update-arms` で `--fast-collect` / `--device-batch` / `--fused` を同じ batch・同じ乱数のペアで測り、結果がビット単位で同じかも出す（`--step` で α を選ぶ・`--precision`） |
 | `distill.py` | 方策ネットを小さいネットへ蒸留する（CPU の代理 P2 の出発点） |
@@ -161,6 +163,35 @@ R-NaD の checkpoint から続ける（net ← 現在のネット、ターゲッ
 - テスト: `tests/test_mmd.py`（λ-return と素直なループ・閉形式、extras の収集、Ataraxos の式の密な参照との損失と勾配、
   decoupled PPO、端から端の勾配、行の選び方の不偏性、予定、再開のビット一致、R-NaD の checkpoint からの始め方、
   止める組み合わせ、煙テスト）
+
+## 序盤の強制（`--open-book`）
+
+方策ネットの序盤は約40,000更新から飛車先の歩の速攻1本に固まり、ほかの手は確率 1e-18 まで落ちている（MMD の 138,000 では
+1e-8 まで戻ったが、自己対局で指されることはなく序盤は 100% 同じ）。
+自己対局の局ごと・**先後それぞれ独立に**確率 p で、その側の最初の数手を定跡のラインから指させ、どんな序盤から来ても
+ぶつかった後をうまく指すことを学ばせる。強制した手は env の中で指すので学習器から見ると環境の手で、R-NaD・MMD とも
+学習器は変えていない。設計と計測は tsuitate-bot の `docs/rl-opening-diversity.md`。
+
+```sh
+# tsuitate-bot の rl-env を入れ直してから（VecEnv の openings / opening_prob が要る）
+.venv/bin/python rnad/train_rnad.py ... --open-book ~/Develop/tsuitate-bot/joseki.json --open-p 0.25
+```
+
+- `--open-p`: 側ごとの確率（両者とも強制される局は p²）。`--open-len LO:HI`: 強制する手数を局ごとに一様に引く
+  （既定はラインを切った後の最後まで）。`--open-weight`: `category`（既定。系統ごとに同じ確率）/ `line`
+- 止める条件: どちらかの駒取り・王手（両者とも止める）・その側の反則・予定の手数。定跡の最後の駒取りの手は指させない
+  （初期配置の相手の駒に触れる手の手前で切る）
+- 使えない組み合わせ: `--league`・`--guard`・`--speed`・`--nyugyoku`・`--c-ply`・`--mmd-lambda-unit turn`。`--pipeline` は使える。
+  `--open-len` / `--open-weight` は `--open-book` と `--open-p` と一緒に使う（片方だけなら止める）。起動時に tsuitate_rl が
+  序盤の強制を知っているかを1局指して確かめる
+- 設定は checkpoint（`collect_cfg`）と `config.json` に残り、再開で `--open-*` を付け忘れると止まる（`--override-config` で通す）。
+  乱数は更新ごとの番号から作るので、再開しても同じ局に同じ定跡が付く
+- ログの `opening`: 強制した側の割合・平均の手数・止めた理由・両者とも強制した局の割合・最初の接触の手数・接触の前の反則・
+  序盤（各側の受理手 12 まで）の反則（`fouls_early_per_side`）・その batch の乱数列（`seed`。batch を使う step から作る）。
+  強制した側の序盤の局面は学習の行に入らないので、`pi_top_*` やエントロピーは強制しない run と直接は比べられない
+- 測る: `opening_eval.py entropy NAME=weights.bin ...`・`opening_eval.py robust --cand a.bin [--ref b.bin] --book joseki.json`
+- テスト: `tests/test_openings.py`（ブック・env の挙動と p = 0 がブックなしと同じ局・collect の不変量・再開のビット一致・
+  付け忘れの再開の停止・使えない組み合わせ）
 
 ## 防御特化（玉の周りの固め）モデル
 
