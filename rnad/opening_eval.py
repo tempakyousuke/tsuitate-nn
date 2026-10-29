@@ -177,6 +177,9 @@ def summarize_cell(rows):
 
 def cmd_robust(args):
     torch.set_num_threads(args.threads)
+    stale = openings.check_env_support()
+    if stale:
+        raise SystemExit(f"tsuitate_rl が序盤の強制を知らない（{stale}）。tsuitate-bot の rl-env を maturin develop で作り直す")
     if args.games % 2:
         raise SystemExit("--games は偶数（先後を同数にする）")
     cand = read_weights(args.cand).eval()

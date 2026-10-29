@@ -17,6 +17,10 @@ import json
 import math
 import pathlib
 
+import numpy as np
+
+import tsuitate_rl
+
 
 @dataclasses.dataclass
 class Book:
@@ -86,6 +90,23 @@ def parse_len(spec):
     if not 1 <= lo <= hi:
         raise ValueError(f"手数の範囲は 1 ≤ LO ≤ HI（{spec}）")
     return lo, hi
+
+
+def check_env_support():
+    """入っている tsuitate_rl が序盤の強制（と終局の記録の `fouls_early`）を知っているか。知らなければ理由を返す
+    （古いビルドは学習の最初の更新の後に KeyError で落ちるので、起動時に1局だけ指して確かめる）"""
+    if not hasattr(tsuitate_rl.VecEnv, "set_opening_seed"):
+        return "VecEnv に set_opening_seed が無い"
+    env = tsuitate_rl.VecEnv(1, seed=0, auto_reset=False, openings=[["7g7f"]], opening_prob=1.0)
+    for _ in range(600):
+        if not env.alive().any():
+            break
+        _, mask, _ = env.observe()
+        env.step(np.array([int(np.flatnonzero(mask[0])[0])], dtype=np.int64))
+    fin = env.pop_finished()
+    missing = [k for k in ("forced_moves", "forced_line", "forced_stop", "contact_ply", "fouls_precontact",
+                           "fouls_early") if fin and k not in fin[0]]
+    return f"終局の記録に {missing} が無い" if missing or not fin else None
 
 
 def summarize(finished):

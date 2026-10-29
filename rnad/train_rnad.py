@@ -425,8 +425,9 @@ def main() -> None:
             # 反則とみなすので、相手の強制した手をはさんだ手番を取り違える。c_ply は collect の行の番号で数えるので、
             # 強制した手（行にならない）のぶん手数がずれる
             raise SystemExit(f"序盤の強制は {' '.join(bad)} と一緒に使えない（自己対局だけ・ボーナスなし）")
-        if not hasattr(tsuitate_rl.VecEnv, "set_opening_seed"):
-            raise SystemExit("tsuitate_rl が序盤の強制を知らない。tsuitate-bot の rl-env を maturin develop で作り直す")
+        stale = openings.check_env_support()
+        if stale:
+            raise SystemExit(f"tsuitate_rl が序盤の強制を知らない（{stale}）。tsuitate-bot の rl-env を maturin develop で作り直す")
         try:
             book = openings.load_book(args.open_book, args.open_weight)
             open_len = openings.parse_len(args.open_len)

@@ -166,7 +166,8 @@ R-NaD の checkpoint から続ける（net ← 現在のネット、ターゲッ
 
 ## 序盤の強制（`--open-book`）
 
-方策ネットの序盤は約40,000更新から飛車先の歩の速攻1本に固まり、ほかの手は確率 1e-18 まで落ちている（MMD でも同じ）。
+方策ネットの序盤は約40,000更新から飛車先の歩の速攻1本に固まり、ほかの手は確率 1e-18 まで落ちている（MMD の 138,000 では
+1e-8 まで戻ったが、自己対局で指されることはなく序盤は 100% 同じ）。
 自己対局の局ごと・**先後それぞれ独立に**確率 p で、その側の最初の数手を定跡のラインから指させ、どんな序盤から来ても
 ぶつかった後をうまく指すことを学ばせる。強制した手は env の中で指すので学習器から見ると環境の手で、R-NaD・MMD とも
 学習器は変えていない。設計と計測は tsuitate-bot の `docs/rl-opening-diversity.md`。
@@ -180,10 +181,13 @@ R-NaD の checkpoint から続ける（net ← 現在のネット、ターゲッ
   （既定はラインを切った後の最後まで）。`--open-weight`: `category`（既定。系統ごとに同じ確率）/ `line`
 - 止める条件: どちらかの駒取り・王手（両者とも止める）・その側の反則・予定の手数。定跡の最後の駒取りの手は指させない
   （初期配置の相手の駒に触れる手の手前で切る）
-- 使えない組み合わせ: `--league`・`--guard`・`--speed`・`--nyugyoku`・`--mmd-lambda-unit turn`。`--pipeline` は使える
+- 使えない組み合わせ: `--league`・`--guard`・`--speed`・`--nyugyoku`・`--c-ply`・`--mmd-lambda-unit turn`。`--pipeline` は使える。
+  `--open-len` / `--open-weight` は `--open-book` と `--open-p` と一緒に使う（片方だけなら止める）。起動時に tsuitate_rl が
+  序盤の強制を知っているかを1局指して確かめる
 - 設定は checkpoint（`collect_cfg`）と `config.json` に残り、再開で `--open-*` を付け忘れると止まる（`--override-config` で通す）。
   乱数は更新ごとの番号から作るので、再開しても同じ局に同じ定跡が付く
-- ログの `opening`: 強制した側の割合・平均の手数・止めた理由・両者とも強制した局の割合・最初の接触の手数・接触の前の反則。
+- ログの `opening`: 強制した側の割合・平均の手数・止めた理由・両者とも強制した局の割合・最初の接触の手数・接触の前の反則・
+  序盤（各側の受理手 12 まで）の反則（`fouls_early_per_side`）・その batch の乱数列（`seed`。batch を使う step から作る）。
   強制した側の序盤の局面は学習の行に入らないので、`pi_top_*` やエントロピーは強制しない run と直接は比べられない
 - 測る: `opening_eval.py entropy NAME=weights.bin ...`・`opening_eval.py robust --cand a.bin [--ref b.bin] --book joseki.json`
 - テスト: `tests/test_openings.py`（ブック・env の挙動と p = 0 がブックなしと同じ局・collect の不変量・再開のビット一致・
