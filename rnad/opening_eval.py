@@ -5,7 +5,7 @@
 
     # 序盤を強制した対局。cand と ref（省略時は cand 自身）を先後入れ替えて指させ、
     # none（強制なし）/ opp（ref の側だけ強制）/ cand（cand の側だけ）/ both の条件ごと・定跡の系統ごとに
-    # cand の得点・接触の前の反則・最初の接触の手数を出す
+    # cand の得点・序盤（各側の受理手 12 まで）の反則・接触の前の反則・最初の接触の手数を出す
     python rnad/opening_eval.py robust --cand a.bin [--ref b.bin] --book ../tsuitate-bot/joseki.json --games 512
 
 どちらも CPU でよい（1局あたり数十手、512局で数十秒〜数分）。強制は tsuitate_rl.VecEnv の中で行うので、
@@ -151,6 +151,7 @@ def play_cell(cand, ref, games, seed, book, cond, length):
                 "cand_color": cand_color, "reason": f["reason"], "plies": f["plies"],
                 "fouls_cand": f["fouls"][cand_color], "fouls_opp": f["fouls"][o],
                 "pre_cand": f["fouls_precontact"][cand_color], "pre_opp": f["fouls_precontact"][o],
+                "early_cand": f["fouls_early"][cand_color], "early_opp": f["fouls_early"][o],
                 "contact_ply": f["contact_ply"],
                 "forced_cand": f["forced_moves"][cand_color], "forced_opp": f["forced_moves"][o],
             })
@@ -166,6 +167,8 @@ def summarize_cell(rows):
         "se": round(float(x.std(ddof=1) / math.sqrt(len(x))), 4) if len(x) > 1 else None,
         "fouls_cand": mean("fouls_cand"), "fouls_opp": mean("fouls_opp"),
         "precontact_fouls_cand": mean("pre_cand"), "precontact_fouls_opp": mean("pre_opp"),
+        # 各側の受理手が 12 に届くまでの反則（相手の序盤が変わったときの「いつもの形を前提にした手」はここに出る）
+        "early_fouls_cand": mean("early_cand"), "early_fouls_opp": mean("early_opp"),
         "contact_ply": round(float(np.mean(contact)), 1) if contact else None,
         "forced_cand": mean("forced_cand"), "forced_opp": mean("forced_opp"),
         "reasons": dict(collections.Counter(r["reason"] for r in rows).most_common()),

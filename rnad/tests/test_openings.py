@@ -62,6 +62,15 @@ def check_book(tmp):
             continue
         raise AssertionError(bad)
     assert openings.env_kwargs(book, 0.0) == {}
+    for bad, msg in [("{}", "ラインが無い"), ('{"lines": [{"moves": [1]}]}', "moves"),
+                     ('{"lines": [{"moves": ["7g7f"], "weight": -1}]}', "weight"), ("x", "JSON")]:
+        (tmp / "bad.json").write_text(bad)
+        try:
+            openings.load_book(tmp / "bad.json")
+        except ValueError as e:
+            assert msg in str(e), (bad, str(e))
+            continue
+        raise AssertionError(f"通ってしまった: {bad}")
     real = HERE.parents[2] / "tsuitate-bot" / "joseki.json"
     if real.exists():
         jb = openings.load_book(real)
@@ -114,6 +123,7 @@ def check_env(tmp):
         assert all(x is not None for x in f["forced_line"]), f
         assert all(s in ("contact", "length", "foul", "game_end") for s in f["forced_stop"]), f["forced_stop"]
         assert len(f["fouls_precontact"]) == 2 and (f["contact_ply"] is None or f["contact_ply"] >= 1)
+        assert all(e <= t for e, t in zip(f["fouls_early"], f["fouls"])), f
     # 片側だけ（後手）
     env = tsuitate_rl.VecEnv(n, seed=3, auto_reset=False, planes=91, **openings.env_kwargs(book, 1.0, sides="gote"))
     fm = env.forced_moves()
@@ -186,7 +196,7 @@ def check_collect(tmp):
     plies = sum(f["plies"] for f in fin)
     assert int(lengths.sum()) + forced == plies + fouls, (int(lengths.sum()), forced, plies, fouls)
     s = openings.summarize(fin)
-    assert 0 < s["forced_frac"] < 1 and s["forced_moves"] >= 1, s
+    assert 0 < s["forced_frac"] < 1 and s["forced_moves"] >= 1 and "fouls_early_per_side" in s, s
     print(f"C1 collect: 行は隙間なし・記録 {len(fin)} 局・報酬の和 = 結果・学習の行 + 強制した手 = 受理手 + 反則"
           f"（強制した側 {s['forced_frac']:.0%}、平均 {s['forced_moves']:.1f} 手）")
 
@@ -220,6 +230,8 @@ def check_train(tmp):
     for k in ca["net"]:
         assert torch.equal(ca["net"][k], cb["net"][k]), k
     assert ca["collect_cfg"]["opening"]["p"] == 0.5 and ca["collect_cfg"]["opening"]["len"] == [1, 4]
+    # 各更新の batch は「その更新の step」の乱数列で集める（ログの step は更新の後の番号）
+    assert [x["opening"]["seed"] for x in la] == [3 * 1_000_003 + 29 + x["step"] - 1 for x in la]
     cfg = json.loads((tmp / "straight" / "config.json").read_text())
     assert cfg["opening"]["book_sha256"] == openings.load_book(book).sha256
 
@@ -230,6 +242,15 @@ def check_train(tmp):
     rec = json.loads((tmp / "resumed" / "config_resume_4.json").read_text())
     assert rec["overridden"]["opening"][1] is None and "opening" not in json.loads(
         (tmp / "resumed" / "log.jsonl").read_text().splitlines()[-1])
+
+    # --pipeline でも、batch は使う step の乱数列で集める（最初の2つが同じ乱数列にならない）。再開しても同じ
+    pipe = [*common, "--pipeline", "--compact-legal", "--fast-collect", "py"]
+    run_train(tmp / "pipe", *pipe, steps=4)
+    run_train(tmp / "pipe_r", *pipe, steps=2)
+    run_train(tmp / "pipe_r", *pipe, steps=4)
+    for d in ("pipe", "pipe_r"):
+        lg = read_log(tmp / d / "log.jsonl")
+        assert [x["opening"]["seed"] for x in lg] == [3 * 1_000_003 + 29 + x["step"] - 1 for x in lg], d
 
     # 強制しない run の checkpoint には集め方の設定を足さない
     run_train(tmp / "off", "--seed", "3", steps=2)
@@ -242,7 +263,10 @@ def check_train(tmp):
         (["--open-book", str(book), "--open-p", "0.5", "--speed", "1.0"], "--speed"),
         (["--open-book", str(book), "--open-p", "0.5", "--nyugyoku", "1.0"], "--nyugyoku"),
         (["--open-book", str(book), "--open-p", "0.5", "--open-len", "0:3"], "手数"),
+        (["--open-book", str(book), "--open-p", "0.5", "--c-ply", "40:0.5"], "--c-ply"),
+        (["--open-len", "1:3"], "--open-book"),
         (["--open-book", str(tmp / "missing.json"), "--open-p", "0.5"], "序盤の強制"),
+        (["--open-book", str(tmp / "bad.json"), "--open-p", "0.5"], "JSON"),
     ]:
         r = run_train(tmp / "rej", *extra, steps=1, check=False)
         assert r.returncode != 0 and msg in (r.stderr + r.stdout), (extra, r.stderr[-500:])

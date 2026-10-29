@@ -14,6 +14,7 @@ import collections
 import dataclasses
 import hashlib
 import json
+import math
 import pathlib
 
 
@@ -38,11 +39,21 @@ def load_book(path, weight="category"):
     """`weight`: category = 系統ごとに同じ重み（系統の中は一様。ラインの数の多い系統に寄らない）/
     line = ラインごとに一様。どちらもラインに "weight" があればそれを掛ける"""
     raw = pathlib.Path(path).read_bytes()
-    data = json.loads(raw)
-    lines = data.get("lines") or []
-    if not lines:
-        raise ValueError(f"{path} にラインが無い")
-    moves = [list(map(str, line["moves"])) for line in lines]
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{path} を JSON として読めない: {e}") from e
+    lines = data.get("lines") if isinstance(data, dict) else None
+    if not isinstance(lines, list) or not lines:
+        raise ValueError(f"{path} にラインが無い（{{\"lines\": [{{\"moves\": [...]}}, ...]}} の形）")
+    for i, line in enumerate(lines):
+        if not isinstance(line, dict) or not isinstance(line.get("moves"), list) or not line["moves"] \
+                or not all(isinstance(m, str) for m in line["moves"]):
+            raise ValueError(f"{path} のライン {i}: moves が USI の文字列の並びでない")
+        w = line.get("weight", 1.0)
+        if isinstance(w, bool) or not isinstance(w, (int, float)) or not math.isfinite(w) or w < 0:
+            raise ValueError(f"{path} のライン {i}: weight は 0 以上の有限の数（{w!r}）")
+    moves = [list(line["moves"]) for line in lines]
     cats = [str(line.get("category", "?")) for line in lines]
     names = [str(line.get("name", "?")) for line in lines]
     base = [float(line.get("weight", 1.0)) for line in lines]
@@ -89,6 +100,8 @@ def summarize(finished):
         "both_forced_frac": (sum(1 for f in finished if all(x is not None for x in f["forced_line"]))
                              / max(len(finished), 1)),
         "fouls_precontact_per_side": (sum(sum(f["fouls_precontact"]) for f in finished) / max(2 * len(finished), 1)),
+        # 各側の受理手が 12 に届くまでの反則（速攻どうしは7〜8手目でぶつかるので、接触の前の反則はほぼ 0 になる）
+        "fouls_early_per_side": (sum(sum(f["fouls_early"]) for f in finished) / max(2 * len(finished), 1)),
     }
     if contact:
         out["contact_ply"] = sum(contact) / len(contact)

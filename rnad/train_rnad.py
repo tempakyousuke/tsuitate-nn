@@ -413,24 +413,25 @@ def main() -> None:
         raise SystemExit("--device-batch は --packed --compact-legal と一緒に使う（--algo mmd は --compact-legal だけ）")
     mcfg = check_algo_args(ap, args)
     open_kw, open_cfg = {}, None
-    if args.open_p or args.open_book:
+    if args.open_p or args.open_book or args.open_len or args.open_weight != "category":
         if not (0.0 < args.open_p <= 1.0) or not args.open_book:
-            raise SystemExit("序盤の強制は --open-book と --open-p（0 < p ≤ 1）を一緒に指定する")
+            raise SystemExit("序盤の強制は --open-book と --open-p（0 < p ≤ 1）を一緒に指定する"
+                             "（--open-len / --open-weight もこの2つと一緒に使う）")
         bad = [f for f, on in (("--league", args.league), ("--guard", args.guard), ("--speed", args.speed),
-                               ("--nyugyoku", args.nyugyoku),
+                               ("--nyugyoku", args.nyugyoku), ("--c-ply", args.c_ply),
                                ("--mmd-lambda-unit turn", mcfg is not None and mcfg.lambda_unit == "turn")) if on]
         if bad:
             # 強制した手で囲った形・延びた手数・玉の前進がボーナスに入る。turn は「同じ側が続けて指す」を
-            # 反則とみなすので、相手の強制した手をはさんだ手番を取り違える
+            # 反則とみなすので、相手の強制した手をはさんだ手番を取り違える。c_ply は collect の行の番号で数えるので、
+            # 強制した手（行にならない）のぶん手数がずれる
             raise SystemExit(f"序盤の強制は {' '.join(bad)} と一緒に使えない（自己対局だけ・ボーナスなし）")
+        if not hasattr(tsuitate_rl.VecEnv, "set_opening_seed"):
+            raise SystemExit("tsuitate_rl が序盤の強制を知らない。tsuitate-bot の rl-env を maturin develop で作り直す")
         try:
             book = openings.load_book(args.open_book, args.open_weight)
             open_len = openings.parse_len(args.open_len)
             open_kw = openings.env_kwargs(book, args.open_p, open_len)
-            tsuitate_rl.VecEnv(2, seed=0, auto_reset=False, **open_kw)
-        except TypeError as e:
-            raise SystemExit(f"tsuitate_rl が序盤の強制を知らない（{e}）。tsuitate-bot の rl-env を "
-                             "maturin develop で作り直す") from e
+            tsuitate_rl.VecEnv(2, seed=0, auto_reset=False, **open_kw)  # ラインの検査（不正なら ValueError）
         except (ValueError, OSError) as e:
             raise SystemExit(f"序盤の強制の設定: {e}") from e
         open_cfg = {"book_sha256": book.sha256, "lines": len(book.lines), "p": args.open_p,
@@ -702,7 +703,9 @@ def main() -> None:
             lambda: tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False, **obs_kw, **open_kw), device,
             seed=args.seed * 1_000_003 + 17 + learner.step_count, compact_legal=args.compact_legal,
             fast=args.fast_collect, actor_extras=args.algo == "mmd")
-        pipe.submit(learner.net, opening_seed=open_seed(args.seed, learner.step_count) if open_kw else None)
+        # 序盤の強制の乱数列は「その batch を使う step」で決める（ループの前に頼む batch は今の step で使う）
+        pipe_open_seed = open_seed(args.seed, learner.step_count) if open_kw else None
+        pipe.submit(learner.net, opening_seed=pipe_open_seed)
 
     # 学習には使わない追加の指数移動平均（--extra-ema）。現在のネットの写しを係数ごとに持つ
     extra_ema = {}
@@ -782,14 +785,19 @@ def main() -> None:
         if pipe is not None:
             # 前の反復で頼んだ batch（1更新前のネットで集めたもの）を受け取り、今のネットで次を頼む
             batch, finished, busy = pipe.result()
-            pipe.submit(learner.net, opening_seed=open_seed(args.seed, learner.step_count) if open_kw else None)
+            batch_open_seed = pipe_open_seed
+            # 次の batch はこの反復の更新（reuse 回）の後に使うので、その step の乱数列で集める
+            # （続けた run と再開した run で、同じ step の batch には同じ乱数列が付く）
+            pipe_open_seed = open_seed(args.seed, learner.step_count + args.reuse) if open_kw else None
+            pipe.submit(learner.net, opening_seed=pipe_open_seed)
             league_env = None
             league_finished = []
             t1 = time.time()
         else:
             envs = [env] if env is not None else []
+            batch_open_seed = open_seed(args.seed, learner.step_count) if open_kw else None
             if open_kw and env is not None:
-                env.set_opening_seed(open_seed(args.seed, learner.step_count))  # collect の reset から効く
+                env.set_opening_seed(batch_open_seed)  # collect の reset から効く
             league_env = None
             league_games = None  # --league-device gpu のときの局ごとの (相手, 学習側の色)
             if league is not None and n_league and args.league_device == "gpu":
@@ -879,7 +887,7 @@ def main() -> None:
         if open_kw and finished:
             # 序盤の強制の監視値（強制した側の割合・手数・やめた理由、最初の接触の手数、接触の前の反則）。
             # 強制した側の序盤の局面は学習の行に入らないので、pi_top_* やエントロピーは強制しない run と直接は比べられない
-            rec["opening"] = openings.summarize(finished)
+            rec["opening"] = {**openings.summarize(finished), "seed": batch_open_seed}
         if league is not None:
             # league_games = この更新の相手ごとの (勝, 負, 分)、league = 窓の勝率と次の配分の重み
             rec["league_games"] = league_rec
