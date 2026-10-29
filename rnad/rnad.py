@@ -1365,9 +1365,11 @@ class PipelinedCollector:
         self.generator.manual_seed(seed)
         self.stream = torch.cuda.Stream(device=device, priority=-1) if device.type == "cuda" else None
 
-    def _work(self, net, ready):
+    def _work(self, net, ready, opening_seed):
         if not hasattr(self.local, "env"):
             self.local.env = self.env_factory()
+        if opening_seed is not None:
+            self.local.env.set_opening_seed(opening_seed)  # 序盤の強制の乱数列（collect の reset から効く）
         t0 = time.time()
         if self.stream is None:
             batch = collect(self.local.env, net, self.device, generator=self.generator, **self.collect_kw)
@@ -1379,7 +1381,7 @@ class PipelinedCollector:
         finished = self.local.env.pop_finished()
         return batch, finished, time.time() - t0
 
-    def submit(self, net):
+    def submit(self, net, opening_seed=None):
         if self.future is not None:
             raise RuntimeError("前の batch を受け取る前に次を頼んだ")
         snap = copy.deepcopy(net).eval()
@@ -1388,7 +1390,7 @@ class PipelinedCollector:
         if self.stream is not None:
             ready = torch.cuda.Event()
             ready.record()  # 既定のストリーム上で写しを作り終えた印
-        self.future = self.pool.submit(self._work, snap, ready)
+        self.future = self.pool.submit(self._work, snap, ready, opening_seed)
 
     def result(self):
         """(batch, 終局した局, 集めるのにかかった秒)"""

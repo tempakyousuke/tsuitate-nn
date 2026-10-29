@@ -39,6 +39,7 @@ from guard import summarize as summarize_guard
 from speed import summarize as summarize_speed
 from model import NUM_PLANES, PolicyValueNet
 from league import League
+import openings
 from mmd import PRESETS as MMD_PRESETS
 from mmd import MMDLearner
 from mmd import make_config as make_mmd_config
@@ -103,11 +104,20 @@ def parse_lambda_schedule(spec: str, schedule: int):
     return at, max(lam for lam, _ in parts)
 
 
-def save_checkpoint(learner, path: pathlib.Path) -> None:
-    """書きかけで止められても前の checkpoint が壊れないよう、別名に書いてから置き換える"""
+def save_checkpoint(learner, path: pathlib.Path, collect_cfg=None) -> None:
+    """書きかけで止められても前の checkpoint が壊れないよう、別名に書いてから置き換える。
+    `collect_cfg` は集め方の設定（序盤の強制など。学習器の設定 cfg とは別に、再開時に食い違いを止める）で、
+    None なら書かない（既定の run の checkpoint は従来とビット単位で同じ）"""
     tmp = path.with_suffix(".tmp")
-    torch.save(learner.state_dict(), tmp)
+    state = learner.state_dict()
+    torch.save(state if collect_cfg is None else {**state, "collect_cfg": collect_cfg}, tmp)
     tmp.replace(path)
+
+
+def open_seed(seed, step):
+    """序盤の強制の乱数列（更新ごと。同じ step から再開すれば同じ局に同じ定跡が付く。リーグの相手の配分
+    `seed * 1_000_003 + step`・--pipeline の行動の乱数 `+ 17` とは別の列）"""
+    return seed * 1_000_003 + 29 + step
 
 
 # R-NaD だけの設定（--algo mmd で既定以外なら止める。黙って無視すると取り違える）
@@ -239,6 +249,17 @@ def main() -> None:
     ap.add_argument("--speed-sum", choices=["own", "zero"], default="own",
                     help="own = 勝った側だけに足す（非ゼロ和）/ zero = 負けた側から同じ額を引く（ゼロ和。"
                          "負けそうな側に「手数を延ばせ」という動機ができる）")
+    ap.add_argument("--open-book", default="",
+                    help="序盤の強制の定跡ブック（tsuitate-bot の joseki.json の形式）。自己対局の局ごと・先後それぞれ"
+                         "独立に確率 --open-p で、その側の最初の数手をこのラインから指させる（env の中で指すので学習器から"
+                         "見ると環境の手。tsuitate-bot の docs/rl-opening-diversity.md）")
+    ap.add_argument("--open-p", type=float, default=0.0,
+                    help="側ごとに序盤を強制する確率（0 = 強制しない。両者とも強制される局は p²）")
+    ap.add_argument("--open-len", default="",
+                    help="強制する手数の範囲 'LO:HI'（局ごとに一様に引く。空 = ラインを切った後の最後まで）。"
+                         "どれも駒がぶつかった時点（どちらかの駒取り・王手）で止める")
+    ap.add_argument("--open-weight", choices=["category", "line"], default="category",
+                    help="ラインの選び方（category = 系統ごとに同じ確率 / line = ラインごとに一様）")
     ap.add_argument("--league", default="",
                     help="リーグ学習の相手（カンマ区切り。tsuitate-bot の strategy::make の名前、例 "
                          "'rl_v15,rl_v16,rl_policy:/path/policy.bin'）。空 = 自己対局だけ")
@@ -391,6 +412,29 @@ def main() -> None:
     if args.device_batch and not (args.compact_legal and (args.packed or args.algo == "mmd")):
         raise SystemExit("--device-batch は --packed --compact-legal と一緒に使う（--algo mmd は --compact-legal だけ）")
     mcfg = check_algo_args(ap, args)
+    open_kw, open_cfg = {}, None
+    if args.open_p or args.open_book:
+        if not (0.0 < args.open_p <= 1.0) or not args.open_book:
+            raise SystemExit("序盤の強制は --open-book と --open-p（0 < p ≤ 1）を一緒に指定する")
+        bad = [f for f, on in (("--league", args.league), ("--guard", args.guard), ("--speed", args.speed),
+                               ("--nyugyoku", args.nyugyoku),
+                               ("--mmd-lambda-unit turn", mcfg is not None and mcfg.lambda_unit == "turn")) if on]
+        if bad:
+            # 強制した手で囲った形・延びた手数・玉の前進がボーナスに入る。turn は「同じ側が続けて指す」を
+            # 反則とみなすので、相手の強制した手をはさんだ手番を取り違える
+            raise SystemExit(f"序盤の強制は {' '.join(bad)} と一緒に使えない（自己対局だけ・ボーナスなし）")
+        try:
+            book = openings.load_book(args.open_book, args.open_weight)
+            open_len = openings.parse_len(args.open_len)
+            open_kw = openings.env_kwargs(book, args.open_p, open_len)
+            tsuitate_rl.VecEnv(2, seed=0, auto_reset=False, **open_kw)
+        except TypeError as e:
+            raise SystemExit(f"tsuitate_rl が序盤の強制を知らない（{e}）。tsuitate-bot の rl-env を "
+                             "maturin develop で作り直す") from e
+        except (ValueError, OSError) as e:
+            raise SystemExit(f"序盤の強制の設定: {e}") from e
+        open_cfg = {"book_sha256": book.sha256, "lines": len(book.lines), "p": args.open_p,
+                    "len": list(open_len) if open_len else None, "weight": args.open_weight}
     if args.fused and args.league and args.league_device == "gpu":
         raise SystemExit("--fused は --league-device gpu とは使えない（相手の手番が batch の隙間になる）")
     if args.threads:
@@ -471,8 +515,14 @@ def main() -> None:
     record = {"args": vars(args), "net": learner.net.config,
               **({"mmd": dict(mcfg.__dict__), "init_from": learner.init_from} if args.algo == "mmd"
                  else {"rnad": dict(cfg.__dict__)})}
+    if open_cfg is not None:
+        record["opening"] = open_cfg
     if ck is not None:
         diff = cfg_diff(ck["cfg"], learner_cfg)
+        # 集め方の設定（序盤の強制）。再開で --open-* を付け忘れると黙って強制が止まるので、学習器の設定と同じく止める
+        old_open = (ck.get("collect_cfg") or {}).get("opening")
+        if old_open != open_cfg:
+            diff["opening"] = (old_open, open_cfg)
         if diff and not args.override_config:
             raise SystemExit(f"checkpoint と設定が違う: {diff}（(保存, 今)）。"
                              "意図した変更なら --override-config を付ける")
@@ -487,8 +537,9 @@ def main() -> None:
                 learner.reseed(args.seed)
             print(f"乱数を --seed {args.seed} で作り直した（checkpoint の乱数状態は使わない）", flush=True)
         if diff:
-            learner.apply_cfg(learner_cfg, **({"old": ck["cfg"]} if args.algo == "mmd" else {}))
             print(f"再開時に設定を上書き: {diff}")
+        if set(diff) - {"opening"}:
+            learner.apply_cfg(learner_cfg, **({"old": ck["cfg"]} if args.algo == "mmd" else {}))
         elif args.algo == "mmd":
             pass  # MMD の学習率は毎更新で予定から入れ直す
         else:
@@ -542,13 +593,13 @@ def main() -> None:
     n_self = args.batch - n_league
     # 自己対局の env はボーナスの λ を作るときに決めるので、λ が変わったら作り直す（下のループ）
     env_bonus = (guard_at(learner.step_count), speed_at(learner.step_count))
-    env = (tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False, **env_kwargs(*env_bonus), **obs_kw)
+    env = (tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False, **env_kwargs(*env_bonus), **obs_kw, **open_kw)
            if n_self else None)
     eval_env = tsuitate_rl.VecEnv(args.eval_games, seed=args.seed + 10_000, auto_reset=False, **obs_kw)
     log = open(out / "log.jsonl", "a")
 
     def save_all():
-        save_checkpoint(learner, ck_path)
+        save_checkpoint(learner, ck_path, None if open_cfg is None else {"opening": open_cfg})
         if extra_ema:
             tmp = out / "extra_ema.tmp"
             torch.save({"step": learner.step_count, "nets": {str(t): n.state_dict() for t, n in extra_ema.items()}}, tmp)
@@ -648,10 +699,10 @@ def main() -> None:
         if league is not None or args.guard or args.speed or args.nyugyoku or cfg.aux_truth > 0:
             raise SystemExit("--pipeline は自己対局だけ・ボーナスなし・補助ヘッドなしの設定で使う")
         pipe = PipelinedCollector(
-            lambda: tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False, **obs_kw), device,
+            lambda: tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False, **obs_kw, **open_kw), device,
             seed=args.seed * 1_000_003 + 17 + learner.step_count, compact_legal=args.compact_legal,
             fast=args.fast_collect, actor_extras=args.algo == "mmd")
-        pipe.submit(learner.net)
+        pipe.submit(learner.net, opening_seed=open_seed(args.seed, learner.step_count) if open_kw else None)
 
     # 学習には使わない追加の指数移動平均（--extra-ema）。現在のネットの写しを係数ごとに持つ
     extra_ema = {}
@@ -726,17 +777,19 @@ def main() -> None:
         speed_lam = speed_at(learner.step_count)
         if env is not None and (guard_lam, speed_lam) != env_bonus:
             env = tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False,
-                                     **env_kwargs(guard_lam, speed_lam), **obs_kw)
+                                     **env_kwargs(guard_lam, speed_lam), **obs_kw, **open_kw)
             env_bonus = (guard_lam, speed_lam)
         if pipe is not None:
             # 前の反復で頼んだ batch（1更新前のネットで集めたもの）を受け取り、今のネットで次を頼む
             batch, finished, busy = pipe.result()
-            pipe.submit(learner.net)
+            pipe.submit(learner.net, opening_seed=open_seed(args.seed, learner.step_count) if open_kw else None)
             league_env = None
             league_finished = []
             t1 = time.time()
         else:
             envs = [env] if env is not None else []
+            if open_kw and env is not None:
+                env.set_opening_seed(open_seed(args.seed, learner.step_count))  # collect の reset から効く
             league_env = None
             league_games = None  # --league-device gpu のときの局ごとの (相手, 学習側の色)
             if league is not None and n_league and args.league_device == "gpu":
@@ -823,6 +876,10 @@ def main() -> None:
                 "nyugyoku_d": int((res == 0).sum()),
                 "king_advance_hist": np.bincount(batch["advance"][:n_self].ravel(), minlength=9).tolist(),
             })
+        if open_kw and finished:
+            # 序盤の強制の監視値（強制した側の割合・手数・やめた理由、最初の接触の手数、接触の前の反則）。
+            # 強制した側の序盤の局面は学習の行に入らないので、pi_top_* やエントロピーは強制しない run と直接は比べられない
+            rec["opening"] = openings.summarize(finished)
         if league is not None:
             # league_games = この更新の相手ごとの (勝, 負, 分)、league = 窓の勝率と次の配分の重み
             rec["league_games"] = league_rec
