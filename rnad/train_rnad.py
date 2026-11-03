@@ -41,6 +41,7 @@ from model import NUM_PLANES, PolicyValueNet
 from league import League
 import openings
 from mmd import PRESETS as MMD_PRESETS
+from mmd import LAMBDA_UNITS as MMD_LAMBDA_UNITS
 from mmd import MMDLearner
 from mmd import make_config as make_mmd_config
 from rnad import (PRECISIONS, MultiEnv, OpponentPool, PipelinedCollector, RNaDConfig, RNaDLearner, cfg_diff,
@@ -156,7 +157,8 @@ def check_algo_args(ap, args):
             pol_scale=args.mmd_pol_scale, clip=args.mmd_clip, kl=args.mmd_kl,
             decoupled=None if args.mmd_decoupled is None else args.mmd_decoupled == "on",
             prox_cap=args.mmd_prox_cap, vf=args.mmd_vf, gae_lambda=args.mmd_gae_lambda, td_lambda=args.mmd_td_lambda,
-            lambda_unit=args.mmd_lambda_unit, magnet=args.mmd_magnet, magnet_avg=args.mmd_magnet_avg,
+            lambda_unit=args.mmd_lambda_unit, gae_lambda_unit=args.mmd_gae_lambda_unit,
+            magnet=args.mmd_magnet, magnet_avg=args.mmd_magnet_avg,
             temp=_floats4(args.mmd_temp, "mmd-temp"),
             temp_t_off=args.mmd_temp_t_off, lr=_floats4(args.mmd_lr, "mmd-lr"), lr_t_off=args.mmd_lr_t_off,
             t_scale=args.mmd_t_scale, steps=args.mmd_steps, chunk=args.mmd_chunk, epochs=args.mmd_epochs,
@@ -374,8 +376,12 @@ def main() -> None:
     mg.add_argument("--mmd-vf", type=float, default=None, help="価値の損失の係数")
     mg.add_argument("--mmd-gae-lambda", type=float, default=None, help="アドバンテージ（GAE）の λ")
     mg.add_argument("--mmd-td-lambda", type=float, default=None, help="価値の目標（TD(λ)）の λ")
-    mg.add_argument("--mmd-lambda-unit", choices=["attempt", "turn"], default=None,
-                    help="λ をかける単位（attempt = 反則の試行も1回 / turn = 受理された手ごと）")
+    mg.add_argument("--mmd-lambda-unit", choices=list(MMD_LAMBDA_UNITS), default=None,
+                    help="λ をかける単位（attempt = 反則の試行も1回 / turn = 受理された手ごと / attempt+check = 自分が"
+                         "王手をかけた手では λ をかけない / turn+check = その両方）。GAE と価値の目標の両方に効く")
+    mg.add_argument("--mmd-gae-lambda-unit", choices=list(MMD_LAMBDA_UNITS), default=None,
+                    help="GAE（アドバンテージ）の側だけの λ の単位（既定 = --mmd-lambda-unit と同じ）。価値の目標は変えずに"
+                         "方策の責任の配り方だけを変える（tsuitate-bot の docs/rl-learning-speed.md 10.8）")
     mg.add_argument("--mmd-magnet", default=None, help="磁石: mix:init,<ε> / mix:target,<ε> / uniform / target")
     mg.add_argument("--mmd-magnet-avg", type=float, default=None,
                     help="動く磁石の EMA の係数（0 = 書き出しのターゲット〔--target-avg〕をそのまま磁石にする）")
@@ -419,10 +425,13 @@ def main() -> None:
                              "（--open-len / --open-weight もこの2つと一緒に使う）")
         bad = [f for f, on in (("--league", args.league), ("--guard", args.guard), ("--speed", args.speed),
                                ("--nyugyoku", args.nyugyoku), ("--c-ply", args.c_ply),
-                               ("--mmd-lambda-unit turn", mcfg is not None and mcfg.lambda_unit == "turn")) if on]
+                               ("--mmd-lambda-unit turn", mcfg is not None and mcfg.lambda_unit == "turn"),
+                               ("--mmd-gae-lambda-unit turn", mcfg is not None and mcfg.gae_lambda_unit == "turn"))
+               if on]
         if bad:
             # 強制した手で囲った形・延びた手数・玉の前進がボーナスに入る。turn は「同じ側が続けて指す」を
-            # 反則とみなすので、相手の強制した手をはさんだ手番を取り違える。c_ply は collect の行の番号で数えるので、
+            # 反則とみなすので、相手の強制した手をはさんだ手番を取り違える（turn+check は反則を観測から読むので
+            # 使える）。c_ply は collect の行の番号で数えるので、
             # 強制した手（行にならない）のぶん手数がずれる
             raise SystemExit(f"序盤の強制は {' '.join(bad)} と一緒に使えない（自己対局だけ・ボーナスなし）")
         stale = openings.check_env_support()

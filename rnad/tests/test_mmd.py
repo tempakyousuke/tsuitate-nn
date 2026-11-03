@@ -5,6 +5,10 @@
 - 手番側ごとの λ-return（`player_lambda_returns`）を、反則で同じ側が続く手番・途中の報酬・長さ1の局を含む合成格子で
   局ごと・プレイヤーごとの素直なループと突き合わせる（λ を試行ごと / 受理された手ごと）。λ=1・λ=0・反則の無い交互の列の
   閉形式（教科書どおりの Σλ^j·δ）とも合わせる
+- +check の単位（自分が王手をかけた手でも λ をかけない）: 観測のスカラーから読む反則・王手の印（`own_next_flags`）が、
+  序盤の強制で同じ側の行が続く合成格子でも真の印と一致し、λ-return が素直なループと一致する。実際の自己対局（強制なし・
+  あり）でも、印を別の観測（行の並び・累計の反則数・相手の次の行の「王手されている」）と突き合わせる。train_rnad.py の
+  `--mmd-gae-lambda-unit turn+check` が序盤の強制と一緒に回り、設定が checkpoint に残る
 - 収集の extras（`v_actor`・`mu_logp`）: 付けても既存のキーがビット単位で同じ。3経路（従来・py・rust）で extras が同じ。
   行ごとの Σexp = 1、選んだ手の exp(mu_logp) = μ、v_actor = 同じ観測での順伝播
 - CSR の行の拾い直し（`csr_positions`）が全体を詰めたものの同じ行と一致
@@ -102,6 +106,193 @@ def naive_returns(batch, v, lam, unit):
                     G = r + (1 - lj) * v_next + lj * G
                 out[flat[(t0, b)]] = G
     return out
+
+
+def synthetic_obs_batch(g, forced):
+    """`synthetic_batch` の形に、反則数・王手のスカラーだけを入れた観測 [N, 86, 1, 1] と真の印の格子を足したもの。
+    各側の決定点は「反則の確率 fp・受理された手は確率 0.3 で王手」。`forced` なら各側の最初の 0〜3手を行にしない
+    （序盤の強制。強制した手は受理されて王手でない）ので、同じ側の行が反則なしで続く。
+    戻り値の "foul_true" / "check_true" は行ごとの真の印 [T, B]（王手は受理された手だけ）"""
+    from mmd import FOULS_THIS_TURN_PLANE, GAVE_CHECK_LAST_PLANE
+    B = int(torch.randint(1, 10, (1,), generator=g))
+    fp = float(torch.rand(1, generator=g) * 0.5)
+    rnd = lambda: float(torch.rand(1, generator=g))  # noqa: E731
+    games = []
+    for b in range(B):
+        n_dec = int(torch.randint(1, 20, (1,), generator=g))
+        n_forced = [int(torch.randint(0, 4, (1,), generator=g)) if forced else 0 for _ in range(2)]
+        p = int(torch.randint(0, 2, (1,), generator=g))
+        ftt, gcl, accepted = 0, [False, False], [0, 0]
+        rows = []
+        for _ in range(n_dec):
+            is_forced = accepted[p] < n_forced[p]
+            foul = (not is_forced) and rnd() < fp
+            check = (not is_forced) and (not foul) and rnd() < 0.3
+            if not is_forced:
+                rows.append({"p": p, "foul": foul, "check": check, "ftt": ftt, "gcl": gcl[p]})
+            if foul:
+                ftt += 1
+            else:
+                gcl[p], ftt = check, 0
+                accepted[p] += 1
+                p = 1 - p
+        games.append(rows)
+    if not any(games):
+        games[0].append({"p": 0, "foul": False, "check": False, "ftt": 0, "gcl": False})
+    T = max(len(r) for r in games)
+    valid = torch.zeros(T, B, dtype=torch.bool)
+    player = torch.zeros(T, B, dtype=torch.long)
+    foul_true = torch.zeros(T, B, dtype=torch.bool)
+    check_true = torch.zeros(T, B, dtype=torch.bool)
+    for b, rows in enumerate(games):
+        for t, r in enumerate(rows):
+            valid[t, b] = True
+            player[t, b] = r["p"]
+            foul_true[t, b] = r["foul"]
+            check_true[t, b] = r["check"]
+    reward = torch.randn(T, B, 2, generator=g) * (torch.rand(T, B, 1, generator=g) < 0.3) * valid[..., None]
+    t_idx, b_idx = valid.nonzero(as_tuple=True)
+    obs = torch.zeros(len(t_idx), 86, 1, 1, dtype=torch.float16)
+    for i, (t, b) in enumerate(zip(t_idx.tolist(), b_idx.tolist())):
+        r = games[b][t]
+        obs[i, FOULS_THIS_TURN_PLANE] = r["ftt"] / 10
+        obs[i, GAVE_CHECK_LAST_PLANE] = float(r["gcl"])
+    return {"valid": valid, "player": player, "reward": reward, "t": t_idx, "b": b_idx, "obs": obs,
+            "foul_true": foul_true, "check_true": check_true}
+
+
+def has_next_own(batch):
+    """[T, B] の bool: 同じ局で同じ側の決定点がこの後にある"""
+    valid, player = batch["valid"], batch["player"]
+    T, B = valid.shape
+    out = torch.zeros(T, B, dtype=torch.bool)
+    for k in (0, 1):
+        seen = torch.zeros(B, dtype=torch.bool)
+        for t in range(T - 1, -1, -1):
+            mine = valid[t] & (player[t] == k)
+            out[t] |= mine & seen
+            seen |= mine
+    return out
+
+
+def naive_returns_skip(batch, v, lam, skip):
+    """`naive_returns` の λ_j を「skip[t_j, b] なら 1、それ以外は λ」にしたもの（反則は真の印で与える）"""
+    valid, player, reward = batch["valid"], batch["player"], batch["reward"]
+    flat = {(t, b): i for i, (t, b) in enumerate(zip(batch["t"].tolist(), batch["b"].tolist()))}
+    out = torch.zeros(len(flat), dtype=torch.float64)
+    for b in range(valid.shape[1]):
+        Tb = int(valid[:, b].sum())
+        for k in (0, 1):
+            ts = [t for t in range(Tb) if int(player[t, b]) == k]
+            G = None
+            for j in range(len(ts) - 1, -1, -1):
+                t0 = ts[j]
+                t1 = ts[j + 1] if j + 1 < len(ts) else Tb
+                r = float(reward[t0:t1, b, k].double().sum())
+                if j + 1 == len(ts):
+                    G = r
+                else:
+                    lj = 1.0 if bool(skip[t0, b]) else lam
+                    G = r + (1 - lj) * float(v[flat[(ts[j + 1], b)]]) + lj * G
+                out[flat[(t0, b)]] = G
+    return out
+
+
+def check_lambda_returns_check():
+    """+check の単位: 観測のスカラーから読む反則・王手の印（`own_next_flags`）が真の印と一致し（序盤の強制で同じ側の行が
+    反則なしで続いても）、λ-return が「その行だけ λ = 1」の素直なループと一致する"""
+    from mmd import foul_rows, own_next_flags
+    g = torch.Generator().manual_seed(17)
+    cases, worst, n_check, n_forced_mismatch = 0, 0.0, 0, 0
+    for trial in range(60):
+        forced = trial % 2 == 1
+        batch = synthetic_obs_batch(g, forced)
+        nxt = has_next_own(batch)
+        foul, check = own_next_flags(batch)
+        assert torch.equal(foul, batch["foul_true"] & nxt), f"反則の印が違う（試行 {trial}）"
+        assert torch.equal(check, batch["check_true"] & nxt), f"王手の印が違う（試行 {trial}）"
+        n_check += int(check.sum())
+        if forced:
+            n_forced_mismatch += int((foul_rows(batch["valid"], batch["player"]) != foul).sum())
+        v = torch.rand(len(batch["t"]), generator=g) * 2 - 1
+        for lam in (0.0, 0.5, 0.8, 1.0):
+            for unit, skip in (("attempt+check", batch["check_true"]),
+                               ("turn+check", batch["check_true"] | batch["foul_true"])):
+                got = player_lambda_returns(batch, v, lam, unit).double()
+                ref = naive_returns_skip(batch, v, lam, skip)
+                err = float((got - ref).abs().max()) if len(ref) else 0.0
+                worst = max(worst, err)
+                assert err <= 1e-5, f"λ-return が違う（試行 {trial}、λ {lam}、{unit}、差 {err:.2e}）"
+                cases += 1
+            if not forced:
+                # 強制なしなら turn+check の反則の側は turn と同じ。王手の無い batch では +check は元の単位と同じ
+                nocheck = {**batch, "_own_next_flags": (foul, torch.zeros_like(check))}
+                for base in ("attempt", "turn"):
+                    a = player_lambda_returns(nocheck, v, lam, base + "+check")
+                    b = player_lambda_returns(batch, v, lam, base)
+                    assert float((a - b).abs().max()) <= 1e-6, f"王手の無い {base}+check が {base} と違う"
+    assert n_check > 0 and n_forced_mismatch > 0, (n_check, n_forced_mismatch)
+    print(f"T1c +check の λ-return: 合成格子 {cases} 通りで素直なループと一致（最大差 {worst:.1e}）。観測から読む反則・王手の印は"
+          f"真の印と一致（王手 {n_check} 行。序盤の強制あり の格子で行の並びの反則判定 foul_rows は {n_forced_mismatch} 行を取り違える）")
+
+
+def check_own_flags_env(net):
+    """実際の自己対局（tsuitate_rl）で `own_next_flags` を別の観測と突き合わせる:
+    - 強制なし: 反則の印 = 行の並びの反則判定（foul_rows）、王手の印 = 相手の次の行の「王手されている」
+    - 序盤の強制あり: 反則の印 = 次の自分の決定点で累計の反則数（S_MY_FOULS）が増えた、王手の印 = 次の時刻が相手の行なら
+      その行の「王手されている」（強制した手が挟まるときは比べない）"""
+    from mmd import IN_CHECK_PLANE, foul_rows, own_next_flags
+    my_fouls_plane = 77
+    book = {"lines": [{"name": "速攻", "category": "居飛車", "moves": ["2g2f", "2f2e", "2e2d"]},
+                      {"name": "四間", "category": "振り飛車", "moves": ["7g7f", "6g6f", "2h6h", "5i4h"]}]}
+    with tempfile.TemporaryDirectory() as d:
+        path = pathlib.Path(d) / "book.json"
+        path.write_text(json.dumps(book, ensure_ascii=False))
+        import openings
+        bk = openings.load_book(path)
+    totals = {}
+    for forced in (False, True):
+        kw = openings.env_kwargs(bk, 0.75) if forced else {}
+        env = tsuitate_rl.VecEnv(24, seed=29, auto_reset=False, planes=91, **kw)
+        gen = torch.Generator().manual_seed(31)
+        batch = collect(env, net, DEV, generator=gen, compact_legal=True, actor_extras=True)
+        valid, player = batch["valid"], batch["player"]
+        T, B = valid.shape
+        t_idx, b_idx = batch["t"], batch["b"]
+        grid = lambda plane: torch.zeros(T, B).index_put_((t_idx, b_idx), batch["obs"][:, plane, 0, 0].float())  # noqa
+        in_check, my_fouls = grid(IN_CHECK_PLANE), grid(my_fouls_plane)
+        foul, check = own_next_flags(batch)
+        nxt_valid = torch.zeros_like(valid)
+        nxt_valid[:-1] = valid[1:]
+        nxt_player = torch.zeros_like(player)
+        nxt_player[:-1] = player[1:]
+        nxt_in_check = torch.zeros(T, B)
+        nxt_in_check[:-1] = in_check[1:]
+        opp_next = valid & nxt_valid & (nxt_player != player)
+        nxt = has_next_own(batch)
+        # 次の自分の決定点の累計反則数
+        nxt_fouls = torch.zeros(T, B)
+        for k in (0, 1):
+            cur = torch.zeros(B)
+            for t in range(T - 1, -1, -1):
+                mine = valid[t] & (player[t] == k)
+                nxt_fouls[t] = torch.where(mine, cur, nxt_fouls[t])
+                cur = torch.where(mine, my_fouls[t], cur)
+        ref_foul = nxt & (nxt_fouls > my_fouls + 1e-4)
+        assert torch.equal(foul, ref_foul), f"反則の印が累計の反則数の増え方と違う（強制 {forced}）"
+        if not forced:
+            assert torch.equal(foul, foul_rows(valid, player)), "強制なしで反則の印が foul_rows と違う"
+        cmp = opp_next & nxt & ~foul
+        assert torch.equal(check[cmp], nxt_in_check[cmp] > 0), f"王手の印が相手の次の行の「王手されている」と違う（強制 {forced}）"
+        assert not bool((check & foul).any())
+        totals[forced] = (int(valid.sum()), int(foul.sum()), int(check.sum()),
+                          int((foul_rows(valid, player) != foul).sum()))
+    assert all(v[1] > 0 and v[2] > 0 for v in totals.values()), totals
+    assert totals[True][3] > 0, "序盤の強制で同じ側の行が続く局が無い（検査が空振り）"
+    print("T2c 観測から読む反則・王手の印（実際の自己対局 24局ずつ）: "
+          + " / ".join(f"{'強制あり' if f else '強制なし'} 行 {n}・反則 {nf}・王手 {nc}"
+                       + (f"（行の並びの反則判定は {mm} 行を取り違える）" if f else "")
+                       for f, (n, nf, nc, mm) in totals.items()))
 
 
 def check_lambda_returns():
@@ -778,6 +969,44 @@ def check_rejects(tmp):
     print(f"T11 使えない組み合わせ: {len(cases) + 3} 通りとも起動時に止まる")
 
 
+def write_small_book(tmp):
+    path = tmp / "book.json"
+    path.write_text(json.dumps({"lines": [
+        {"name": "速攻", "category": "居飛車", "moves": ["2g2f", "2f2e", "2e2d"]},
+        {"name": "四間", "category": "振り飛車", "moves": ["7g7f", "6g6f", "2h6h", "5i4h"]}]}, ensure_ascii=False))
+    return str(path)
+
+
+def check_check_unit_train(tmp):
+    """train_rnad.py の配線: --mmd-gae-lambda-unit turn+check は序盤の強制と一緒に回り、ログに印の見張りが出て、設定が
+    checkpoint に残る（付けずに再開すると設定の差で止まる）。turn は序盤の強制と一緒に使えない"""
+    book = write_small_book(tmp)
+    out = tmp / "check_unit"
+    run_train(out, "--mmd-gae-lambda-unit", "turn+check", "--open-book", book, "--open-p", "0.5", "--pipeline",
+              "--fast-collect", "py", "--device-batch", "--mmd-chunk", "64", steps=3)
+    raw = [json.loads(line) for line in open(out / "log.jsonl") if line.strip()]
+    assert len(raw) == 3
+    for x in raw:
+        assert 0.0 <= x["lam_check_frac"] < 0.5 and 0.0 < x["lam_foul_frac"] < 1.0, x
+        assert math.isfinite(x["loss_nerd"]) and math.isfinite(x["loss_v"])
+    cfg = json.loads((out / "config.json").read_text())["mmd"]
+    assert cfg["gae_lambda_unit"] == "turn+check" and cfg["lambda_unit"] == "attempt", cfg
+    r = run_train(out, "--open-book", book, "--open-p", "0.5", "--pipeline", "--fast-collect", "py", "--device-batch",
+                  "--mmd-chunk", "64", steps=4, check=False)
+    assert r.returncode != 0 and "gae_lambda_unit" in r.stderr, r.stderr[-800:]
+    # 既定（付けない）なら見張りは出ない = 収集・損失は従来と同じ経路
+    run_train(tmp / "check_unit_off", "--mmd-chunk", "64", steps=1)
+    x = json.loads(open(tmp / "check_unit_off" / "log.jsonl").readline())
+    assert "lam_check_frac" not in x
+    for unit in ("turn",):
+        for flag in ("--mmd-lambda-unit", "--mmd-gae-lambda-unit"):
+            r = run_train(tmp / "rej_turn", flag, unit, "--open-book", book, "--open-p", "0.5", steps=1, check=False)
+            assert r.returncode != 0 and f"{flag} turn" in r.stderr, (flag, r.stderr[-500:])
+    print(f"T14 +check の配線: --mmd-gae-lambda-unit turn+check は序盤の強制と一緒に回り（王手の行 "
+          f"{sum(x['lam_check_frac'] for x in raw) / len(raw):.1%}・反則の行 {sum(x['lam_foul_frac'] for x in raw) / len(raw):.1%}）、"
+          "設定が checkpoint に残る。turn は序盤の強制と使えない")
+
+
 def check_smoke(tmp):
     """pipeline・fast py・device_batch で3つの preset を回し、NaN なし・ログのキーあり・stage_log.py が読める"""
     for preset in ("tsuitate", "mixinit", "ataraxos"):
@@ -806,9 +1035,11 @@ def check_smoke(tmp):
 if __name__ == "__main__":
     torch.set_num_threads(2)
     check_lambda_returns()
+    check_lambda_returns_check()
     check_selection()
     check_schedules()
     net0, batch = check_extras()
+    check_own_flags_env(net0)
     check_csr(batch)
     check_loss_dense(net0, batch)
     check_end_to_end(net0, batch)
@@ -823,4 +1054,5 @@ if __name__ == "__main__":
         check_override_magnet(tmp)
         check_init_from_rnad(tmp)
         check_rejects(tmp)
+        check_check_unit_train(tmp)
         check_smoke(tmp)
