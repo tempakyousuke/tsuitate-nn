@@ -125,7 +125,8 @@ R-NaD の checkpoint から続ける（net ← 現在のネット、ターゲッ
 | `--mmd-filter` | `pps:0.5,floor=0.05`（`mixinit` は 0.25） | `quantile:0.75,min=0.01` | 方策の行: `pps:<割合>[,floor=]` / `quantile:<分位>[,min=]` / `topk:<割合>`（ちょうどその割合、同値は乱数）/ `none` |
 | `--mmd-value-rows` | `auto` | `filtered` | 価値の行: `auto`（pps は方策と同じ行・重み、quantile は `uniform:0.25`）/ `all` / `uniform:<割合>` / `filtered` |
 | `--mmd-gae-lambda` / `--mmd-td-lambda` | 0.5 / 0.8（`mixinit` は 0.8 / 0.8） | 0.5 / 0.8 | A と価値の目標の λ |
-| `--mmd-lambda-unit` | `attempt` | 同じ | λ を試行ごと（反則も1回）/ `turn`（受理された手ごと） |
+| `--mmd-lambda-unit` | `attempt` | 同じ | λ を試行ごと（反則も1回）/ `turn`（受理された手ごと）/ `attempt+check`（自分が王手をかけた手では λ をかけない）/ `turn+check`（その両方）。+check は反則・王手を観測のスカラーから読む（`own_next_flags`）ので序盤の強制と使える |
+| `--mmd-gae-lambda-unit` | なし（= `--mmd-lambda-unit`） | 同じ | GAE（アドバンテージ）の側だけの単位。価値の目標は変えずに、詰まされた責任を王手の手で減らさずに手前へ届ける A/B 用（tsuitate-bot の docs/rl-learning-speed.md 10.8）。ログに `lam_check_frac` / `lam_foul_frac` / `adv_mean_check` が出る |
 | `--mmd-magnet` | `target`（`mixinit` は `mix:init,0.03`） | `uniform` | `mix:init,<ε>` / `mix:target,<ε>` / `uniform` / `target` |
 | `--mmd-magnet-avg` | 0 | 0 | 動く磁石（`target` / `mix:target`）の EMA の係数。0 = 書き出しのターゲット（`--target-avg`）をそのまま磁石にする |
 | `--mmd-temp` / `--mmd-temp-t-off` | `0.05,0,0.05,0.05`（固定）/ 0（`mixinit` は `0.05,0.3,0.1,0.001` / 2000） | `0.05,0.3,0.1,0.001` / 0 | 温度 clip(coef/(t+1)^decay, floor, ceil)、t = MMD の更新回数 + ずらし |
@@ -181,7 +182,7 @@ R-NaD の checkpoint から続ける（net ← 現在のネット、ターゲッ
   （既定はラインを切った後の最後まで）。`--open-weight`: `category`（既定。系統ごとに同じ確率）/ `line`
 - 止める条件: どちらかの駒取り・王手（両者とも止める）・その側の反則・予定の手数。定跡の最後の駒取りの手は指させない
   （初期配置の相手の駒に触れる手の手前で切る）
-- 使えない組み合わせ: `--league`・`--guard`・`--speed`・`--nyugyoku`・`--c-ply`・`--mmd-lambda-unit turn`。`--pipeline` は使える。
+- 使えない組み合わせ: `--league`・`--guard`・`--speed`・`--nyugyoku`・`--c-ply`・`--mmd-lambda-unit turn`（`--mmd-gae-lambda-unit turn` も。`turn+check` は使える）。`--pipeline` は使える。
   `--open-len` / `--open-weight` は `--open-book` と `--open-p` と一緒に使う（片方だけなら止める）。起動時に tsuitate_rl が
   序盤の強制を知っているかを1局指して確かめる
 - 設定は checkpoint（`collect_cfg`）と `config.json` に残り、再開で `--open-*` を付け忘れると止まる（`--override-config` で通す）。

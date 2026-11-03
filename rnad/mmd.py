@@ -6,7 +6,8 @@
 - **1/μ がどの項にも無い**。R-NaD の勾配の雑音の 99.6〜99.9% は v-trace の s = (G − v)/μ のスパイク
 - アドバンテージは手番側ごとの GAE（λ_A）、価値の目標は TD(λ)。どちらも**収集時の価値**（`collect(actor_extras=True)`
   の `v_actor`）で作り、学習時に計算し直さない（Ataraxos と同じ）。反則で同じ側が続く手番も、既存の `v_trace_scalars` を
-  η=0・π=μ=1・c=λ で呼べばそのまま扱える（λ は試行ごと。`lambda_unit="turn"` なら反則の試行では λ をかけない）
+  η=0・π=μ=1・c=λ で呼べばそのまま扱える（λ は試行ごと。`lambda_unit="turn"` なら反則の試行では λ をかけない。
+  `"…+check"` なら自分が王手をかけた手でも λ をかけない。`gae_lambda_unit` で GAE の側だけ変えられる）
 - 学習に使う行を |A| に比例した確率で間引き（pps）、重み s̄/p で戻す（期待値は全行と同じ = 固定点を動かさない）。
   Ataraxos どおりの「|A| の 75%点以上だけ」（quantile）は、クーンポーカーで固定点を均衡から外す（NashConv は期待値の
   更新で 0.67〜0.71、標本ありで 0.60〜0.62。絞り込みなしは α-QRE の 0.038）ので既定にしない。`preset="ataraxos"` の腕として残す
@@ -44,6 +45,14 @@ from rnad import _pack_csr, forward, legal_log_policy, rng_state, set_rng_state,
 
 # ---------------------------------------------------------------- 設定
 
+# λ をかける単位（`MMDConfig.lambda_unit` / `gae_lambda_unit`）
+LAMBDA_UNITS = ("attempt", "turn", "attempt+check", "turn+check")
+# 観測のスカラーのプレーン（tsuitate-bot の src/rl/encode.rs。P_SCALAR = 77 から S_FOULS_THIS_TURN = 4・S_IN_CHECK = 5・
+# S_GAVE_CHECK_LAST = 6。v2〔91枚〕は v1〔86枚〕の後ろに足すだけなので番号は同じ）。値は全マス同じなので (0, 0) を読む
+FOULS_THIS_TURN_PLANE = 81  # 今の手番の反則数 / 10
+IN_CHECK_PLANE = 82  # 自玉が王手されている
+GAVE_CHECK_LAST_PLANE = 83  # 直前の自分の手で王手をかけた
+
 
 @dataclass
 class MMDConfig:
@@ -67,8 +76,14 @@ class MMDConfig:
     # そろう〕を v8 の 768局が満たし、代理 P2 で 0.8 より悪くなかった。docs/rl-learning-speed.md 10.4）
     gae_lambda: float = 0.5
     td_lambda: float = 0.8
-    # λ をかける単位: "attempt"（反則の試行も1回と数える）/ "turn"（受理された手ごと。反則の試行では λ をかけない）
+    # λ をかける単位: "attempt"（反則の試行も1回と数える）/ "turn"（受理された手ごと。反則の試行では λ をかけない）/
+    # "attempt+check"（自分が王手をかけた手では λ をかけない）/ "turn+check"（その両方）。+check の2つは反則・王手を観測の
+    # スカラーから読むので序盤の強制と一緒に使える（`own_next_flags`。turn は行の並びで反則を見るので使えない）
     lambda_unit: str = "attempt"
+    # GAE（アドバンテージ）の側だけの単位。"" = lambda_unit と同じ。価値の目標（TD(λ)）を変えずに方策の責任の配り方だけを
+    # 変える A/B 用（2026-11-03。王手で相手の手を強制している間は、詰まされた責任を手前の手へ減らさずに届ける案。
+    # tsuitate-bot の docs/rl-learning-speed.md 10.8）
+    gae_lambda_unit: str = ""
     # 磁石: "target"（今のターゲット = 現在のネットの EMA。動く磁石）/ "mix:target,<ε>"（今のターゲットと一様の混合）/
     # "mix:init,<ε>"（始めたときのターゲットの写しと一様の混合 = 固定の磁石）/ "uniform"（合法手に一様。Ataraxos のコードの既定）。
     # 既定は動く磁石（2026-10-25。固定の磁石 ＋ 温度を下げる形は、クーンで R-NaD の約8倍遅く、代理 P2 で自己対局が短い詰みの筋に
@@ -189,8 +204,10 @@ def parse_config(cfg: MMDConfig) -> dict:
                          "使うなら α を一様のときの約半分に読み替える（引く強さが約2.1倍。docs/rl-learning-speed.md 10節）")
     else:
         raise ValueError(f"magnet {cfg.magnet}（mix:init,<ε> / mix:target,<ε> / uniform / target）")
-    if cfg.lambda_unit not in ("attempt", "turn"):
-        raise ValueError(f"lambda_unit {cfg.lambda_unit}（attempt / turn）")
+    if cfg.lambda_unit not in LAMBDA_UNITS:
+        raise ValueError(f"lambda_unit {cfg.lambda_unit}（{' / '.join(LAMBDA_UNITS)}）")
+    if cfg.gae_lambda_unit not in ("",) + LAMBDA_UNITS:
+        raise ValueError(f"gae_lambda_unit {cfg.gae_lambda_unit}（空 = lambda_unit と同じ / {' / '.join(LAMBDA_UNITS)}）")
     for name in ("gae_lambda", "td_lambda"):
         if not 0.0 <= getattr(cfg, name) <= 1.0:
             raise ValueError(f"{name} は 0〜1")
@@ -228,15 +245,57 @@ def foul_rows(valid, player):
     return valid & nxt_valid & (nxt_player == player)
 
 
+def own_next_flags(batch):
+    """[T, B] の bool 2つ (foul, check)。各試行について、**同じ側の次の決定点の観測**から読む:
+    foul = その試行は反則だった（次の自分の決定点の「今の手番の反則数」> 0 = 同じ手番の指し直し）、
+    check = 受理されて相手に王手をかけた（反則でなく、次の自分の決定点の「直前の自分の手で王手をかけた」が立っている）。
+    次の自分の決定点が無い試行（その側の局の最後の試行。λ は使われない）は両方 False。
+
+    `foul_rows`（次の時刻に同じ側が指す = 反則）と違い、序盤の強制（行にならない手）をはさんで同じ側の行が続いても
+    取り違えない。王手を相手の次の行の「王手されている」で見ないのも同じ理由（強制した相手の手は行にならない）。
+    batch["obs"] が要る（自己対局の batch に限るのは `player_lambda_returns` と同じ）。結果は batch に覚えておく"""
+    if "_own_next_flags" in batch:
+        return batch["_own_next_flags"]
+    valid, player = batch["valid"], batch["player"]
+    t_idx, b_idx = batch["t"], batch["b"]
+    T, B = valid.shape
+    obs = batch["obs"]
+    if obs.shape[1] <= GAVE_CHECK_LAST_PLANE:
+        raise ValueError(f"観測のプレーンが {obs.shape[1]} 枚（王手のスカラー {GAVE_CHECK_LAST_PLANE} が無い）")
+    ftt = torch.zeros(T, B)
+    gcl = torch.zeros(T, B)
+    ftt[t_idx, b_idx] = obs[:, FOULS_THIS_TURN_PLANE, 0, 0].float()
+    gcl[t_idx, b_idx] = obs[:, GAVE_CHECK_LAST_PLANE, 0, 0].float()
+    foul = torch.zeros(T, B, dtype=torch.bool)
+    check = torch.zeros(T, B, dtype=torch.bool)
+    for k in (0, 1):
+        has = torch.zeros(B, dtype=torch.bool)  # この時刻より後に k の決定点がある
+        nxt_f = torch.zeros(B, dtype=torch.bool)  # その（直近の）決定点の「今の手番の反則数」> 0
+        nxt_c = torch.zeros(B, dtype=torch.bool)  # その決定点の「直前の自分の手で王手をかけた」
+        for t in range(T - 1, -1, -1):
+            mine = valid[t] & (player[t] == k)
+            foul[t] |= mine & has & nxt_f
+            check[t] |= mine & has & ~nxt_f & nxt_c
+            nxt_f = torch.where(mine, ftt[t] > 0, nxt_f)
+            nxt_c = torch.where(mine, gcl[t] > 0, nxt_c)
+            has |= mine
+    batch["_own_next_flags"] = (foul, check)
+    return foul, check
+
+
 def player_lambda_returns(batch, v, lam, unit="attempt"):
     """手番側ごとの λ-return G^λ（平らな [N]）。v は各決定点の価値（平らな [N]）。
 
     プレイヤー k の決定点を時刻の順に i = 1..n とすると（次の自分の決定点は反則なら次の時刻、通常は2つ先）
         r_i = 自分の決定点 i から次の自分の決定点の手前までに k が受けた報酬の和（最後の決定点は局の終わりまで）
         G_i = r_i + [i < n]·((1 − λ_i)·V_{i+1} + λ_i·G_{i+1})
-    （λ_i = λ。unit="turn" なら反則の試行だけ λ_i = 1）。`v_trace_scalars` を η=0・π=μ=1・c=λ で呼んだ vt がこれと同じ
+    （λ_i = λ。unit="turn" なら反則の試行だけ λ_i = 1、"attempt+check" なら王手をかけた手だけ、"turn+check" ならその両方。
+    +check の2つは反則・王手を `own_next_flags` の観測から読む）。`v_trace_scalars` を η=0・π=μ=1・c=λ で呼んだ vt がこれと同じ
     （相手の手番の行は報酬を次の自分の手番へ運ぶだけ）。局の途中で切らないので bootstrap は無い。
     **自己対局の batch に限る**（相手の手番が記録されない局では、有効でない行で carry が 0 に戻り途中が終局扱いになる）
+
+    λ_i = 1 の手は「減衰の時計を進めない」だけで責任を免れない: G_i = r_i + G_{i+1} なので、その手には次の自分の手と
+    同じ重さで後ろの δ が届き、その手より前の手には1手ぶん減らずに届く
     """
     valid, player, reward = batch["valid"], batch["player"], batch["reward"]
     t_idx, b_idx = batch["t"], batch["b"]
@@ -247,8 +306,11 @@ def player_lambda_returns(batch, v, lam, unit="attempt"):
         c = float(lam)
     elif unit == "turn":
         c = torch.where(foul_rows(valid, player), 1.0, float(lam))
+    elif unit in ("attempt+check", "turn+check"):
+        foul, check = own_next_flags(batch)
+        c = torch.where(check | foul if unit == "turn+check" else check, 1.0, float(lam))
     else:
-        raise ValueError(f"unit {unit}（attempt / turn）")
+        raise ValueError(f"unit {unit}（{' / '.join(LAMBDA_UNITS)}）")
     ones, zeros = torch.ones(T, B), torch.zeros(T, B)
     out = torch.zeros(len(t_idx))
     mine_flat = player[t_idx, b_idx]
@@ -437,9 +499,10 @@ class MMDLearner:
 
         n = len(batch["action"])
         v_act = batch["v_actor"].float()
+        gae_unit = cfg.gae_lambda_unit or cfg.lambda_unit
         g_td = player_lambda_returns(batch, v_act, cfg.td_lambda, cfg.lambda_unit)
-        g_a = g_td if cfg.gae_lambda == cfg.td_lambda else player_lambda_returns(batch, v_act, cfg.gae_lambda,
-                                                                                  cfg.lambda_unit)
+        g_a = (g_td if cfg.gae_lambda == cfg.td_lambda and gae_unit == cfg.lambda_unit
+               else player_lambda_returns(batch, v_act, cfg.gae_lambda, gae_unit))
         adv = g_a - v_act
         t_gae = time.time()
 
@@ -525,6 +588,13 @@ class MMDLearner:
             out.update(loss_nerd=0.0, loss_v=0.0, minibatches=0)
         out.update(_policy_monitors(batch, n))
         out.update(_value_monitors(batch, v_act, g_td, adv, keep_p, keep_v))
+        if "_own_next_flags" in batch:
+            # +check の単位の見張り: λ をかけなかった行（王手をかけた手・反則）の割合と、王手をかけた手の A の平均
+            foul_g, check_g = batch["_own_next_flags"]
+            chk = check_g[batch["t"], batch["b"]]
+            out["lam_check_frac"] = float(chk.float().mean()) if n else 0.0
+            out["lam_foul_frac"] = float(foul_g[batch["t"], batch["b"]].float().mean()) if n else 0.0
+            out["adv_mean_check"] = float(adv[chk].mean()) if bool(chk.any()) else None
         out["kl_mu_unkept"] = self._kl_unkept(batch, keep_p, batch["_legal_ptr"])
         out.update(gae_sec=t_gae - t_start, prox_sec=t_prox - t_gae, train_sec=t_train - t_prox)
         return out
