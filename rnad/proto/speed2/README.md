@@ -28,6 +28,7 @@ tsuitate-bot の `docs/rl-learning-speed.md`「さらに速くする」で検討
 | F5 | `fused_update.py` | pass 1 の online 順伝播を pass 2 に融合した update（S3）の勾配が本物と一致するかと、1回の秒 |
 | F6 | `stage_monitor_and_ramp.diff` | tsuitate-nn の rnad.py / train_rnad.py に `--schedule-ramp`（α の補間の長さ。既定 0 = 今と同じ）と段階の収束の見張り3つ（`kl_online_reg` / `kl_target_reg` / `kl_online_target`）を足す差分。テスト `rnad/tests/test_stage_ramp.py` つき |
 | F8 | `recon_tail_avg.py` | 既存の書き出し（e 更新ごとの `policy_<step>.bin`）から、段階の後半の一様な平均（`--tail-avg`）を遡って作る。`--self-test` は合成データでの誤差 |
+| F9 | `tail_probe.py` | 収集の末尾（2026-11-06、MMD の本線向け）: 本線と同じ形（序盤の強制 p 0.25）で 768局を指し、手番ごとの生存局数・自動リセットなら手番がいくつになるか・生存率の帯ごとの手番と決定点の割合を数える（壁時計は使わないので CPU でも同じ数）。`--box <box_bench.py の出力>` で、F2b の生存局数ごとの1手番の秒を補間して今と自動リセットの GPU 側の秒を見積もる（tsuitate-bot の docs/rl-learning-speed.md 11.3） |
 | F9 | `gpu_league_gap.py` | （本題の外）`--league-device gpu` の batch で、学習側の手番の vt に終局の報酬が届かない不具合の再現 |
 | F10 | `wall_model.py` | pipeline の1更新 = max(収集, 更新) の粗い模型。試作を積んだときの見込みの秒 |
 
