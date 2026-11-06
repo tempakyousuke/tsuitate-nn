@@ -135,18 +135,28 @@ def tiny_net(seed: int = 0) -> PolicyValueNet:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("checkpoint", nargs="?", help="train_bc.py の checkpoint.pt（--tiny なら不要）")
+    ap.add_argument("checkpoint", nargs="?", help="train_bc.py / train_rnad.py の checkpoint.pt（--tiny なら不要）")
     ap.add_argument("out")
     ap.add_argument("--test-vector")
     ap.add_argument("--tiny", action="store_true")
+    ap.add_argument("--which", default="",
+                    help="train_rnad.py の checkpoint のどのネットを書き出すか（target / net / magnet_net。省くと train_bc.py の "
+                         "state_dict、無ければ target = 学習が書き出す policy_<step>.bin と同じ）。MMD の magnet_net は "
+                         "--mmd-magnet-avg の EMA で、書き出しのターゲットより長い平均（学習に影響しない比較用）")
     args = ap.parse_args()
 
     if args.tiny:
         net = tiny_net()
     else:
         ck = torch.load(args.checkpoint, map_location="cpu")
+        which = args.which or ("state_dict" if "state_dict" in ck else "target")
+        if which not in ck:
+            keys = [k for k in ("state_dict", "target", "net", "magnet_net") if k in ck]
+            raise SystemExit(f"{args.checkpoint} に {which} が無い（あるのは {keys}）")
         net = PolicyValueNet(ck["config"]["channels"], ck["config"]["blocks"], ck["config"]["planes"])
-        net.load_state_dict(ck["state_dict"])
+        net.load_state_dict(ck[which])
+        if which != "state_dict":
+            print(f"{which}（step {ck.get('step')}）を書き出す")
     write(net, pathlib.Path(args.out))
     if args.test_vector:
         write_test_vector(net, pathlib.Path(args.test_vector))

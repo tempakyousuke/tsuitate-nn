@@ -41,7 +41,7 @@ ARENA_MATCH_SEED=20260927 cargo run --release --bin arena -- 100 "rl_policy:<pol
 | --- | --- |
 | `model.py` | 方策・価値ネット（ResNet。方策 [139,9,9]、価値 tanh）。**層を変えたら tsuitate-bot の `src/rl/policy_net.rs` と `export_weights.py` も直す** |
 | `train_bc.py` | 記録を真似る教師あり学習。局単位で学習/検証を分ける |
-| `export_weights.py` | Rust 推論用の重み（`TSRLPV01` 形式、BatchNorm は畳み込みへ畳み込む）。`--tiny --test-vector` で tsuitate-bot のテスト用フィクスチャを作る |
+| `export_weights.py` | Rust 推論用の重み（`TSRLPV01` 形式、BatchNorm は畳み込みへ畳み込む）。`--tiny --test-vector` で tsuitate-bot のテスト用フィクスチャを作る。train_rnad.py の checkpoint は `--which target\|net\|magnet_net` で書き出すネットを選ぶ（既定 target。MMD の磁石は書き出しより長い平均なので、学習を止めずに平均の長さの効きを比べられる。tsuitate-bot の docs/rl-learning-speed.md 11節） |
 | `fetch_records.py` | GitHub Actions の対局記録を取る |
 | `league.py` | リーグ学習の相手の選び方（負けやすい相手ほど多く当てる） |
 | `guard.py` | 防御特化（玉の周りの固め）の監視値の集計 |
