@@ -37,7 +37,7 @@ from export_weights import write as write_weights
 from guard import apply_win_bonus as apply_guard_win_bonus
 from guard import summarize as summarize_guard
 from speed import summarize as summarize_speed
-from model import NUM_PLANES, NUM_PLANES_DEDUCED, NUM_PLANES_V3, PolicyValueNet
+from model import EXTENDED_PLANES, NUM_PLANES, NUM_PLANES_DEDUCED, PolicyValueNet, planes_for
 from widen_planes import add_extra_flags, extras_from_args, widen_checkpoint
 from league import League
 import openings
@@ -62,24 +62,26 @@ def pick_device(name: str) -> torch.device:
 
 
 def with_extras(ck: dict, want: list, what, verbose: bool = True) -> dict:
-    """checkpoint `ck` を、学習のフラグで選んだ v3 の入力プレーンの組 `want` に合わせる（`widen_planes.py` と同じ）。
-    足りない組は足し（v2 なら v3 へ広げる。足した列は 0 なので元と同じ関数から始まる）、外すのは止める
+    """checkpoint `ck` を、学習のフラグで選んだ v3 / v4 の入力プレーンの組 `want` に合わせる（`widen_planes.py` と同じ）。
+    足りない組は足し（組が入る版まで広げる。足した列は 0 なので元と同じ関数から始まる）、外すのは止める
     （再開でフラグを付け忘れると、学習した組を黙って読まなくなるため）"""
     cfg = ck.get("config")
     have = sorted((cfg or {}).get("extras", ()))
     if have == sorted(want):
         return ck
     if set(have) - set(want):
-        raise SystemExit(f"{what} は v3 の入力プレーンの組 {have} を使っている（フラグでは {sorted(want)}）。"
-                         "再開・初期化ではフラグ（--opp-hand-planes / --opp-foul-planes）を付け直す（組は外せない）")
+        raise SystemExit(f"{what} は入力プレーンの組 {have} を使っている（フラグでは {sorted(want)}）。"
+                         "再開・初期化ではフラグ（--opp-hand-planes / --opp-foul-planes / --king-foul-planes）を付け直す"
+                         "（組は外せない）")
     if cfg is None:
         raise SystemExit(f"{what} にネットの形が無い（古い checkpoint）ので入力プレーンを足せない")
-    if cfg["planes"] not in (NUM_PLANES_DEDUCED, NUM_PLANES_V3):
-        raise SystemExit(f"{what} は v1（{cfg['planes']}枚）。v3 の組は v2（確定事実のプレーンつき）に足すので、"
+    if cfg["planes"] not in (NUM_PLANES_DEDUCED, *EXTENDED_PLANES):
+        raise SystemExit(f"{what} は v1（{cfg['planes']}枚）。v3 / v4 の組は v2（確定事実のプレーンつき）に足すので、"
                          "先に widen_planes.py で v2 にする")
-    out = widen_checkpoint(ck, NUM_PLANES_V3, want)
+    planes = max(cfg["planes"], planes_for(want))
+    out = widen_checkpoint(ck, planes, want)
     if verbose:
-        print(f"{what} の入力プレーンを {cfg['planes']} → {NUM_PLANES_V3}枚に（v3 の組 {have} → {sorted(want)}。"
+        print(f"{what} の入力プレーンを {cfg['planes']} → {planes}枚に（組 {have} → {sorted(want)}。"
               "足した列は 0 なので元と同じ関数から始まる）", flush=True)
     return out
 
@@ -92,7 +94,7 @@ def load_net(path: str, channels: int, blocks: int, which: str = "target", plane
     `extras` が None でなければ、checkpoint をその組に合わせてから読む（`with_extras`。錨は None = そのまま）"""
     if path == "none":
         if extras:
-            planes = NUM_PLANES_V3
+            planes = planes_for(extras)
         return PolicyValueNet(channels, blocks, planes, extras or ())
     ck = torch.load(path, map_location="cpu")
     if extras is not None:
@@ -432,9 +434,9 @@ def main() -> None:
     ap.add_argument("--threads", type=int, default=0, help="torch のスレッド数（0 = 既定）")
     ap.add_argument("--planes", type=int, default=NUM_PLANES,
                     help="--init none のときの入力のプレーン数（86 = v1 / 91 = v2 確定事実つき。"
-                         "v3 = 101 は下の組のフラグで選ぶ）")
-    # v3 の入力プレーン（tsuitate-bot の docs/rl-deepnash-design.md「エンコーダ v3」）。組ごとに別のフラグで足せる。
-    # v2 の checkpoint から始める・再開するときは読み込み時に v3 へ広げる（足した列は 0 = 元と同じ関数から始まる）。
+                         "v3 = 101 / v4 = 102 は下の組のフラグで選ぶ）")
+    # v3 / v4 の入力プレーン（tsuitate-bot の docs/rl-deepnash-design.md「エンコーダ v3」）。組ごとに別のフラグで足せる。
+    # v2 / v3 の checkpoint から始める・再開するときは読み込み時に組が入る版へ広げる（足した列は 0 = 元と同じ関数から始まる）。
     # 一度足した組は、以後の再開でもフラグを付ける（外すと止める）
     add_extra_flags(ap)
     ap.add_argument("--device", default="auto")

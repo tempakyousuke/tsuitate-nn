@@ -1,12 +1,14 @@
 """checkpoint の入力プレーンを広げる・足す（tsuitate-bot の `rl::encode`）。
 
     .venv/bin/python rnad/widen_planes.py <元の checkpoint.pt> <出力の checkpoint.pt> [--planes 91]
-    .venv/bin/python rnad/widen_planes.py <元> <出力> [--opp-hand-planes] [--opp-foul-planes]
+    .venv/bin/python rnad/widen_planes.py <元> <出力> [--opp-hand-planes] [--opp-foul-planes] [--king-foul-planes]
 
 - **v1 → v2**（`--planes 91`、既定）: v1 の 86枚の後ろに確定事実のプレーン 5枚
-- **v2 → v3**（`--planes 101`、組のフラグを付けると既定でこれ）: v2 の後ろに相手の持ち駒の上界（7枚）と
-  相手の反則の時系列（3枚）。どの組を**使う**かはフラグで選ぶ（`--opp-hand-planes` = 案3、`--opp-foul-planes` = 案4）。
-  選ばなかった組はネットが入力を 0 にして読まない（`model.PolicyValueNet`）。v3 の checkpoint に組を後から足すときも
+- **v2 → v3**（`--planes 101`）: v2 の後ろに相手の持ち駒の上界（7枚）と相手の反則の時系列（3枚）
+- **→ v4**（`--planes 102`）: v3 の後ろに玉の移動で反則したマス（1枚）
+- 組のフラグを付けると、プレーン数の既定はその組が入る最小の版。どの組を**使う**かはフラグで選ぶ
+  （`--opp-hand-planes` = 案3、`--opp-foul-planes` = 案4、`--king-foul-planes` = 玉の反則マス）。
+  選ばなかった組はネットが入力を 0 にして読まない（`model.PolicyValueNet`）。v3 / v4 の checkpoint に組を後から足すときも
   同じフラグで足せる（組を外すことはできない）。学習の `train_rnad.py` の同名のフラグはこれを読み込み時に行う
 
 足した列（と新しく使い始める組の列）は stem の重みを **0** にするので、元と同じ関数から学習を続けられる。
@@ -27,12 +29,13 @@ import sys
 import torch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from model import EXTRA_PLANES, NUM_PLANES_DEDUCED, NUM_PLANES_V3, normalize_extras, unused_planes  # noqa: E402
+from model import (EXTENDED_PLANES, EXTRA_PLANES, NUM_PLANES_DEDUCED, normalize_extras, planes_for,  # noqa: E402
+                   unused_planes)
 
 STEM = "stem.weight"
 NETS = ("net", "target", "prev", "prev_", "magnet_net", "state_dict")
 # 学習のフラグ名 → 組の名前（train_rnad.py と共有）
-EXTRA_FLAGS = {"opp_hand_planes": "opp_hand", "opp_foul_planes": "opp_fouls"}
+EXTRA_FLAGS = {"opp_hand_planes": "opp_hand", "opp_foul_planes": "opp_fouls", "king_foul_planes": "king_fouls"}
 
 
 def add_extra_flags(ap: argparse.ArgumentParser) -> None:
@@ -41,6 +44,8 @@ def add_extra_flags(ap: argparse.ArgumentParser) -> None:
                     help="v3: 相手の持ち駒の上界（駒種別 7枚。取られた自駒の数で抑える）を入力に使う")
     ap.add_argument("--opp-foul-planes", action="store_true",
                     help="v3: 相手の反則の時系列（直前の手番 / 王手を受けていた手番 / 受けていない手番の 3枚）を入力に使う")
+    ap.add_argument("--king-foul-planes", action="store_true",
+                    help="v4: 自玉の移動で反則したマス（1枚。鮮度は反則した手数から）を入力に使う")
 
 
 def extras_from_args(args) -> list:
@@ -105,7 +110,7 @@ def widen_checkpoint(ck: dict, planes: int = NUM_PLANES_DEDUCED, extras=None) ->
         ck["opt"] = opt
     config = {k: v for k, v in cfg.items() if k != "extras"}
     config["planes"] = planes
-    if planes == NUM_PLANES_V3:
+    if planes in EXTENDED_PLANES:
         config["extras"] = new_extras
     ck["config"] = config
     return ck
@@ -121,14 +126,14 @@ def main() -> None:
     ap.add_argument("src")
     ap.add_argument("dst")
     ap.add_argument("--planes", type=int, default=None,
-                    help=f"広げた後のプレーン数（既定: 組のフラグがあれば {NUM_PLANES_V3}、無ければ {NUM_PLANES_DEDUCED}）")
+                    help=f"広げた後のプレーン数（既定: 組のフラグがあればその組が入る最小の版、無ければ {NUM_PLANES_DEDUCED}）")
     add_extra_flags(ap)
     args = ap.parse_args()
     ck = torch.load(args.src, map_location="cpu", weights_only=False)
     flags = extras_from_args(args)
-    planes = args.planes or (NUM_PLANES_V3 if flags else NUM_PLANES_DEDUCED)
     # フラグの組は今の組に足す（v3 の checkpoint に後から足すとき、前に選んだ組を書き直さなくてよい）
     extras = sorted(set(ck["config"].get("extras", ())) | set(flags)) if flags else None
+    planes = args.planes or (max(ck["config"]["planes"], planes_for(extras)) if flags else NUM_PLANES_DEDUCED)
     out = widen_checkpoint(ck, planes, extras)
     pathlib.Path(args.dst).parent.mkdir(parents=True, exist_ok=True)
     torch.save(out, args.dst)
