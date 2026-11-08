@@ -25,7 +25,7 @@ from train_rnad import pick_device
 
 def make_learner(ck, device):
     c = ck["config"]
-    net = PolicyValueNet(c["channels"], c["blocks"], c["planes"])
+    net = PolicyValueNet.from_config(c)
     if ck.get("algo", "rnad") == "mmd":
         # MMD の checkpoint（train_rnad.py --algo mmd）: 現在のネットを R-NaD の更新で測る（正則化方策・ターゲットも同じネット）
         net.load_state_dict(ck["net"])

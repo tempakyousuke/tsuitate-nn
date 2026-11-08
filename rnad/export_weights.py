@@ -36,6 +36,10 @@ def fold(conv: torch.nn.Conv2d, bn: torch.nn.BatchNorm2d):
 def tensors(net: PolicyValueNet):
     out = []
     w, b = fold(net.stem, net.stem_bn)
+    if net.in_off is not None:
+        # 使わない入力プレーン（v3 で選ばなかった組）の列は 0（学習中も 0 のままのはずだが、Rust 側は組の選び方を
+        # 知らずに v3 の観測を全部書くので、ここで必ず 0 にしておく）
+        w = w.masked_fill(net.in_off.view(1, -1, 1, 1), 0)
     out += [("stem.w", w), ("stem.b", b)]
     for i, blk in enumerate(net.blocks):
         for j, (c, bn) in enumerate([(blk.c1, blk.b1), (blk.c2, blk.b2)]):
@@ -83,7 +87,7 @@ def read(path) -> PolicyValueNet:
         off += 4 * n
     if off != len(data):
         raise ValueError(f"{path} の長さがヘッダと合わない")
-    net = PolicyValueNet(header["channels"], header["blocks"], header["planes"])
+    net = PolicyValueNet.from_config(header)
 
     def put(conv, bn, w, b):
         conv.weight.copy_(w.reshape(conv.weight.shape))
@@ -145,7 +149,7 @@ def main() -> None:
         net = tiny_net()
     else:
         ck = torch.load(args.checkpoint, map_location="cpu")
-        net = PolicyValueNet(ck["config"]["channels"], ck["config"]["blocks"], ck["config"]["planes"])
+        net = PolicyValueNet.from_config(ck["config"])
         net.load_state_dict(ck["state_dict"])
     write(net, pathlib.Path(args.out))
     if args.test_vector:

@@ -105,7 +105,7 @@ def main():
     n = len(obs)
     print(f"先生の自己対局 {args.games}局・{n}決定点（{time.time() - t0:.0f}s）", flush=True)
 
-    student = PolicyValueNet(args.channels, args.blocks, planes).eval()
+    student = PolicyValueNet(args.channels, args.blocks, planes, teacher.config.get("extras", ())).eval()
     opt = torch.optim.Adam(student.parameters(), lr=args.lr)
     perm_gen = torch.Generator().manual_seed(args.seed)
     # 無作為な 5% を検証にする（決定点は手番の順に並んでいるので、先頭を取ると序盤の局面だけになる。
