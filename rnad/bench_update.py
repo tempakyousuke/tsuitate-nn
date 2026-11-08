@@ -81,7 +81,7 @@ def make_learner(args, device, packed, **flags):
     if args.ckpt:
         ck = copy.deepcopy(load_ck(args, device))
         c = ck["config"]
-        net = PolicyValueNet(c["channels"], c["blocks"], c["planes"])
+        net = PolicyValueNet.from_config(c)
         if ck.get("algo", "rnad") == "mmd":
             # MMD の checkpoint: R-NaD の腕は現在のネットから（正則化方策・ターゲットも同じネット。α = 1）
             net.load_state_dict(ck["net"])
@@ -109,7 +109,7 @@ def make_mmd(args, device, rate, stale=False, device_batch=False):
     if args.ckpt:
         ck = load_ck(args, device)
         c = ck["config"]
-        L = MMDLearner(PolicyValueNet(c["channels"], c["blocks"], c["planes"]), cfg, device, device_batch=device_batch,
+        L = MMDLearner(PolicyValueNet.from_config(c), cfg, device, device_batch=device_batch,
                        stale_actor=stale)
         L.start_from(ck["net"], ck["target"], int(ck.get("step", 0)))
         if ck.get("algo") == "mmd":
@@ -128,7 +128,7 @@ def calib_report(args, device, batch):
         if ck is None:
             raise SystemExit("--calib は --ckpt と一緒に使う")
         c = ck["config"]
-        net = PolicyValueNet(c["channels"], c["blocks"], c["planes"]).to(device).eval()
+        net = PolicyValueNet.from_config(c).to(device).eval()
         net.load_state_dict(ck[which])
         v = torch.cat([forward(net, batch["obs"][i:i + 2048].to(device, torch.float32))[1].cpu()
                        for i in range(0, len(batch["action"]), 2048)])

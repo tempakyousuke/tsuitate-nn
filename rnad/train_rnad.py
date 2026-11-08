@@ -37,7 +37,8 @@ from export_weights import write as write_weights
 from guard import apply_win_bonus as apply_guard_win_bonus
 from guard import summarize as summarize_guard
 from speed import summarize as summarize_speed
-from model import NUM_PLANES, PolicyValueNet
+from model import NUM_PLANES, NUM_PLANES_DEDUCED, NUM_PLANES_V3, PolicyValueNet
+from widen_planes import add_extra_flags, extras_from_args, widen_checkpoint
 from league import League
 import openings
 from mmd import PRESETS as MMD_PRESETS
@@ -60,15 +61,44 @@ def pick_device(name: str) -> torch.device:
     return torch.device("cpu")
 
 
-def load_net(path: str, channels: int, blocks: int, which: str = "target", planes: int = NUM_PLANES) -> PolicyValueNet:
+def with_extras(ck: dict, want: list, what, verbose: bool = True) -> dict:
+    """checkpoint `ck` を、学習のフラグで選んだ v3 の入力プレーンの組 `want` に合わせる（`widen_planes.py` と同じ）。
+    足りない組は足し（v2 なら v3 へ広げる。足した列は 0 なので元と同じ関数から始まる）、外すのは止める
+    （再開でフラグを付け忘れると、学習した組を黙って読まなくなるため）"""
+    cfg = ck.get("config")
+    have = sorted((cfg or {}).get("extras", ()))
+    if have == sorted(want):
+        return ck
+    if set(have) - set(want):
+        raise SystemExit(f"{what} は v3 の入力プレーンの組 {have} を使っている（フラグでは {sorted(want)}）。"
+                         "再開・初期化ではフラグ（--opp-hand-planes / --opp-foul-planes）を付け直す（組は外せない）")
+    if cfg is None:
+        raise SystemExit(f"{what} にネットの形が無い（古い checkpoint）ので入力プレーンを足せない")
+    if cfg["planes"] not in (NUM_PLANES_DEDUCED, NUM_PLANES_V3):
+        raise SystemExit(f"{what} は v1（{cfg['planes']}枚）。v3 の組は v2（確定事実のプレーンつき）に足すので、"
+                         "先に widen_planes.py で v2 にする")
+    out = widen_checkpoint(ck, NUM_PLANES_V3, want)
+    if verbose:
+        print(f"{what} の入力プレーンを {cfg['planes']} → {NUM_PLANES_V3}枚に（v3 の組 {have} → {sorted(want)}。"
+              "足した列は 0 なので元と同じ関数から始まる）", flush=True)
+    return out
+
+
+def load_net(path: str, channels: int, blocks: int, which: str = "target", planes: int = NUM_PLANES,
+             extras=None) -> PolicyValueNet:
     """模倣学習（train_bc.py）の checkpoint か、R-NaD（train_rnad.py）の checkpoint から読む。
     R-NaD の checkpoint は `which`（既定はターゲットネット = 書き出す重みと同じ）を読む。
-    `none` は乱数初期化（入力のプレーン数は `planes`）"""
+    `none` は乱数初期化（入力のプレーン数は `planes`。v3 の組 `extras` があれば v3）。
+    `extras` が None でなければ、checkpoint をその組に合わせてから読む（`with_extras`。錨は None = そのまま）"""
     if path == "none":
-        return PolicyValueNet(channels, blocks, planes)
+        if extras:
+            planes = NUM_PLANES_V3
+        return PolicyValueNet(channels, blocks, planes, extras or ())
     ck = torch.load(path, map_location="cpu")
+    if extras is not None:
+        ck = with_extras(ck, extras, path)
     if "config" in ck:
-        net = PolicyValueNet(ck["config"]["channels"], ck["config"]["blocks"], ck["config"]["planes"])
+        net = PolicyValueNet.from_config(ck["config"])
     elif "net" in ck:
         # ネットの形を持たない古い R-NaD の checkpoint（2026-09-28 以前）は引数の形で読む
         net = PolicyValueNet(channels, blocks)
@@ -171,7 +201,8 @@ def check_algo_args(ap, args):
 def start_mmd_from_init(learner, args):
     """--init の checkpoint から MMD を始める（--init-which both なら net ← 現在のネット、ターゲットと磁石 ← ターゲット。
     --init-step なら step の番号を続ける）。Adam の状態・正則化方策・乱数状態は持ち込まない"""
-    ick = torch.load(args.init, map_location="cpu")
+    # load_net で同じ checkpoint を同じ組へ合わせ済み（表示はそちらで1回だけ）
+    ick = with_extras(torch.load(args.init, map_location="cpu"), extras_from_args(args), args.init, verbose=False)
     step = int(ick.get("step", 0)) if args.init_step else 0
     if args.init_step and "step" not in ick:
         raise SystemExit(f"{args.init} に step が無い（--init-step は R-NaD / MMD の checkpoint に使う）")
@@ -400,7 +431,12 @@ def main() -> None:
                     help="最初の N 更新は価値の頭だけを全行で学ぶ（幹と方策は止める）")
     ap.add_argument("--threads", type=int, default=0, help="torch のスレッド数（0 = 既定）")
     ap.add_argument("--planes", type=int, default=NUM_PLANES,
-                    help="--init none のときの入力のプレーン数（86 = v1 / 91 = v2 確定事実つき）")
+                    help="--init none のときの入力のプレーン数（86 = v1 / 91 = v2 確定事実つき。"
+                         "v3 = 101 は下の組のフラグで選ぶ）")
+    # v3 の入力プレーン（tsuitate-bot の docs/rl-deepnash-design.md「エンコーダ v3」）。組ごとに別のフラグで足せる。
+    # v2 の checkpoint から始める・再開するときは読み込み時に v3 へ広げる（足した列は 0 = 元と同じ関数から始まる）。
+    # 一度足した組は、以後の再開でもフラグを付ける（外すと止める）
+    add_extra_flags(ap)
     ap.add_argument("--device", default="auto")
     ap.add_argument("--precision", choices=PRECISIONS, default="default",
                     help="ネットの計算精度（rnad.set_precision。default でも畳み込みは TF32 = tf32 と速さは同じ）")
@@ -499,14 +535,17 @@ def main() -> None:
     if ck is not None and ck.get("algo", "rnad") != args.algo:
         raise SystemExit(f"{ck_path} は --algo {ck.get('algo', 'rnad')} の checkpoint（今は --algo {args.algo}）。"
                          "別の学習器として黙って再開しない")
+    extras = extras_from_args(args)
+    if ck is not None and "config" in ck:
+        ck = with_extras(ck, extras, ck_path)
     if ck is not None and "config" in ck:
         # 再開: ネットの形は checkpoint から（--init には依存しない）
-        init_net = PolicyValueNet(ck["config"]["channels"], ck["config"]["blocks"], ck["config"]["planes"])
+        init_net = PolicyValueNet.from_config(ck["config"])
         if args.algo == "mmd" and (args.init_which != "target" or args.init_step):
             print("checkpoint から再開するので --init / --init-which / --init-step は使わない", flush=True)
     else:
         init_net = load_net(args.init, args.channels, args.blocks, planes=args.planes,
-                            which=("net" if args.init_which in ("net", "both") else "target"))
+                            which=("net" if args.init_which in ("net", "both") else "target"), extras=extras)
     if args.algo == "mmd":
         learner = MMDLearner(init_net, mcfg, device, seed=args.seed, device_batch=args.device_batch,
                              stale_actor=args.pipeline)
@@ -745,9 +784,11 @@ def main() -> None:
     if args.panel:
         import speedlab
         panel = json.loads(pathlib.Path(args.panel).read_text())
-        if panel["planes"] != init_net.config["planes"]:
-            raise SystemExit(f"パネルの planes {panel['planes']} が学習するネット {init_net.config['planes']} と違う")
-        panel_members = [speedlab.Member(m, panel["planes"], device) for m in panel["members"]]
+        # 観測は学習するネットの形で書く。パネルの相手のネットは先頭だけを読む（v1 ⊂ v2 ⊂ v3 は先頭が同じ）
+        panel_planes = init_net.config["planes"]
+        if panel["planes"] > panel_planes:
+            raise SystemExit(f"パネルの planes {panel['planes']} が学習するネット {panel_planes} より多い")
+        panel_members = [speedlab.Member(m, panel_planes, device) for m in panel["members"]]
         if args.panel_games % 2:
             raise SystemExit("--panel-games は偶数（先後を同数にするため）")
 
@@ -760,7 +801,7 @@ def main() -> None:
                 res = []
                 for m in panel_members:
                     o = speedlab.play_vs(nets[which], m, args.panel_games, speedlab.EVAL_SEED + speedlab.stable_seed(m.name),
-                                         panel["planes"], per_game=True, device=device)
+                                         panel_planes, per_game=True, device=device)
                     w, l, d = int((o > 0).sum()), int((o < 0).sum()), int((o == 0).sum())
                     res.append((m.name, w, l, d))
                     f.write(json.dumps({"step": step, "which": which, "opponent": m.name, "w": w, "l": l, "d": d,

@@ -386,7 +386,7 @@ def cmd_export_ck(args):
         raise SystemExit(f"{'・'.join(taken)} がもうある（上書きするなら --force）")
     out.mkdir(parents=True, exist_ok=True)
     for key, path in pairs:
-        net = PolicyValueNet(cfg["channels"], cfg["blocks"], cfg["planes"])
+        net = PolicyValueNet.from_config(cfg)
         net.load_state_dict(ck[key])
         write_weights(net.eval(), path)
         print(f"書き出し: {path}（checkpoint の {key}、checkpoint の step {ck_step}）")
