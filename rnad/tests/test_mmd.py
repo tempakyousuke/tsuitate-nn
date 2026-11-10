@@ -946,7 +946,8 @@ def check_rejects(tmp):
         (["--lr", "1e-4"], "--lr"),
         (["--schedule", "1000"], "--schedule"),
         (["--reuse", "2"], "--reuse"),
-        (["--league", "rl_v15"], "--league"),
+        # 相手を固定した局（--league）は使える（tests/test_shaping.py）。turn の単位とだけ使えない
+        (["--league", "heuristic", "--mmd-lambda-unit", "turn"], "--league"),
         (["--mmd-magnet", "twostage"], "twostage"),
         (["--mmd-filter", "pps:0.01,floor=0.05"], "floor"),
     ]

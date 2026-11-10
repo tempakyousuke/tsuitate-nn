@@ -242,12 +242,16 @@ def v_trace_scalars(v, valid, player, pi_a, mu_a, ent, reward, k, eta, c=1.0, rh
         our_s = inv_mu[t] * (disc + c_is * c_next_vt - v[t])
         vt[t] = torch.where(ours, our_vt, zeros)
         s[t] = torch.where(ours, our_s, zeros)
-        # 次（1つ前の時刻）へ渡す carry
-        n_reward = torch.where(ours, zeros, torch.where(opp, eta_reg_entropy[t] + cs[t] * disc, zeros))
-        n_reward_unc = torch.where(ours, zeros, torch.where(opp, r_unc, zeros))
-        n_next_value = torch.where(ours, v[t], torch.where(opp, c_next_value, zeros))
-        n_next_vt = torch.where(ours, our_vt, torch.where(opp, c_next_vt, zeros))
-        n_is = torch.where(ours, ones, torch.where(opp, cs[t] * c_is, ones))
+        # 次（1つ前の時刻）へ渡す carry。**無効なステップ（どちらの手番でもない）では carry をそのまま通す**
+        # （2026-11-10。それまでは 0 に戻していた）。局の後ろの埋め草では carry は初期値のままなので結果は同じ。
+        # 局の途中に隙間がある batch（相手の手番を記録しない `collect(opponents=...)` = `--league-device gpu`）では、
+        # 0 に戻すと終局の報酬が各局の最後の学習側の手番にしか届かなかった（docs/rl-learning-speed.md 9.8）。
+        # `_v_trace_chunk`（有効な手番だけを進める）はもともと隙間を通す
+        n_reward = torch.where(ours, zeros, torch.where(opp, eta_reg_entropy[t] + cs[t] * disc, c_reward))
+        n_reward_unc = torch.where(ours, zeros, torch.where(opp, r_unc, c_reward_unc))
+        n_next_value = torch.where(ours, v[t], c_next_value)
+        n_next_vt = torch.where(ours, our_vt, c_next_vt)
+        n_is = torch.where(ours, ones, torch.where(opp, cs[t] * c_is, c_is))
         c_reward, c_reward_unc, c_next_value, c_next_vt, c_is = (
             n_reward, n_reward_unc, n_next_value, n_next_vt, n_is)
     return vt, s
@@ -997,6 +1001,20 @@ KING_PLANE = 7
 GRADED_MILESTONES = (3, 4, 5, 6)
 
 
+def split_noise(spec: str):
+    """相手の指定 `<名前>` か `<名前>@<ε>`（ハンデ = 相手の手番ごとに確率 ε で合法手の乱数手。tsuitate-bot の
+    docs/rl-fixed-opponent.md）→ (名前, ε)。tsuitate_rl と同じ読み方: 末尾の `@` の後ろが 0〜1 の数でなければ全体が名前"""
+    name, sep, eps = spec.rpartition("@")
+    if sep:
+        try:
+            e = float(eps)
+        except ValueError:
+            return spec, 0.0
+        if 0.0 <= e <= 1.0:
+            return name, e
+    return spec, 0.0
+
+
 class MultiEnv:
     """複数の VecEnv（auto_reset=False）を1つの VecEnv に見せる（局の並びは渡した順につなげる）。
 
@@ -1034,6 +1052,14 @@ class MultiEnv:
     def truth(self):
         return np.concatenate([e.truth() for e in self.envs])
 
+    def signals(self):
+        return np.concatenate([e.signals() for e in self.envs])
+
+    def random_legal_actions(self, u):
+        return np.concatenate([e.random_legal_actions(np.ascontiguousarray(x)) if (x >= 0).any()
+                               else np.full(e.num_envs, -1, dtype=np.int64)
+                               for e, x in zip(self.envs, self._split(u))])
+
     def observe_alive_f16_csr(self):
         # 生きている局だけを env の順につなげる = 全体の局の添字の昇順（VecEnv と同じ並び）
         parts = [e.observe_alive_f16_csr() for e in self.envs]
@@ -1053,7 +1079,8 @@ class MultiEnv:
 
 def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode="enter",
             nyugyoku_zero_sum=True, opponents=None, opp_nets=None, nyugyoku_win_only=False, truth=False,
-            generator=None, compact_legal=False, fast="", actor_extras=False):
+            generator=None, compact_legal=False, fast="", actor_extras=False, shaping=None, shape_mult=1.0,
+            watch_signals=False, noise_rng=None):
     """`env`（auto_reset=False の VecEnv）の全局を1局ずつ最後まで自己対局し、学習用に並べる。
 
     戻り値の obs / legal / action / mu_a / t / b は有効なステップだけを平らにしたもの、
@@ -1088,7 +1115,10 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
     相手の手番で入った報酬（相手の手で終局した局の勝敗・ボーナス）は学習側の直前の手番へ足す
     （Rust の評価モード `VecEnv(opponents=...)` で相手の手が学習側の step の中で進むのと同じ帰属）。
     入玉ボーナスも学習側だけを数える。None の局は従来どおりの自己対局で、`opponents` を渡さなければ
-    結果も乱数の消費も従来と同じ
+    結果も乱数の消費も従来と同じ。相手の名前が `<名前>@<ε>` なら**ハンデつき**: ネットは `opp_nets[<名前>]` を使い、
+    相手の手番ごとに確率 ε で、その手を真実の盤面の合法手から一様に選んだ手に差し替える（`VecEnv.random_legal_actions`。
+    Rust の評価モードの `<名前>@<ε>` と同じ弱め方）。その乱数は `noise_rng`（numpy の Generator。ハンデつきの局が
+    あれば必須）から引き、学習側の手の乱数は消費しない
 
     `truth=True` なら記録する各手番の**真実の盤面のラベル**（`VecEnv.truth()`、[N, 81] int8）を
     `truth` に入れて返す（補助ヘッド用。乱数は消費しない）
@@ -1104,18 +1134,26 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
     `mu_logp`（`legal_cols` と同じ CSR の並び）も返す（MMD 学習器〔`mmd.py`〕が使う。`compact_legal=True` に限り、
     相手のネットに指させる局〔opponents〕とは使えない）。乱数は消費しないので、ほかのキーは付けないときと同じ
 
+    `shaping`（`shaping.Shaping`）を渡すと、**局の信号**（`VecEnv.signals()`: 駒得・反則・王手・手数など）の差分に重みを
+    掛けた報酬を足す（`shape_mult` は重みの倍率。tsuitate-bot の docs/rl-fixed-opponent.md）。足す先は env の報酬と同じ
+    （自己対局は [先手, 後手] の両方をその時刻へ、相手を固定した局は学習側の列だけを学習側の直前の手番へ）。
+    `outcome` は env の勝敗のまま。`watch_signals=True`（`shaping` があれば常に）なら、局ごとの信号の監視値の元
+    （`shaping.ShapeRun`）を `shape_run` に入れて返す。どちらも乱数は消費しないので、ほかのキーは付けないときと同じ。
+    `fast` とは一緒に使えない
+
     `fast="py"` / `"rust"` は**同じ batch をビット単位で同じに作る、CPU の仕事を減らした経路**（`_collect_fast`。
     docs/rl-learning-speed.md「さらに速くする」の S1）。自己対局（opponents なし）・入玉ボーナスなし・truth なし・
     `compact_legal=True` に限る。"rust" は `VecEnv.observe_alive_f16_csr`（rl-env を作り直した tsuitate_rl）を使う
     """
-    if actor_extras and (not compact_legal or opponents is not None):
-        raise ValueError("collect(actor_extras=True) は compact_legal=True で、opponents なしに限る")
+    if actor_extras and not compact_legal:
+        raise ValueError("collect(actor_extras=True) は compact_legal=True に限る")
+    watch_signals = watch_signals or shaping is not None
     if fast:
         if fast not in ("py", "rust"):
             raise ValueError(f"fast {fast!r}（'py' か 'rust'）")
-        if opponents is not None or nyugyoku_lambda != 0 or truth or not compact_legal:
+        if opponents is not None or nyugyoku_lambda != 0 or truth or not compact_legal or watch_signals:
             raise ValueError("collect(fast=...) は自己対局（opponents なし）・入玉ボーナスなし・truth なし・"
-                             "compact_legal=True に限る")
+                             "報酬の整形と信号の監視なし・compact_legal=True に限る")
         if fast == "rust" and not all(hasattr(e, "observe_alive_f16_csr") for e in getattr(env, "envs", [env])):
             raise ValueError("collect(fast='rust') には VecEnv.observe_alive_f16_csr が要る（tsuitate-bot の rl-env を"
                              " maturin develop で作り直す）")
@@ -1132,6 +1170,13 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
     last_act = np.full((B, 2), -1, dtype=np.int64)
     outcome = np.zeros((B, 2), dtype=np.float32)
     pending = []  # nyugyoku_win_only のとき、終局まで保留する (時刻, 局, 側, ボーナス)
+    shape_run = None
+    if watch_signals:
+        from shaping import ShapeRun, env_signal_names
+        names = shaping.names if shaping is not None else env_signal_names()
+        if names is None or not all(hasattr(e, "signals") for e in getattr(env, "envs", [env])):
+            raise ValueError("局の信号（VecEnv.signals）が無い。tsuitate-bot の rl-env を maturin develop で作り直す")
+        shape_run = ShapeRun(names, env.signals(), shaping, shape_mult)
     for t in range(max_steps):
         alive = env.alive()
         if not alive.any():
@@ -1187,14 +1232,37 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
                 a, mu = sample_actions(net, obs[idx], mask[idx], device, generator)
             actions[idx] = a.numpy()
         if opp_by:
-            groups = {name: np.array(bs, dtype=np.int64) for name, bs in opp_by.items()}
+            # ハンデつきの相手（<名前>@<ε>）は同じネット（<名前>）にまとめて推論し、後から雑音の手に差し替える
+            merged, noisy = {}, []
+            for spec, bs in opp_by.items():
+                name, eps = split_noise(spec)
+                merged.setdefault(name, []).extend(bs)
+                if eps > 0:
+                    noisy.append((bs, eps))
+            groups = {name: np.array(bs, dtype=np.int64) for name, bs in merged.items()}
             if isinstance(opp_nets, OpponentPool):
                 for name, a_opp in opp_nets.sample(groups, obs, mask, device).items():
                     actions[groups[name]] = a_opp
             else:
                 for name, bs in groups.items():
                     actions[bs] = sample_actions(opp_nets[name], obs[bs], mask[bs], device)[0].numpy()
+            if noisy:
+                if noise_rng is None:
+                    raise ValueError("ハンデつきの相手（<名前>@<ε>）には noise_rng が要る")
+                u = np.full(B, -1.0)
+                for bs, eps in noisy:
+                    bs = np.array(bs, dtype=np.int64)
+                    hit = noise_rng.random(len(bs)) < eps
+                    u[bs[hit]] = noise_rng.random(int(hit.sum()))
+                if (u >= 0).any():
+                    a_noise = env.random_legal_actions(u)
+                    sel = a_noise >= 0
+                    actions[sel] = a_noise[sel]
         rew, done = env.step(actions)
+        outcome[done] = rew[done]
+        if shape_run is not None:
+            # 勝敗（outcome）は env の報酬のまま。学習の報酬にだけ整形を足す
+            rew = rew + shape_run.step(env.signals(), done, rew)
         valid[t, idx] = True
         player[t, idx] = torch.from_numpy(pl[idx].astype(np.int64))
         # ボーナスは過去の時刻へ足すので、この時刻の報酬は上書きでなく加算
@@ -1208,7 +1276,6 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
                 elif last_act[b, o[1]] >= 0 and rew[b, o[1]] != 0:
                     # 学習側の列だけを、学習側の直前の手番（この時刻の手番なら t）へ
                     reward[last_act[b, o[1]], b, o[1]] += float(rew[b, o[1]])
-        outcome[done] = rew[done]
         if not len(idx):
             continue
         obs_l.append(torch.from_numpy(obs[idx]).half())
@@ -1235,6 +1302,8 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
     extra = {"truth": torch.cat(truth_l)} if truth else {}
     if actor_extras:
         extra.update(v_actor=torch.cat(v_l), mu_logp=torch.cat(lp_l))
+    if shape_run is not None:
+        extra["shape_run"] = shape_run
     return {**extra,
         **({"legal_cols": torch.cat([c for c, _ in legal_l]), "legal_counts": torch.cat([n for _, n in legal_l])}
            if compact_legal else {"legal": torch.cat(legal_l)}),
