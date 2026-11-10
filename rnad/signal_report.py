@@ -112,9 +112,11 @@ def cmd_curve(args):
             print(f"## {run}: 範囲に行が無い")
             continue
         cols = [(column(names, k), h) for k, h in CURVE_COLS if k.split("_", 1)[-1] in names or k in names]
+        vs = [v for v in args.vs.split(",") if v]
         print(f"\n## {run}（{rows[0]['step']}〜{rows[-1]['step']} 更新、窓 {args.window}）\n")
-        print("| 更新 | 局 | 得点 | 勝 / 負 / 分 | " + " | ".join(h for _, h in cols) + " | 整形の合計 | 倍率 |")
-        print("| --- | --- | --- | --- | " + " | ".join("---" for _ in cols) + " | --- | --- |")
+        print("| 更新 | 局 | 得点 | 勝 / 負 / 分 | " + "".join(f"対 {v}（局） | " for v in vs)
+              + " | ".join(h for _, h in cols) + " | 整形の合計 | 倍率 |")
+        print("| --- | --- | --- | --- | " + "--- | " * len(vs) + " | ".join("---" for _ in cols) + " | --- | --- |")
         for i in range(0, len(rows), args.window):
             chunk = rows[i:i + args.window]
             st = window_stats(chunk, dim)
@@ -124,8 +126,13 @@ def cmd_curve(args):
             score, n = score_of(st)
             shaped = [x["signals"]["shaped_total"]["mean"] for x in chunk if "shaped_total" in x["signals"]]
             mult = [x["shape_mult"] for x in chunk if "shape_mult" in x]
+            vs_cells = ""
+            for v in vs:
+                # その相手との局だけの得点（学習中の対局。log の league_games = 更新ごとの相手別の [勝, 負, 分]）
+                w, l, d = (sum(x.get("league_games", {}).get(v, [0, 0, 0])[i] for x in chunk) for i in range(3))
+                vs_cells += (f"{(w + 0.5 * d) / (w + l + d):.3f}（{w + l + d}） | " if w + l + d else "— | ")
             print(f"| {chunk[0]['step']}〜{chunk[-1]['step']} | {n} | {score:.3f} | "
-                  f"{st['win'].n} / {st['loss'].n} / {st['draw'].n} | "
+                  f"{st['win'].n} / {st['loss'].n} / {st['draw'].n} | " + vs_cells
                   + " | ".join(f"{allm.mean(c):.2f}" for c, _ in cols)
                   + f" | {(sum(shaped) / len(shaped)) if shaped else float('nan'):+.3f}"
                   + f" | {(sum(mult) / len(mult)) if mult else float('nan'):.2f} |")
@@ -179,6 +186,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("runs", nargs="+", type=pathlib.Path, help="train_rnad.py の --out（log.jsonl と config.json）")
     ap.add_argument("--window", type=int, default=50, help="学習曲線の窓（更新回数）")
+    ap.add_argument("--vs", default="", help="学習曲線に、この相手との局だけの得点の列を足す（カンマ区切り。--league の名前。"
+                                             "ハンデの梯子の run で本物の相手への得点を見る）")
     ap.add_argument("--from", dest="from_", type=int, default=0, help="この更新から")
     ap.add_argument("--to", type=int, default=0, help="この更新まで（0 = 最後まで）")
     ap.add_argument("--split", action="store_true", help="勝ち局と負け局を分ける信号の表を出す")

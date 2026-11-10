@@ -206,7 +206,7 @@ X=rl_mmdopen_v15
     --mmd-magnet uniform --mmd-temp 0.01,0,0.01,0.01 --mmd-lr 3e-4,0,3e-4,3e-4 \
     --mmd-steps 8 --mmd-epochs 2 --mmd-adv-norm 0.001 \
     --export-every 100 --export-current --out out_rnad/fx_ladder_foul --steps 4000
-.venv/bin/python rnad/signal_report.py out_rnad/fx_ladder_foul                 # 学習曲線（得点と信号）
+.venv/bin/python rnad/signal_report.py out_rnad/fx_ladder_foul --vs $X         # 学習曲線（得点と信号。--vs で本物の相手への得点の列）
 .venv/bin/python rnad/signal_report.py out_rnad/fx_ladder_foul --split         # 勝ち局と負け局を分ける信号
 .venv/bin/python rnad/ladder_eval.py out_rnad/fx_ladder_foul --opponent $X     # ハンデの梯子で測る（ε50）
 .venv/bin/python rnad/ladder_eval.py out_rnad/fx_ladder_foul --report
@@ -231,6 +231,8 @@ X=rl_mmdopen_v15
 
 - 報酬は 1 + cap + λ で割って価値の頭（tanh）の範囲に収める（`reward_scale`。倍率で下げ切った後も変えない）。MMD は磁石の温度と
   近い方策への KL の係数も同じ倍率で縮める（R-NaD が η を割るのと同じ）
+- 整形の設定（重み・形・上限・負けの長さ）は checkpoint（`collect_cfg`）と `config.json` に残り、再開で付け忘れる・変えると止まる
+  （`--override-config` で通す）。倍率の予定（`--shape-decay`）だけは再開で変えてよい（勝ちが出てきたのを見てから下げ始められる）
 - `--pipeline`・`--fast-collect`・`--open-book` とは一緒に使えない（速い収集は信号を読まない。強制した手の駒得が報酬に入る）。
   自己対局の局がある設定で零和でない整形（反対称でない重み・`--lose-len`）を付けると注意を出す（R-NaD の前提が外れる）
 - ログ: `signals`（勝ち局・負け局・引き分けごとに、終局時と両者の受理手の合計が 20 / 40 / 60 に届いた時点の信号の平均と標準偏差。

@@ -619,8 +619,11 @@ def main() -> None:
                  else {"rnad": dict(cfg.__dict__)})}
     if open_cfg is not None:
         record["opening"] = open_cfg
+    # checkpoint に残す整形の設定（倍率の予定は除く）
+    shape_cfg = None
     if shape is not None:
         record["shaping"] = shape.config()
+        shape_cfg = {k: v for k, v in shape.config().items() if k != "decay"}
     if watch_signals:
         record["signal_names"] = signal_names
     if ck is not None:
@@ -629,6 +632,11 @@ def main() -> None:
         old_open = (ck.get("collect_cfg") or {}).get("opening")
         if old_open != open_cfg:
             diff["opening"] = (old_open, open_cfg)
+        # 報酬の整形も同じ（付け忘れると報酬の単位 reward_scale が黙って変わる）。倍率の予定（--shape-decay）だけは
+        # 再開で変えてよい（勝ちが出てきたのを見てから下げ始める使い方のため）
+        old_shape = (ck.get("collect_cfg") or {}).get("shaping")
+        if old_shape != shape_cfg:
+            diff["shaping"] = (old_shape, shape_cfg)
         if diff and not args.override_config:
             raise SystemExit(f"checkpoint と設定が違う: {diff}（(保存, 今)）。"
                              "意図した変更なら --override-config を付ける")
@@ -644,7 +652,7 @@ def main() -> None:
             print(f"乱数を --seed {args.seed} で作り直した（checkpoint の乱数状態は使わない）", flush=True)
         if diff:
             print(f"再開時に設定を上書き: {diff}")
-        if set(diff) - {"opening"}:
+        if set(diff) - {"opening", "shaping"}:
             learner.apply_cfg(learner_cfg, **({"old": ck["cfg"]} if args.algo == "mmd" else {}))
         elif args.algo == "mmd":
             pass  # MMD の学習率は毎更新で予定から入れ直す
@@ -709,7 +717,8 @@ def main() -> None:
     log = open(out / "log.jsonl", "a")
 
     def save_all():
-        save_checkpoint(learner, ck_path, None if open_cfg is None else {"opening": open_cfg})
+        collect_cfg = {k: v for k, v in (("opening", open_cfg), ("shaping", shape_cfg)) if v is not None}
+        save_checkpoint(learner, ck_path, collect_cfg or None)
         if extra_ema:
             tmp = out / "extra_ema.tmp"
             torch.save({"step": learner.step_count, "nets": {str(t): n.state_dict() for t, n in extra_ema.items()}}, tmp)

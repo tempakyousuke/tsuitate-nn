@@ -427,12 +427,25 @@ def check_train(tmp):
             assert cfg["signal_names"] == NAMES and cfg["shaping"]["mode"] == mode
             assert cfg["shaping"]["own"] == {"capture_value": 0.03, "fouls": -0.02}
             assert cfg["shaping"]["opp"] == {"capture_value": -0.03}
+    # 再開: 整形の設定は checkpoint に残り、付け忘れ・違う重みは止まる。倍率の予定（--shape-decay）だけは変えてよい
+    out = tmp / "mmd_plain"
+    r = run_train(out, "--league", "heuristic", "--league-frac", "1", steps=4, check=False)
+    assert r.returncode != 0 and "shaping" in r.stderr, r.stderr[-600:]
+    r = run_train(out, *shape[:4], "--shape", "d_capture_value=0.05", *shape[6:], steps=4, check=False)
+    assert r.returncode != 0 and "shaping" in r.stderr, r.stderr[-600:]
+    run_train(out, *shape[:-2], "--shape-decay", "2:4", "--shape-mode", "plain", steps=5)
+    lines = [json.loads(x) for x in open(out / "log.jsonl") if x.strip()]
+    assert [x["shape_mult"] for x in lines[3:]] == [0.5, 0.0] and lines[-1]["reward_scale"] == 1.8
+    ck = torch.load(out / "checkpoint.pt", map_location="cpu")
+    assert ck["collect_cfg"]["shaping"]["mode"] == "plain" and "decay" not in ck["collect_cfg"]["shaping"]
+    # 整形を付けない run の checkpoint には集め方の設定を書かない（従来と同じ中身）
     # 監視だけ（報酬は変えない）: 自己対局でも出る。reward_scale は 1 のまま
     out = tmp / "watch"
     run_train(out, "--watch-signals", steps=1)
     x = json.loads(open(out / "log.jsonl").readline())
     assert x["reward_scale"] == 1.0 and "shape_mult" not in x
     assert x["signals"]["win"]["final"]["n"] + x["signals"]["draw"]["final"]["n"] // 2 == 6
+    assert "collect_cfg" not in torch.load(out / "checkpoint.pt", map_location="cpu")
     # 既定（付けない）なら signals は出ない = 収集は従来と同じ経路
     run_train(tmp / "off", steps=1)
     assert "signals" not in json.loads(open(tmp / "off" / "log.jsonl").readline())
