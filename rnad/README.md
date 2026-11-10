@@ -193,24 +193,32 @@ R-NaD の checkpoint から続ける（net ← 現在のネット、ターゲッ
 ## 相手を固定してゼロから学習する（報酬の整形・ハンデの梯子）
 
 既存のモデルを相手に、乱数初期化から「早くその相手に勝てるようになる学習方法」を探すための道具。
-設計・計測・GPU での手順は tsuitate-bot の `docs/rl-fixed-opponent.md`。**どれも既定は使わない**（付けなければ本線は従来と同じ）。
+設計・CPU のパイロットの結果・GPU での手順は tsuitate-bot の `docs/rl-fixed-opponent.md`。**どれも既定は使わない**
+（付けなければ本線は従来と同じ）。
 
 ```sh
 # tsuitate-bot の rl-env を入れ直してから（VecEnv の signals / random_legal_actions・相手の <名前>@<ε> が要る）
 .venv/bin/python rnad/tests/test_shaping.py
 X=rl_mmdopen_v15
+# パイロットで離陸した設定（32ch×3・相手1体・駒得の報酬。CPU 1スレッドで 1更新 約5〜7秒）
 .venv/bin/python -u rnad/train_rnad.py --algo mmd --init none --anchor none --eval-every 0 --planes 91 \
-    --compact-legal --batch 64 --league-frac 1 --league-device gpu \
-    --league $X@1,$X@0.6,$X@0.3,$X@0.1,$X --league-weighting even \      # ハンデの梯子（相手は $X だけでもよい）
-    --shape fouls=-0.05 --shape-cap 0.5 --shape-decay 2000:4000 \         # 報酬の整形（下の表）
+    --channels 32 --blocks 3 --batch 64 --compact-legal --league $X --league-frac 1 --league-device gpu \
+    --shape d_capture_value=0.02 --shape-cap 0.5 \
     --mmd-magnet uniform --mmd-temp 0.01,0,0.01,0.01 --mmd-lr 3e-4,0,3e-4,3e-4 \
     --mmd-steps 8 --mmd-epochs 2 --mmd-adv-norm 0.001 \
-    --export-every 100 --export-current --out out_rnad/fx_ladder_foul --steps 4000
-.venv/bin/python rnad/signal_report.py out_rnad/fx_ladder_foul --vs $X         # 学習曲線（得点と信号。--vs で本物の相手への得点の列）
-.venv/bin/python rnad/signal_report.py out_rnad/fx_ladder_foul --split         # 勝ち局と負け局を分ける信号
-.venv/bin/python rnad/ladder_eval.py out_rnad/fx_ladder_foul --opponent $X     # ハンデの梯子で測る（ε50）
-.venv/bin/python rnad/ladder_eval.py out_rnad/fx_ladder_foul --report
+    --export-every 100 --export-current --checkpoint-every 50 --seed 1 --steps 600 --out out_rnad/fx_mat
+.venv/bin/python rnad/signal_report.py out_rnad/fx_mat --vs $X                 # 学習曲線（得点と信号。--vs でその相手への得点の列）
+.venv/bin/python rnad/signal_report.py out_rnad/fx_mat --split                 # 勝ち局と負け局を分ける信号
+.venv/bin/python rnad/ladder_eval.py out_rnad/fx_mat --opponent $X             # ハンデの梯子で測る（ε50）
+.venv/bin/python rnad/ladder_eval.py out_rnad/fx_mat --report
+# 勝ちが出てきたら、同じ out を --shape-decay <今の更新>:<今の更新 + 200> --steps <...> を付けて再開（勝敗だけの報酬へ戻す）
 ```
+
+**パイロットで分かったこと**（2026-11-10、詳細は上の doc）: 勝敗だけの報酬は 1局も勝てない間は信号が無い（約 2.9万局で勝率 0.0〜0.1% の
+まま）。駒得の報酬の 1本は約 1.9万局で離陸して 3.8万局で rl_mmdopen_v15 に五分（アリーナ 53.0% ± 9.8）になり、整形を 0 へ下げても
+保ったが、**4 seed 中 1本だけ**で、勝ち方は決まった1本の手順への特化（別系統の凍結版には 0〜2%）。**`fouls` のペナルティだけを
+付けるのは逆効果**（早く詰まされるほうが得になる）。梯子を `--league-weighting even` で回すと引き分けの多い最下段（ε = 1）に
+配分が張り付く。
 
 - **学習器は `--algo mmd`**（PPO 型）を `--league <相手> --league-frac 1` で使う。相手を固定した学習は一人用の RL で、
   磁石は一様（= エントロピーの正則化）にする。R-NaD（既定）でも同じフラグで回る
