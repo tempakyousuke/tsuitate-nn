@@ -82,6 +82,47 @@ def check_pool():
     print("OK: OpponentPool の積み重ねた推論 = 相手ごとの推論、サンプルはマスク内")
 
 
+def check_pool_mixed_planes():
+    """入力の版が違う相手（v1 86枚・v2 91枚・v3 101枚〔組の選び方も違う〕）を1つの pool に積んでも、相手ごとの推論と一致する"""
+    from model import NUM_PLANES_DEDUCED, NUM_PLANES_V3
+    from rnad import pad_planes
+    nets = {}
+    for i, (planes, extras) in enumerate([(86, ()), (NUM_PLANES_DEDUCED, ()), (NUM_PLANES_V3, ("opp_hand",)),
+                                          (NUM_PLANES_V3, ("opp_hand", "opp_fouls"))]):
+        torch.manual_seed(20 + i)
+        nets[f"n{i}"] = PolicyValueNet(8, 1, planes, extras).eval()
+    pool = OpponentPool(nets)
+    assert pool.planes == NUM_PLANES_V3
+    env = tsuitate_rl.VecEnv(8, seed=9, auto_reset=False, planes=NUM_PLANES_V3)
+    obs, mask, _ = env.observe()
+    x = torch.from_numpy(obs).half().float()
+    assert float(x[:, 91:].abs().sum()) >= 0.0
+    groups = {name: np.array([2 * i, 2 * i + 1]) for i, name in enumerate(nets)}
+    xs = torch.zeros((len(nets), 2, *obs.shape[1:]))
+    for name, bs in groups.items():
+        xs[pool.index[name]] = x[bs]
+    with torch.no_grad():
+        stacked = pool.forward(pool.params, pool.buffers, xs)
+        for name, bs in groups.items():
+            want = nets[name](x[bs])[0]
+            got = stacked[pool.index[name]]
+            assert float((got - want).abs().max()) < 1e-4, name
+            # 広げたネット単体でも同じ（価値も）
+            lw, vw = pad_planes(nets[name], NUM_PLANES_V3).eval()(x[bs])
+            l0, v0 = nets[name](x[bs])
+            assert float((lw - l0).abs().max()) < 1e-5 and float((vw - v0).abs().max()) < 1e-6, name
+    acts = pool.sample(groups, obs, mask, DEV)
+    for name, bs in groups.items():
+        assert all(mask[b, a] for b, a in zip(bs, acts[name]))
+    try:
+        pad_planes(nets["n3"], 91)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("狭める指定が通った")
+    print("OK: 入力の版が違う相手（86 / 91 / 101枚）を1つの pool に積んでも、相手ごとの推論と一致する")
+
+
 def check_collect_opponents():
     torch.manual_seed(0)
     learner = PolicyValueNet(8, 1).eval()
@@ -116,4 +157,5 @@ def check_collect_opponents():
 if __name__ == "__main__":
     check_roundtrip()
     check_pool()
+    check_pool_mixed_planes()
     check_collect_opponents()

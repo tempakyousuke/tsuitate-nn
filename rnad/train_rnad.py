@@ -692,6 +692,11 @@ def main() -> None:
             if any(split_noise(n)[1] > 0 for n in league.names) and not hasattr(tsuitate_rl.VecEnv, "random_legal_actions"):
                 raise SystemExit("ハンデつきの相手（<名前>@<ε>）には VecEnv.random_legal_actions が要る"
                                  "（tsuitate-bot の rl-env を maturin develop で作り直す）")
+            # 相手の入力が学習側の観測より広いと読めない（相手のネットは学習側の env の観測を読む）
+            wide = {n: m.config["planes"] for n, m in opp_nets.items() if m.config["planes"] > init_net.config["planes"]}
+            if wide:
+                raise SystemExit(f"リーグの相手の入力（{wide}）が学習するネットの観測（{init_net.config['planes']}枚）より広い。"
+                                 "学習側を同じ版にする（v3 なら --opp-hand-planes など）か、--league-device rust を使う")
             # 全相手を1回の推論で指させる（相手ごとに推論すると相手の数だけ直列になり速くならない）
             opp_nets = OpponentPool(opp_nets)
         else:

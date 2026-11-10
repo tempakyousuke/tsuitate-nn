@@ -947,6 +947,27 @@ def _gumbel_sample(logits, legal, generator):
     return action.cpu(), prob.cpu()
 
 
+def pad_planes(net, planes: int):
+    """入力を `planes` 枚に広げた、**同じ関数**のネット（足した stem の列は 0。観測の先頭が同じなので、広い観測を渡しても
+    元のネットと同じ出力になる）。v3 の「使わない組を 0 にしてから読む」マスクは外す（その列の重みはもともと 0 のまま
+    なので結果は同じ）。相手のネットをまとめて推論する `OpponentPool` が、入力の版の違う相手を1つに積むために使う"""
+    from model import EXTRA_PLANES, NUM_PLANES_V3, PolicyValueNet
+    cfg = net.config
+    if cfg["planes"] > planes:
+        raise ValueError(f"入力 {cfg['planes']}枚のネットを {planes}枚へは狭められない")
+    if cfg["planes"] == planes and getattr(net, "in_off", None) is None:
+        return net
+    wide = PolicyValueNet(cfg["channels"], cfg["blocks"], planes,
+                          sorted(EXTRA_PLANES) if planes == NUM_PLANES_V3 else ())
+    sd = {k: v.clone() for k, v in net.state_dict().items()}
+    w = sd["stem.weight"]
+    stem = torch.zeros((w.shape[0], planes, *w.shape[2:]), dtype=w.dtype, device=w.device)
+    stem[:, :w.shape[1]] = w
+    sd["stem.weight"] = stem
+    wide.load_state_dict(sd)
+    return wide.to(w.device)
+
+
 class OpponentPool:
     """リーグの相手のネットを**まとめて1回の推論**で指させる（`collect` の `opp_nets` に渡す）。
 
@@ -961,7 +982,11 @@ class OpponentPool:
         from torch.func import functional_call, stack_module_state
         self.names = list(nets)
         self.index = {n: i for i, n in enumerate(self.names)}
-        mods = [nets[n].eval() for n in self.names]
+        # 入力の版（v1 = 86枚 / v2 = 91枚 / v3 = 101枚）が違う相手は、いちばん広い版にそろえてから積む
+        # （`pad_planes`。足した列は 0 なので同じ関数）。それまでは版が混ざると積めずに落ちていた
+        planes = max(n.config["planes"] for n in nets.values())
+        self.planes = planes
+        mods = [pad_planes(nets[n], planes).eval() for n in self.names]
         self.params, self.buffers = stack_module_state(mods)
         base = copy.deepcopy(mods[0]).to("meta")
 
