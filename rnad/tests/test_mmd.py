@@ -1008,6 +1008,39 @@ def check_check_unit_train(tmp):
           "設定が checkpoint に残る。turn は序盤の強制と使えない")
 
 
+def check_pipeline_league(tmp):
+    """--pipeline と --league（Rust の評価モードの相手）・--open-book を一緒に回す: 局の配分が [自己対局, リーグ] で合い、
+    リーグの勝敗が数えられ、序盤の強制の監視値は自己対局の局だけから出る。自己対局なし（--league-frac 1）も回る"""
+    book = write_small_book(tmp)
+    out = tmp / "pipe_league"
+    common = ["--league", "heuristic", "--pipeline", "--fast-collect", "py", "--device-batch", "--mmd-chunk", "64"]
+    run_train(out, *common, "--league-frac", "0.34", "--open-book", book, "--open-p", "0.5", steps=4)
+    raw = [json.loads(line) for line in open(out / "log.jsonl") if line.strip()]
+    assert len(raw) == 4
+    for x in raw:
+        # batch 6 = 自己対局 4 + リーグ 2（2局単位）
+        assert x["games"] == 4, x["games"]
+        assert sum(sum(v) for v in x["league_games"].values()) == 2, x["league_games"]
+        assert "opening" in x and "heuristic" in x["league"], x.keys()
+        assert math.isfinite(x["loss_nerd"]) and math.isfinite(x["loss_v"])
+    state = json.loads((out / "league.json").read_text())
+    assert state, "league.json にリーグの勝敗が残る"
+    # 続きから回せる（league.json と checkpoint から再開）
+    run_train(out, *common, "--league-frac", "0.34", "--open-book", book, "--open-p", "0.5", steps=6)
+    assert sum(1 for line in open(out / "log.jsonl") if line.strip()) >= 6
+    # 自己対局なし: 全部の局がリーグ
+    out1 = tmp / "pipe_league_all"
+    run_train(out1, *common, "--league-frac", "1", steps=3)
+    for line in open(out1 / "log.jsonl"):
+        x = json.loads(line)
+        assert x["games"] == 0 and sum(sum(v) for v in x["league_games"].values()) == 6, x["league_games"]
+    # 相手をネットに指させるリーグ（--league-device gpu）は --pipeline と使えない
+    r = run_train(tmp / "pipe_league_gpu", *common, "--league-device", "gpu", steps=1, check=False)
+    assert r.returncode != 0, "--pipeline と --league-device gpu は止まる"
+    print("T15 --pipeline とリーグ: 自己対局 4 + リーグ 2 で回り、勝敗が league.json に残り、再開できる。"
+          "--league-frac 1 も回る")
+
+
 def check_smoke(tmp):
     """pipeline・fast py・device_batch で3つの preset を回し、NaN なし・ログのキーあり・stage_log.py が読める"""
     for preset in ("tsuitate", "mixinit", "ataraxos"):
@@ -1056,4 +1089,5 @@ if __name__ == "__main__":
         check_init_from_rnad(tmp)
         check_rejects(tmp)
         check_check_unit_train(tmp)
+        check_pipeline_league(tmp)
         check_smoke(tmp)

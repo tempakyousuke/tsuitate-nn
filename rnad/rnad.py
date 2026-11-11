@@ -1461,23 +1461,31 @@ class PipelinedCollector:
         self.generator.manual_seed(seed)
         self.stream = torch.cuda.Stream(device=device, priority=-1) if device.type == "cuda" else None
 
-    def _work(self, net, ready, opening_seed):
+    def _work(self, net, ready, opening_seed, league):
         if not hasattr(self.local, "env"):
-            self.local.env = self.env_factory()
-        if opening_seed is not None:
-            self.local.env.set_opening_seed(opening_seed)  # 序盤の強制の乱数列（collect の reset から効く）
+            self.local.env = self.env_factory()  # 自己対局の局が無い（リーグだけ）なら None
+        self_env = self.local.env
+        if opening_seed is not None and self_env is not None:
+            self_env.set_opening_seed(opening_seed)  # 序盤の強制の乱数列（collect の reset から効く）
+        # リーグの局（相手を固定した評価モードの env）は batch ごとに相手の配分が変わるので毎回作る。
+        # 自己対局の env の後ろにつなげる（局の並びは --pipeline なしと同じ [自己対局, リーグ]）
+        league_env = league() if league is not None else None
+        envs = [e for e in (self_env, league_env) if e is not None]
+        env = envs[0] if len(envs) == 1 else MultiEnv(envs)
         t0 = time.time()
         if self.stream is None:
-            batch = collect(self.local.env, net, self.device, generator=self.generator, **self.collect_kw)
+            batch = collect(env, net, self.device, generator=self.generator, **self.collect_kw)
         else:
             self.stream.wait_event(ready)  # 写しを作り終えてから使う
             with torch.cuda.stream(self.stream):
-                batch = collect(self.local.env, net, self.device, generator=self.generator, **self.collect_kw)
+                batch = collect(env, net, self.device, generator=self.generator, **self.collect_kw)
             self.stream.synchronize()
-        finished = self.local.env.pop_finished()
-        return batch, finished, time.time() - t0
+        finished = self_env.pop_finished() if self_env is not None else []
+        league_finished = league_env.pop_finished() if league_env is not None else []
+        return batch, finished, time.time() - t0, league_finished
 
-    def submit(self, net, opening_seed=None):
+    def submit(self, net, opening_seed=None, league=None):
+        """`league` はリーグの env を作る関数（集める側のスレッドの中で呼ぶ。VecEnv は unsendable）。None = 自己対局だけ"""
         if self.future is not None:
             raise RuntimeError("前の batch を受け取る前に次を頼んだ")
         snap = copy.deepcopy(net).eval()
@@ -1486,13 +1494,13 @@ class PipelinedCollector:
         if self.stream is not None:
             ready = torch.cuda.Event()
             ready.record()  # 既定のストリーム上で写しを作り終えた印
-        self.future = self.pool.submit(self._work, snap, ready, opening_seed)
+        self.future = self.pool.submit(self._work, snap, ready, opening_seed, league)
 
     def result(self):
-        """(batch, 終局した局, 集めるのにかかった秒)"""
-        out = self.future.result()
+        """(batch, 自己対局の終局した局, 集めるのにかかった秒)。リーグの終局した局は `league_finished` に置く"""
+        *out, self.league_finished = self.future.result()
         self.future = None
-        return out
+        return tuple(out)
 
     def close(self):
         self.pool.shutdown(wait=True)
