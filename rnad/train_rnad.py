@@ -358,7 +358,7 @@ def main() -> None:
                          "まれな手の 1/μ による分散が消える）")
     ap.add_argument("--pipeline", action="store_true",
                     help="自己対局を別スレッドで集めて更新と重ねる（1更新遅れの方策で集める。rnad.PipelinedCollector）。"
-                         "自己対局だけ・ボーナスなし・補助ヘッドなしの設定に限る")
+                         "ボーナスなし・補助ヘッドなしの設定に限る（リーグは --league-device rust なら使える）")
     ap.add_argument("--reuse", type=int, default=1,
                     help="1つの batch で続けて更新する回数（2 以上で標本を使い回す。2回目以降は π/μ ≠ 1 を"
                          "v-trace が補正する。正則化方策の差し替え間隔は更新回数で数える）")
@@ -510,7 +510,9 @@ def main() -> None:
         if not (0.0 < args.open_p <= 1.0) or not args.open_book:
             raise SystemExit("序盤の強制は --open-book と --open-p（0 < p ≤ 1）を一緒に指定する"
                              "（--open-len / --open-weight もこの2つと一緒に使う）")
-        bad = [f for f, on in (("--league", args.league), ("--guard", args.guard), ("--speed", args.speed),
+        # --league とは使える: 強制するのは自己対局の局だけで、リーグの局（相手を固定した局）は強制しない
+        # （リーグの env には定跡を渡さない。--league-frac 1 で自己対局の局が無ければ何も強制されない）
+        bad = [f for f, on in (("--guard", args.guard), ("--speed", args.speed),
                                ("--nyugyoku", args.nyugyoku), ("--c-ply", args.c_ply),
                                ("--mmd-lambda-unit turn", mcfg is not None and mcfg.lambda_unit == "turn"),
                                ("--mmd-gae-lambda-unit turn", mcfg is not None and mcfg.gae_lambda_unit == "turn"))
@@ -520,7 +522,7 @@ def main() -> None:
             # 反則とみなすので、相手の強制した手をはさんだ手番を取り違える（turn+check は反則を観測から読むので
             # 使える）。c_ply は collect の行の番号で数えるので、
             # 強制した手（行にならない）のぶん手数がずれる
-            raise SystemExit(f"序盤の強制は {' '.join(bad)} と一緒に使えない（自己対局だけ・ボーナスなし）")
+            raise SystemExit(f"序盤の強制は {' '.join(bad)} と一緒に使えない（ボーナスなし）")
         stale = openings.check_env_support()
         if stale:
             raise SystemExit(f"tsuitate_rl が序盤の強制を知らない（{stale}）。tsuitate-bot の rl-env を maturin develop で作り直す")
@@ -822,15 +824,29 @@ def main() -> None:
             tail["sum"], tail["n"] = None, 0
     pipe = None
     if args.pipeline:
-        if league is not None or args.guard or args.speed or args.nyugyoku or cfg.aux_truth > 0:
-            raise SystemExit("--pipeline は自己対局だけ・ボーナスなし・補助ヘッドなしの設定で使う")
+        if (league is not None and args.league_device == "gpu") or args.guard or args.speed or args.nyugyoku \
+                or cfg.aux_truth > 0 or watch_signals:
+            raise SystemExit("--pipeline はボーナスなし・補助ヘッドなし・報酬の整形と局の信号の監視なしの設定で使う"
+                             "（リーグは --league-device rust だけ）")
         pipe = PipelinedCollector(
-            lambda: tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False, **obs_kw, **open_kw), device,
+            lambda: (tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False, **obs_kw, **open_kw)
+                     if n_self else None), device,
             seed=args.seed * 1_000_003 + 17 + learner.step_count, compact_legal=args.compact_legal,
             fast=args.fast_collect, actor_extras=args.algo == "mmd")
+
+        def pipe_league(step):
+            """step で使う batch のリーグの env を作る関数（env は集める側のスレッドの中で作る = VecEnv は unsendable）。
+            相手の配分と env の乱数列は --pipeline なしと同じく「その batch を使う step」で決める"""
+            if league is None or not n_league:
+                return None
+            rng = np.random.default_rng(args.seed * 1_000_003 + step)
+            opponents = [name for name, k in league.allocate(n_league, rng).items() for _ in range(k)]
+            return lambda: tsuitate_rl.VecEnv(n_league, opponents=opponents, seed=args.seed * 1_000_003 + step,
+                                              auto_reset=False, **obs_kw)
+
         # 序盤の強制の乱数列は「その batch を使う step」で決める（ループの前に頼む batch は今の step で使う）
         pipe_open_seed = open_seed(args.seed, learner.step_count) if open_kw else None
-        pipe.submit(learner.net, opening_seed=pipe_open_seed)
+        pipe.submit(learner.net, opening_seed=pipe_open_seed, league=pipe_league(learner.step_count))
 
     # 学習には使わない追加の指数移動平均（--extra-ema）。現在のネットの写しを係数ごとに持つ
     extra_ema = {}
@@ -916,9 +932,12 @@ def main() -> None:
             # 次の batch はこの反復の更新（reuse 回）の後に使うので、その step の乱数列で集める
             # （続けた run と再開した run で、同じ step の batch には同じ乱数列が付く）
             pipe_open_seed = open_seed(args.seed, learner.step_count + args.reuse) if open_kw else None
-            pipe.submit(learner.net, opening_seed=pipe_open_seed)
+            # リーグの局の勝敗は次の batch を頼む前に数える（次の相手の配分に、受け取った batch までの勝率が入る。
+            # 再開したときも league.json の状態から同じ配分になる）
+            league_finished = pipe.league_finished
+            league_rec = league.record(league_finished) if league is not None and n_league else {}
+            pipe.submit(learner.net, opening_seed=pipe_open_seed, league=pipe_league(learner.step_count + args.reuse))
             league_env = None
-            league_finished = []
             t1 = time.time()
         else:
             envs = [env] if env is not None else []
@@ -974,7 +993,7 @@ def main() -> None:
                 assert len(league_finished) == len(league_games), (len(league_finished), len(league_games))
                 for f, (name, color) in zip(league_finished, league_games):
                     f["opponent"], f["learner"] = name, color
-        league_rec = league.record(league_finished) if league_env is not None else {}
+            league_rec = league.record(league_finished) if league_env is not None else {}
         if args.guard and args.guard_cond == "win" and guard_lam:
             apply_guard_win_bonus(batch, [(0, finished), (n_self, league_finished)], guard_lam, args.guard_radius)
         for _ in range(args.reuse):
