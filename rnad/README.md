@@ -200,10 +200,10 @@ R-NaD の checkpoint から続ける（net ← 現在のネット、ターゲッ
 # tsuitate-bot の rl-env を入れ直してから（VecEnv の signals / random_legal_actions・相手の <名前>@<ε> が要る）
 .venv/bin/python rnad/tests/test_shaping.py
 X=rl_mmdopen_v15
-# パイロットで離陸しやすかった設定（32ch×3・相手1体・駒得 ＋ 相手玉の周りへの利き。CPU 1スレッドで 1更新 約5〜9秒）
+# パイロットで離陸しやすかった設定（32ch×3・相手1体・駒得 ＋ 相手玉の周りへの利き ＋ 相手の反則。CPU 1スレッドで 1更新 約5〜9秒）
 .venv/bin/python -u rnad/train_rnad.py --algo mmd --init none --anchor none --eval-every 0 --planes 91 \
     --channels 32 --blocks 3 --batch 64 --compact-legal --league $X --league-frac 1 --league-device gpu \
-    --shape d_capture_value=0.02,king_attack=0.03 --shape-cap 1.0 \
+    --shape d_capture_value=0.02,king_attack=0.03,opp_fouls=0.05 --shape-cap 1.0 \
     --mmd-magnet uniform --mmd-temp 0.01,0,0.01,0.01 --mmd-lr 3e-4,0,3e-4,3e-4 \
     --mmd-steps 8 --mmd-epochs 2 --mmd-adv-norm 0.001 \
     --export-every 100 --export-current --checkpoint-every 50 --seed 1 --steps 600 --out out_rnad/fx_mat
@@ -216,8 +216,8 @@ X=rl_mmdopen_v15
 # 腕（--shape の違い）× seed をまとめて回し、離陸の率と離陸までの局数を表にする（離陸 = 直近 50更新の勝率が 10% 以上）
 .venv/bin/python rnad/takeoff.py run --root out_rnad/tk --opponent $X --seeds 1,2,3,4,5,6 --steps 400 --jobs 4 \
     --arm mat1='--shape d_capture_value=0.02 --shape-cap 1.0' \
-    --arm mat_katk='--shape d_capture_value=0.02,king_attack=0.03 --shape-cap 1.0' \
-    --arm mat_ofoul='--shape d_capture_value=0.02,opp_fouls=0.05 --shape-cap 1.0'
+    --arm mat_katk_ofoul='--shape d_capture_value=0.02,king_attack=0.03,opp_fouls=0.05 --shape-cap 1.0' \
+    --arm katk_ofoul='--shape king_attack=0.03,opp_fouls=0.05 --shape-cap 1.0'
 .venv/bin/python rnad/takeoff.py report out_rnad/tk --horizon 400
 ```
 
@@ -227,15 +227,20 @@ X=rl_mmdopen_v15
 付けるのは逆効果**（早く詰まされるほうが得になる）。梯子を `--league-weighting even` で回すと引き分けの多い最下段（ε = 1）に
 配分が張り付く。
 
-**駒得に何を足すと離陸が増えるか**（2026-11-11、上の doc の 8節。打ち切り 25,600局・腕ごとに 5〜6 seed）:
+**駒得に何を足すと離陸が増えるか**（2026-11-11、上の doc の 8節。打ち切り 25,600局・腕ごとに 6 seed）:
 - **`--shape-cap` は 1.0（既定）にする**。上の「4 seed 中 1本」は上限 0.5 で回していて、駒得が +25 点で頭打ちになっていた
   （駒得だけの腕は、上限 0.5 で 4本中1本・上限 1.0 で 6本中2本）
-- **駒得 ＋ 相手玉の周りへの利き（`king_attack=0.03`）と、駒得 ＋ 相手の反則（`opp_fouls=0.05`）は、どちらも 6本中5本が
-  1.2万〜2.2万局で離陸**（駒得だけは 6本中2本）。駒得 ＋ 王手（`checks=0.05`）は 5本中3本。本数が少なく言い切れる差ではない
-  （3つを合わせて Fisher の片側 p = 0.08）が、向きはそろっている
+- **駒得 ＋ 相手玉の周りへの利き ＋ 相手の反則（`king_attack=0.03,opp_fouls=0.05`）は 6本中6本が 1.2万〜2.3万局で離陸**。
+  片方ずつ足した腕は 6本中5本ずつ、駒得だけは 6本中2本、駒得 ＋ 王手（`checks=0.05`）は 6本中4本。利きか相手の反則を入れた
+  4腕を合わせて 24本中21本 対 6本中2本（Fisher の片側 p = 0.02）
+- **駒得は無くても離陸する**: 利き ＋ 相手の反則だけ（`--shape king_attack=0.03,opp_fouls=0.05`）で 6本中5本、離陸までの局数の
+  中央値は 1.36万局でいちばん少ない。片方だけ（利きだけ・相手の反則だけ）は 4本中1本で、その1本も続かなかった（2本ずつの試行）
 - 一手詰め・詰めろ（`mate_threat=0.3`）と、王手を外す報酬（`evasions=0.03,fouls_in_check=-0.03`）は離陸しなかった（1本ずつ）
-- 勝ち方は「詰み」と「遠くからの王手で相手を反則負けに追い込む」の2通り。後者の 1本は 14,400局でアリーナの rl_mmdopen_v15 に
-  66.7% ± 11.9（どちらも学習の相手への特化）
+- 勝ち方は「詰み」と「遠くからの王手で相手を反則負けに追い込む」の2通りで、**駒得と利きの両方があると詰み、どちらかが欠けると
+  相手の反則負け**に寄る。離陸の直後のアリーナの勝率は駒得つきの組み合わせのほうが高い（rl_mmdopen_v15 に平均 32% 対 17%。
+  いちばん高い 1本は 17,600局で 58.3% ± 12.5）。どちらも学習の相手への特化（別系統の凍結版には 0〜8%）
+- **いちばん早く勝ち越した 1本は、駒得 ＋ 王手の seed 6**: ゼロから 19,200局（CPU 約 36分）でアリーナの rl_mmdopen_v15 に
+  84.5% ± 5.0（200局）。先手・後手それぞれ決まった1本の詰みの手順への特化で、1本だけの結果
 
 - **学習器は `--algo mmd`**（PPO 型）を `--league <相手> --league-frac 1` で使う。相手を固定した学習は一人用の RL で、
   磁石は一様（= エントロピーの正則化）にする。R-NaD（既定）でも同じフラグで回る
