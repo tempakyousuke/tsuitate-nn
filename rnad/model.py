@@ -21,30 +21,49 @@ NUM_PLANES_DEDUCED = 91
 # Rust 側は組の選び方を知らずに v3 の観測を全部書けばよい）。並びが固定なので、組の選び方が違うネットどうし
 # （錨・リーグ）も同じ観測を読める。v1・v2 のネットは先頭だけを読む（trunk が切る）
 NUM_PLANES_V3 = 101
+# エンコーダ v4（tsuitate-bot の `rl::encode::NUM_PLANES_V4`）: v3 の後ろに1枚。組の扱いは v3 と同じで、v3 のネットは
+# v4 の観測の先頭を読む（v3 の実験の checkpoint をそのまま使える）
+NUM_PLANES_V4 = 102
+# 組を持てるネットのプレーン数
+EXTENDED_PLANES = (NUM_PLANES_V3, NUM_PLANES_V4)
 EXTRA_PLANES = {
     "opp_hand": (91, 7),  # 案3: 相手の持ち駒の上界（駒種別）
     "opp_fouls": (98, 3),  # 案4: 相手の反則の時系列（直前の手番 / 王手を受けていた手番 / 受けていない手番）
+    "king_fouls": (101, 1),  # v4: 自玉の移動で反則したマス（鮮度は反則した手数から）
 }
 NUM_ACTION_KINDS = 139
 
 
+def planes_for(extras) -> int:
+    """組 `extras` を入れられる最小のプレーン数（組が無ければ v2）"""
+    need = max((s + n for name, (s, n) in EXTRA_PLANES.items() if name in set(extras or ())), default=0)
+    if need == 0:
+        return NUM_PLANES_DEDUCED
+    return min(p for p in EXTENDED_PLANES if p >= need)
+
+
 def normalize_extras(planes: int, extras) -> list:
-    """v3 のネットが使う組の名前（並べ替え済み）。v3 でないネットは組を持てない"""
+    """v3 / v4 のネットが使う組の名前（並べ替え済み）。v1・v2 のネットは組を持てない。
+    組はネットのプレーン数に収まっていること（v4 の組は v3 のネットには入らない）"""
     extras = sorted(set(extras or ()))
     unknown = set(extras) - set(EXTRA_PLANES)
     if unknown:
         raise ValueError(f"知らない入力プレーンの組: {sorted(unknown)}（{sorted(EXTRA_PLANES)} のどれか）")
-    if extras and planes != NUM_PLANES_V3:
-        raise ValueError(f"入力プレーンの組 {extras} は v3（{NUM_PLANES_V3}枚）のネットだけが持てる（planes {planes}）")
+    if extras and planes not in EXTENDED_PLANES:
+        raise ValueError(f"入力プレーンの組 {extras} は v3 / v4（{EXTENDED_PLANES}枚）のネットだけが持てる（planes {planes}）")
+    over = [n for n in extras if sum(EXTRA_PLANES[n]) > planes]
+    if over:
+        raise ValueError(f"入力プレーンの組 {over} は {planes}枚のネットに入らない（{planes_for(over)}枚が要る）")
     return extras
 
 
 def unused_planes(planes: int, extras) -> list:
-    """ネットが使わない入力プレーンの番号（v3 で選ばなかった組）。v1・v2 は空"""
-    if planes != NUM_PLANES_V3:
+    """ネットが使わない入力プレーンの番号（v3 / v4 で選ばなかった組）。v1・v2 は空"""
+    if planes not in EXTENDED_PLANES:
         return []
     extras = normalize_extras(planes, extras)
-    return [i for name, (s, n) in EXTRA_PLANES.items() if name not in extras for i in range(s, s + n)]
+    return [i for name, (s, n) in EXTRA_PLANES.items()
+            if name not in extras and s + n <= planes for i in range(s, s + n)]
 
 
 class ResBlock(nn.Module):
@@ -66,7 +85,7 @@ class PolicyValueNet(nn.Module):
         super().__init__()
         extras = normalize_extras(planes, extras)
         self.config = {"planes": planes, "channels": channels, "blocks": blocks}
-        if planes == NUM_PLANES_V3:
+        if planes in EXTENDED_PLANES:
             self.config["extras"] = extras
         self.stem = nn.Conv2d(planes, channels, 3, padding=1, bias=False)
         # 使わない入力プレーン（v3 で選ばなかった組）。入力を 0 にするので stem のその列には勾配が来ず、
