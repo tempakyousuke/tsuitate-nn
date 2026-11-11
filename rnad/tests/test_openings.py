@@ -389,6 +389,7 @@ def check_train(tmp):
     for extra, msg in [
         (["--open-p", "0.5"], "--open-book"),
         (["--open-book", str(book)], "--open-p"),
+        # --league とは使える（強制するのは自己対局の局だけ。tests/test_mmd.py の T15）
         (["--open-book", str(book), "--open-p", "0.5", "--speed", "1.0"], "--speed"),
         (["--open-book", str(book), "--open-p", "0.5", "--nyugyoku", "1.0"], "--nyugyoku"),
         (["--open-book", str(book), "--open-p", "0.5", "--open-len", "0:3"], "手数"),

@@ -311,13 +311,13 @@ X=rl_mmdopen_v15
   定跡から指させる。相手を Rust で指させる形・ネットで指させる形（`--league-device gpu`）・`--pipeline` のどれでも効く
   - **定跡に従う相手を搾取する搾取役**: `--league <相手> --league-frac 1 --league-device gpu --open-book <ブック>
     --league-open-p 1.0` ＋ 報酬の整形。ゼロから 3.2万〜5.1万局で、局ごとに定跡を引く相手（arena の `open:book:<相手>`）に
-    34〜52%（tsuitate-bot の `docs/rl-fixed-opponent.md` 9節。手口は seed ごとに違うので数本回して合わせる）
+    34〜52%（tsuitate-bot の `docs/rl-fixed-opponent.md` 10節。手口は seed ごとに違うので数本回して合わせる）
   - **本線で搾取役を相手にするとき**: `--league "rl_policy:<搾取役の重み>,..." --league-open-p 0.25 --league-open-sides learner`
     で、リーグの局でも本線の側が定跡から指す（小さいネットで動くことだけを確かめた。効果は測っていない）
   - ログの `league_opening` に、強制の監視値と**ラインごとの学習側の [勝, 負, 分]**（`by_line`。ラインはブックの添字）
   - `--league-open-adapt γ`（`--league-open-window`）: ラインの重みを学習側の直近の勝率で付け替える
     （重み ∝ 元の重み × max(1 − 勝率, 0.05)^γ = 勝てていないラインの局を増やす。`openings.LineAdapter`）。
-    **試した 1組では全体が下がった**（勝てていたラインが崩れる。同 9.5節）ので、勧めない。`--pipeline` とは使えない
+    **試した 1組では全体が下がった**（勝てていたラインが崩れる。同 10.5節）ので、勧めない。`--pipeline` とは使えない
 - 使えない組み合わせ: `--guard`・`--speed`・`--nyugyoku`・`--c-ply`・`--mmd-lambda-unit turn`（`--mmd-gae-lambda-unit turn` も。`turn+check` は使える）。`--pipeline` は使える。
   `--open-len` / `--open-weight` は `--open-book` と `--open-p` と一緒に使う（片方だけなら止める）。起動時に tsuitate_rl が
   序盤の強制を知っているかを1局指して確かめる

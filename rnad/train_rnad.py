@@ -305,7 +305,7 @@ def main() -> None:
     ap.add_argument("--league-open-p", type=float, default=0.0,
                     help="リーグの局（相手を固定した局）で、--league-open-sides の側の序盤を --open-book のラインから指させる"
                          "確率（0 = しない。自己対局の局の --open-p とは別）。定跡に従う相手を搾取する学習なら 1.0・opponent"
-                         "（tsuitate-bot の docs/rl-fixed-opponent.md 9節）")
+                         "（tsuitate-bot の docs/rl-fixed-opponent.md 10節）")
     ap.add_argument("--league-open-sides", choices=["opponent", "learner"], default="opponent",
                     help="リーグの局で序盤を強制する側（opponent = 相手だけ / learner = 学習側だけ）")
     ap.add_argument("--league-open-adapt", type=float, default=0.0,
