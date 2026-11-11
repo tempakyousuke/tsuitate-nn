@@ -302,6 +302,17 @@ def main() -> None:
                          "どれも駒がぶつかった時点（どちらかの駒取り・王手）で止める")
     ap.add_argument("--open-weight", choices=["category", "line"], default="category",
                     help="ラインの選び方（category = 系統ごとに同じ確率 / line = ラインごとに一様）")
+    ap.add_argument("--league-open-p", type=float, default=0.0,
+                    help="リーグの局（相手を固定した局）で、--league-open-sides の側の序盤を --open-book のラインから指させる"
+                         "確率（0 = しない。自己対局の局の --open-p とは別）。定跡に従う相手を搾取する学習なら 1.0・opponent"
+                         "（tsuitate-bot の docs/rl-fixed-opponent.md 10節）")
+    ap.add_argument("--league-open-sides", choices=["opponent", "learner"], default="opponent",
+                    help="リーグの局で序盤を強制する側（opponent = 相手だけ / learner = 学習側だけ）")
+    ap.add_argument("--league-open-adapt", type=float, default=0.0,
+                    help="リーグの局の定跡のラインの重みを、学習側の直近の勝率で付け替える指数 γ（0 = しない）。"
+                         "重み ∝ 元の重み × max(1 − 勝率, 0.05)^γ = 勝てていないラインの局を増やす（openings.LineAdapter）")
+    ap.add_argument("--league-open-window", type=int, default=50,
+                    help="--league-open-adapt の勝率を数える更新の数")
     # ---- 報酬の整形（tsuitate-bot の docs/rl-fixed-opponent.md）。どれも既定は使わない = 報酬は勝敗だけ
     ap.add_argument("--shape", default="",
                     help="局の信号に付ける重み（カンマ区切りの '鍵=重み'。例 'd_capture_value=0.02,fouls=-0.03'）。"
@@ -495,9 +506,12 @@ def main() -> None:
         if args.shape_decay and not shape.active:
             raise SystemExit("--shape-decay は --shape か --lose-len と一緒に使う")
         bad = [f for f, on in (("--pipeline", args.pipeline), ("--fast-collect", args.fast_collect),
-                               ("--open-book", args.open_book)) if on]
+                               ("--open-p", args.open_p),
+                               ("--league-open-sides learner",
+                                args.league_open_p and args.league_open_sides == "learner")) if on]
         if bad:
-            # 収集の速い経路は信号を読まない。序盤の強制は、強制した手の駒得や手数が報酬に入る
+            # 収集の速い経路は信号を読まない。序盤の強制は、学習する側の強制した手の駒得や手数が報酬に入る
+            # （リーグの局で相手の側だけを強制する --league-open-p は使える: 学習側の手は全部自分で選んでいる）
             raise SystemExit(f"報酬の整形・信号の監視は {' '.join(bad)} と一緒に使えない")
         if shape.active and not shape.zero_sum and not (args.league and args.league_frac == 1.0):
             print("注意: 整形が零和でない（重みが反対称でない・負けの長さ）のに自己対局の局がある。"
@@ -505,11 +519,15 @@ def main() -> None:
         signal_names = shape.names
         if not shape.active:
             shape = None  # 監視だけ
-    open_kw, open_cfg = {}, None
-    if args.open_p or args.open_book or args.open_len or args.open_weight != "category":
-        if not (0.0 < args.open_p <= 1.0) or not args.open_book:
-            raise SystemExit("序盤の強制は --open-book と --open-p（0 < p ≤ 1）を一緒に指定する"
-                             "（--open-len / --open-weight もこの2つと一緒に使う）")
+    open_kw, league_open_kw, open_cfg = {}, {}, None
+    line_adapter = None  # --league-open-adapt
+    if args.open_p or args.league_open_p or args.open_book or args.open_len or args.open_weight != "category":
+        if not (0.0 <= args.open_p <= 1.0 and 0.0 <= args.league_open_p <= 1.0
+                and (args.open_p or args.league_open_p)) or not args.open_book:
+            raise SystemExit("序盤の強制は --open-book と --open-p / --league-open-p（どちらかが 0 < p ≤ 1）を一緒に指定する"
+                             "（--open-len / --open-weight もこれらと一緒に使う）")
+        if args.league_open_p and not args.league:
+            raise SystemExit("--league-open-p は --league と一緒に使う")
         # --league とは使える: 強制するのは自己対局の局だけで、リーグの局（相手を固定した局）は強制しない
         # （リーグの env には定跡を渡さない。--league-frac 1 で自己対局の局が無ければ何も強制されない）
         bad = [f for f, on in (("--guard", args.guard), ("--speed", args.speed),
@@ -530,11 +548,28 @@ def main() -> None:
             book = openings.load_book(args.open_book, args.open_weight)
             open_len = openings.parse_len(args.open_len)
             open_kw = openings.env_kwargs(book, args.open_p, open_len)
-            tsuitate_rl.VecEnv(2, seed=0, auto_reset=False, **open_kw)  # ラインの検査（不正なら ValueError）
-        except (ValueError, OSError) as e:
-            raise SystemExit(f"序盤の強制の設定: {e}") from e
+            # ラインの検査（不正なら ValueError）
+            tsuitate_rl.VecEnv(2, seed=0, auto_reset=False, **openings.env_kwargs(book, 1.0, open_len))
+            if args.league_open_p:
+                # リーグの局: 相手（か学習側）だけを強制する。GPU の相手は自己対局モードの env で指すので、
+                # 学習側の色を env の中の並びの偶奇で読ませる（opening_index_learner。下の league_games と同じ並び）
+                league_open_kw = openings.env_kwargs(book, args.league_open_p, open_len, sides=args.league_open_sides)
+                if args.league_device == "gpu":
+                    league_open_kw["opening_index_learner"] = True
+                    tsuitate_rl.VecEnv(2, seed=0, auto_reset=False, **league_open_kw)  # 古い tsuitate_rl なら TypeError
+        except (ValueError, OSError, TypeError) as e:
+            raise SystemExit(f"序盤の強制の設定: {e}（--league-open-p には作り直した tsuitate_rl が要る）") from e
         open_cfg = {"book_sha256": book.sha256, "lines": len(book.lines), "p": args.open_p,
                     "len": list(open_len) if open_len else None, "weight": args.open_weight}
+        if args.league_open_p:
+            # 無いときは足さない（これまでの checkpoint の設定と同じ形のまま比べられる）
+            open_cfg.update(league_p=args.league_open_p, league_sides=args.league_open_sides)
+        if args.league_open_adapt:
+            if not args.league_open_p or args.pipeline:
+                raise SystemExit("--league-open-adapt は --league-open-p と一緒に使う（--pipeline とは使えない: "
+                                 "次の batch を前の更新の勝敗が出る前に集め始めるため）")
+            line_adapter = openings.LineAdapter(book.weights, args.league_open_adapt, args.league_open_window)
+            open_cfg.update(league_adapt=args.league_open_adapt, league_window=args.league_open_window)
     if args.fused and args.league and args.league_device == "gpu":
         raise SystemExit("--fused は --league-device gpu とは使えない（相手の手番が batch の隙間になる）")
     if args.threads:
@@ -645,6 +680,9 @@ def main() -> None:
             raise SystemExit(f"checkpoint と設定が違う: {diff}（(保存, 今)）。"
                              "意図した変更なら --override-config を付ける")
         learner.load_state_dict(ck)
+        if line_adapter is not None:
+            # ラインごとの直近の勝敗はログから作り直す（checkpoint より先に書かれた行は使わない）
+            line_adapter.restore(out / "log.jsonl", learner.step_count)
         if args.algo == "mmd":
             record["init_from"] = learner.init_from  # checkpoint から戻した値（record を作った時点ではまだ None）
         if args.reseed:
@@ -842,7 +880,7 @@ def main() -> None:
             rng = np.random.default_rng(args.seed * 1_000_003 + step)
             opponents = [name for name, k in league.allocate(n_league, rng).items() for _ in range(k)]
             return lambda: tsuitate_rl.VecEnv(n_league, opponents=opponents, seed=args.seed * 1_000_003 + step,
-                                              auto_reset=False, **obs_kw)
+                                              auto_reset=False, **obs_kw, **league_open_kw)
 
         # 序盤の強制の乱数列は「その batch を使う step」で決める（ループの前に頼む batch は今の step で使う）
         pipe_open_seed = open_seed(args.seed, learner.step_count) if open_kw else None
@@ -946,6 +984,9 @@ def main() -> None:
                 env.set_opening_seed(batch_open_seed)  # collect の reset から効く
             league_env = None
             league_games = None  # --league-device gpu のときの局ごとの (相手, 学習側の色)
+            if line_adapter is not None:
+                # ラインの重みを直近の勝率で付け替える（この batch の env から効く）
+                league_open_kw = {**league_open_kw, "opening_weights": line_adapter.weights()}
             if league is not None and n_league and args.league_device == "gpu":
                 # 自己対局モードの env で、相手の手番だけ相手のネットに指させる（collect の opponents）。
                 # 色は局ごとに交互（相手ごとの局数は偶数なので先後がそろう）
@@ -953,7 +994,8 @@ def main() -> None:
                 names = [name for name, k in league.allocate(n_league, rng).items() for _ in range(k)]
                 league_games = [(name, i % 2) for i, name in enumerate(names)]
                 league_env = tsuitate_rl.VecEnv(n_league, seed=args.seed * 1_000_003 + learner.step_count,
-                                                auto_reset=False, **env_kwargs(guard_lam, speed_lam), **obs_kw)
+                                                auto_reset=False, **env_kwargs(guard_lam, speed_lam), **obs_kw,
+                                                **league_open_kw)
                 envs.append(league_env)
             elif league is not None and n_league:
                 # リーグの局は1つの env にまとめる（局番号 g の局は opponents[g % len] と指す。相手ごとに
@@ -962,7 +1004,7 @@ def main() -> None:
                 opponents = [name for name, k in league.allocate(n_league, rng).items() for _ in range(k)]
                 league_env = tsuitate_rl.VecEnv(n_league, opponents=opponents,
                                                 seed=args.seed * 1_000_003 + learner.step_count, auto_reset=False,
-                                                **env_kwargs(guard_lam, speed_lam), **obs_kw)
+                                                **env_kwargs(guard_lam, speed_lam), **obs_kw, **league_open_kw)
                 envs.append(league_env)
             shape_mult = shape.multiplier(learner.step_count) if shape is not None else 1.0
             batch = collect(MultiEnv(envs), learner.net, device,
@@ -1051,6 +1093,21 @@ def main() -> None:
             # 序盤の強制の監視値（強制した側の割合・手数・やめた理由、最初の接触の手数、接触の前の反則）。
             # 強制した側の序盤の局面は学習の行に入らないので、pi_top_* やエントロピーは強制しない run と直接は比べられない
             rec["opening"] = {**openings.summarize(finished), "seed": batch_open_seed}
+        if league_open_kw and league_finished:
+            # リーグの局の序盤の強制（強制した側の割合 = 0.5 × p、手数、やめた理由）
+            rec["league_opening"] = openings.summarize(league_finished)
+            # 強制した側のラインごとの学習側の [勝, 負, 分]（どの序盤の相手に勝てているか。ラインはブックの添字）
+            by_line = {}
+            for f in league_finished:
+                for c in (0, 1):
+                    k = f["forced_line"][c]
+                    if k is not None and "learner" in f:
+                        wld = by_line.setdefault(str(k), [0, 0, 0])
+                        wld[2 if f["winner"] is None else (0 if f["winner"] == f["learner"] else 1)] += 1
+            rec["league_opening"]["by_line"] = by_line
+            if line_adapter is not None:
+                rec["league_opening"]["line_weights"] = [round(w, 4) for w in league_open_kw["opening_weights"]]
+                line_adapter.push(by_line)
         if league is not None:
             # league_games = この更新の相手ごとの (勝, 負, 分)、league = 窓の勝率と次の配分の重み
             rec["league_games"] = league_rec
