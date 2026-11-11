@@ -83,20 +83,33 @@ def check_pool():
 
 
 def check_pool_mixed_planes():
-    """入力の版が違う相手（v1 86枚・v2 91枚・v3 101枚〔組の選び方も違う〕）を1つの pool に積んでも、相手ごとの推論と一致する"""
-    from model import NUM_PLANES_DEDUCED, NUM_PLANES_V3
+    """入力の版が違う相手（v1 86枚・v2 91枚・v3 101枚・v4 102枚〔組の選び方も違う〕）を1つの pool に積んでも、
+    相手ごとの推論と一致する。v3 / v4 の組のプレーンには 0 でない値を入れて確かめる（初期局面では全部 0 で、
+    組を読まなくなる間違いが見えない）"""
+    from model import NUM_PLANES_DEDUCED, NUM_PLANES_V3, NUM_PLANES_V4
     from rnad import pad_planes
+    for top, specs in [(NUM_PLANES_V3, [(86, ()), (NUM_PLANES_DEDUCED, ()), (NUM_PLANES_V3, ("opp_hand",)),
+                                        (NUM_PLANES_V3, ("opp_hand", "opp_fouls"))]),
+                       (NUM_PLANES_V4, [(NUM_PLANES_DEDUCED, ()), (NUM_PLANES_V3, ("opp_hand",)),
+                                        (NUM_PLANES_V4, ("king_fouls",)), (NUM_PLANES_V4, ("opp_hand", "king_fouls"))])]:
+        _check_pool_mixed(top, specs, pad_planes)
+    print("OK: 入力の版が違う相手（86 / 91 / 101 / 102枚）を1つの pool に積んでも、相手ごとの推論と一致する")
+
+
+def _check_pool_mixed(top, specs, pad_planes):
+    NUM_PLANES_V3 = top
     nets = {}
-    for i, (planes, extras) in enumerate([(86, ()), (NUM_PLANES_DEDUCED, ()), (NUM_PLANES_V3, ("opp_hand",)),
-                                          (NUM_PLANES_V3, ("opp_hand", "opp_fouls"))]):
+    for i, (planes, extras) in enumerate(specs):
         torch.manual_seed(20 + i)
         nets[f"n{i}"] = PolicyValueNet(8, 1, planes, extras).eval()
     pool = OpponentPool(nets)
     assert pool.planes == NUM_PLANES_V3
     env = tsuitate_rl.VecEnv(8, seed=9, auto_reset=False, planes=NUM_PLANES_V3)
     obs, mask, _ = env.observe()
+    obs = obs.copy()
+    obs[:, 91:] = np.random.default_rng(3).random(obs[:, 91:].shape, dtype=np.float32)
     x = torch.from_numpy(obs).half().float()
-    assert float(x[:, 91:].abs().sum()) >= 0.0
+    assert float(x[:, 91:].abs().sum()) > 0.0
     groups = {name: np.array([2 * i, 2 * i + 1]) for i, name in enumerate(nets)}
     xs = torch.zeros((len(nets), 2, *obs.shape[1:]))
     for name, bs in groups.items():
@@ -120,7 +133,6 @@ def check_pool_mixed_planes():
         pass
     else:
         raise AssertionError("狭める指定が通った")
-    print("OK: 入力の版が違う相手（86 / 91 / 101枚）を1つの pool に積んでも、相手ごとの推論と一致する")
 
 
 def check_collect_opponents():

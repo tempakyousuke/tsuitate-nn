@@ -949,16 +949,18 @@ def _gumbel_sample(logits, legal, generator):
 
 def pad_planes(net, planes: int):
     """入力を `planes` 枚に広げた、**同じ関数**のネット（足した stem の列は 0。観測の先頭が同じなので、広い観測を渡しても
-    元のネットと同じ出力になる）。v3 の「使わない組を 0 にしてから読む」マスクは外す（その列の重みはもともと 0 のまま
+    元のネットと同じ出力になる）。v3 / v4 の「使わない組を 0 にしてから読む」マスクは外す（その列の重みはもともと 0 のまま
     なので結果は同じ）。相手のネットをまとめて推論する `OpponentPool` が、入力の版の違う相手を1つに積むために使う"""
-    from model import EXTRA_PLANES, NUM_PLANES_V3, PolicyValueNet
+    from model import EXTENDED_PLANES, EXTRA_PLANES, PolicyValueNet
     cfg = net.config
     if cfg["planes"] > planes:
         raise ValueError(f"入力 {cfg['planes']}枚のネットを {planes}枚へは狭められない")
     if cfg["planes"] == planes and getattr(net, "in_off", None) is None:
         return net
-    wide = PolicyValueNet(cfg["channels"], cfg["blocks"], planes,
-                          sorted(EXTRA_PLANES) if planes == NUM_PLANES_V3 else ())
+    # 広げた側は、その枚数に入る組を全部読む（マスクなし）。v4（102枚）で組を空にすると、v3 / v4 の相手が読む組まで
+    # 0 にしてしまう
+    fits = [n for n, (s, k) in EXTRA_PLANES.items() if s + k <= planes] if planes in EXTENDED_PLANES else ()
+    wide = PolicyValueNet(cfg["channels"], cfg["blocks"], planes, fits)
     sd = {k: v.clone() for k, v in net.state_dict().items()}
     w = sd["stem.weight"]
     stem = torch.zeros((w.shape[0], planes, *w.shape[2:]), dtype=w.dtype, device=w.device)
@@ -982,7 +984,7 @@ class OpponentPool:
         from torch.func import functional_call, stack_module_state
         self.names = list(nets)
         self.index = {n: i for i, n in enumerate(self.names)}
-        # 入力の版（v1 = 86枚 / v2 = 91枚 / v3 = 101枚）が違う相手は、いちばん広い版にそろえてから積む
+        # 入力の版（v1 = 86枚 / v2 = 91枚 / v3 = 101枚 / v4 = 102枚）が違う相手は、いちばん広い版にそろえてから積む
         # （`pad_planes`。足した列は 0 なので同じ関数）。それまでは版が混ざると積めずに落ちていた
         planes = max(n.config["planes"] for n in nets.values())
         self.planes = planes
