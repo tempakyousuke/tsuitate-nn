@@ -308,6 +308,11 @@ def main() -> None:
                          "（tsuitate-bot の docs/rl-fixed-opponent.md 9節）")
     ap.add_argument("--league-open-sides", choices=["opponent", "learner"], default="opponent",
                     help="リーグの局で序盤を強制する側（opponent = 相手だけ / learner = 学習側だけ）")
+    ap.add_argument("--league-open-adapt", type=float, default=0.0,
+                    help="リーグの局の定跡のラインの重みを、学習側の直近の勝率で付け替える指数 γ（0 = しない）。"
+                         "重み ∝ 元の重み × max(1 − 勝率, 0.05)^γ = 勝てていないラインの局を増やす（openings.LineAdapter）")
+    ap.add_argument("--league-open-window", type=int, default=50,
+                    help="--league-open-adapt の勝率を数える更新の数")
     # ---- 報酬の整形（tsuitate-bot の docs/rl-fixed-opponent.md）。どれも既定は使わない = 報酬は勝敗だけ
     ap.add_argument("--shape", default="",
                     help="局の信号に付ける重み（カンマ区切りの '鍵=重み'。例 'd_capture_value=0.02,fouls=-0.03'）。"
@@ -515,6 +520,7 @@ def main() -> None:
         if not shape.active:
             shape = None  # 監視だけ
     open_kw, league_open_kw, open_cfg = {}, {}, None
+    line_adapter = None  # --league-open-adapt
     if args.open_p or args.league_open_p or args.open_book or args.open_len or args.open_weight != "category":
         if not (0.0 <= args.open_p <= 1.0 and 0.0 <= args.league_open_p <= 1.0
                 and (args.open_p or args.league_open_p)) or not args.open_book:
@@ -558,6 +564,12 @@ def main() -> None:
         if args.league_open_p:
             # 無いときは足さない（これまでの checkpoint の設定と同じ形のまま比べられる）
             open_cfg.update(league_p=args.league_open_p, league_sides=args.league_open_sides)
+        if args.league_open_adapt:
+            if not args.league_open_p or args.pipeline:
+                raise SystemExit("--league-open-adapt は --league-open-p と一緒に使う（--pipeline とは使えない: "
+                                 "次の batch を前の更新の勝敗が出る前に集め始めるため）")
+            line_adapter = openings.LineAdapter(book.weights, args.league_open_adapt, args.league_open_window)
+            open_cfg.update(league_adapt=args.league_open_adapt, league_window=args.league_open_window)
     if args.fused and args.league and args.league_device == "gpu":
         raise SystemExit("--fused は --league-device gpu とは使えない（相手の手番が batch の隙間になる）")
     if args.threads:
@@ -668,6 +680,9 @@ def main() -> None:
             raise SystemExit(f"checkpoint と設定が違う: {diff}（(保存, 今)）。"
                              "意図した変更なら --override-config を付ける")
         learner.load_state_dict(ck)
+        if line_adapter is not None:
+            # ラインごとの直近の勝敗はログから作り直す（checkpoint より先に書かれた行は使わない）
+            line_adapter.restore(out / "log.jsonl", learner.step_count)
         if args.algo == "mmd":
             record["init_from"] = learner.init_from  # checkpoint から戻した値（record を作った時点ではまだ None）
         if args.reseed:
@@ -969,6 +984,9 @@ def main() -> None:
                 env.set_opening_seed(batch_open_seed)  # collect の reset から効く
             league_env = None
             league_games = None  # --league-device gpu のときの局ごとの (相手, 学習側の色)
+            if line_adapter is not None:
+                # ラインの重みを直近の勝率で付け替える（この batch の env から効く）
+                league_open_kw = {**league_open_kw, "opening_weights": line_adapter.weights()}
             if league is not None and n_league and args.league_device == "gpu":
                 # 自己対局モードの env で、相手の手番だけ相手のネットに指させる（collect の opponents）。
                 # 色は局ごとに交互（相手ごとの局数は偶数なので先後がそろう）
@@ -1087,6 +1105,9 @@ def main() -> None:
                         wld = by_line.setdefault(str(k), [0, 0, 0])
                         wld[2 if f["winner"] is None else (0 if f["winner"] == f["learner"] else 1)] += 1
             rec["league_opening"]["by_line"] = by_line
+            if line_adapter is not None:
+                rec["league_opening"]["line_weights"] = [round(w, 4) for w in league_open_kw["opening_weights"]]
+                line_adapter.push(by_line)
         if league is not None:
             # league_games = この更新の相手ごとの (勝, 負, 分)、league = 窓の勝率と次の配分の重み
             rec["league_games"] = league_rec

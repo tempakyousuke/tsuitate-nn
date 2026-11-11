@@ -299,6 +299,38 @@ def check_league_train(tmp):
           "強制・ラインごとの勝敗がログに出る・設定が残る・使えない組み合わせを止める")
 
 
+def check_adapt(tmp):
+    """ラインの重みの付け替え（`--league-open-adapt`）"""
+    ad = openings.LineAdapter([1.0, 1.0, 2.0, 2.0], gamma=1.0, window=2, min_games=4)
+    assert ad.weights() == [1.0, 1.0, 2.0, 2.0], "記録が無ければ元の重み"
+    ad.push({"0": [4, 0, 0], "1": [1, 3, 0], "2": [1, 0, 0]})  # ライン 2 は局数が足りない = 勝率 0 として扱う
+    w = np.array(ad.weights())
+    want = np.array([1.0 * 0.05, 1.0 * 0.75, 2.0, 2.0])
+    assert np.allclose(w, want / want.sum() * 6.0), w
+    ad.push({"0": [0, 4, 0]})
+    ad.push({"3": [2, 0, 2]})  # 窓は 2更新: 最初の記録は落ちる。引き分けは 0.5 勝
+    w = np.array(ad.weights())
+    want = np.array([1.0, 1.0, 2.0, 2.0 * 0.25])
+    assert np.allclose(w, want / want.sum() * 6.0), w
+    assert openings.LineAdapter([1.0, 3.0], gamma=0.0).weights() == [1.0, 3.0]
+
+    book = write_book(tmp)
+    args = ["--seed", "6", "--open-book", str(book), "--league-open-p", "1.0", "--league-frac", "1", "--compact-legal",
+            "--league", "heuristic", "--league-open-adapt", "2.0", "--league-open-window", "2"]
+    run_train(tmp / "ad_a", *args, steps=4)
+    run_train(tmp / "ad_b", *args, steps=2)
+    run_train(tmp / "ad_b", *args, steps=4)
+    la, lb = read_log(tmp / "ad_a" / "log.jsonl"), read_log(tmp / "ad_b" / "log.jsonl")
+    assert la == lb, "重みの付け替えつきの再開でログが変わる"
+    ws = [x["league_opening"]["line_weights"] for x in la]
+    assert len(ws[0]) == 4 and abs(sum(ws[0]) - sum(openings.load_book(book).weights)) < 1e-3
+    r = run_train(tmp / "rej3", "--open-book", str(book), "--open-p", "0.5", "--league-open-adapt", "1.0", steps=1,
+                  check=False)
+    assert r.returncode != 0 and "--league-open-adapt" in (r.stderr + r.stdout)
+    print("A1 ラインの重みの付け替え: 勝てているラインを減らす・局数の足りないラインは減らさない・窓・引き分け・"
+          "train_rnad.py の再開でログがビット単位で一致")
+
+
 def run_train(out, *extra, steps, check=True):
     cmd = [sys.executable, str(TRAIN), "--anchor", "none", "--init", "none", "--batch", "6", "--steps", str(steps),
            "--channels", "16", "--blocks", "1", "--planes", "91", "--eval-every", "0", "--export-every", "2",
@@ -381,4 +413,5 @@ if __name__ == "__main__":
         check_train(tmp)
         check_league_env(tmp)
         check_league_train(tmp)
+        check_adapt(tmp)
     print("ok")

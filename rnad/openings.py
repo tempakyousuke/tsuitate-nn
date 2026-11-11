@@ -127,3 +127,54 @@ def summarize(finished):
     if contact:
         out["contact_ply"] = sum(contact) / len(contact)
     return out
+
+
+class LineAdapter:
+    """リーグの局の定跡のラインの重みを、学習側の直近の勝率で付け替える（`train_rnad.py --league-open-adapt γ`）。
+
+    定跡に従う相手を搾取する学習では、勝てるようになったライン（同じ手口が通るライン）の局が batch の大半を占め、
+    まだ勝てないラインを崩す手がかりが薄まる。そこで 重み ∝ 元の重み × max(1 − 勝率, floor)^γ とし、勝てていない
+    ラインの局を増やす（γ = 0 は付け替えなし。勝てているラインも floor ぶんは残る = 忘れないための復習）。
+    勝率はラインごとに直近 `window` 更新の [勝, 負, 分]（引き分けは 0.5 勝）で、`min_games` 局に満たないラインは
+    勝率 0 として扱う（まだ分からないラインは減らさない）。状態はログの `league_opening.by_line` から作り直せる"""
+
+    def __init__(self, base_weights, gamma, window=50, floor=0.05, min_games=8):
+        if gamma < 0 or window < 1:
+            raise ValueError(f"γ は 0 以上・window は 1 以上（{gamma}, {window}）")
+        self.base = np.asarray(base_weights, dtype=np.float64)
+        self.gamma, self.window, self.floor, self.min_games = float(gamma), int(window), float(floor), int(min_games)
+        self.recent = collections.deque(maxlen=self.window)
+
+    def push(self, by_line):
+        """1更新ぶんの {ラインの添字（文字列）: [勝, 負, 分]} を足す"""
+        self.recent.append({int(k): list(v) for k, v in (by_line or {}).items()})
+
+    def win_rates(self):
+        w = np.zeros(len(self.base))
+        n = np.zeros(len(self.base))
+        for rec in self.recent:
+            for k, (win, loss, draw) in rec.items():
+                w[k] += win + 0.5 * draw
+                n[k] += win + loss + draw
+        return np.where(n >= self.min_games, w / np.maximum(n, 1), 0.0), n
+
+    def weights(self):
+        wr, _ = self.win_rates()
+        out = self.base * np.maximum(1.0 - wr, self.floor) ** self.gamma
+        return (out / out.sum() * self.base.sum()).tolist()
+
+    def restore(self, log_path, step):
+        """再開: ログの step 以下の行から直近 window 更新を読み直す（同じ step が2回あれば後の行）"""
+        rows = {}
+        path = pathlib.Path(log_path)
+        if path.exists():
+            for line in path.read_text().splitlines():
+                try:
+                    x = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(x.get("step"), int) and x["step"] <= step:
+                    rows[x["step"]] = (x.get("league_opening") or {}).get("by_line")
+        self.recent.clear()
+        for s in sorted(rows)[-self.window:]:
+            self.push(rows[s])
