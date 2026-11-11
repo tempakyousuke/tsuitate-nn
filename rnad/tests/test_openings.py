@@ -11,6 +11,10 @@
 - train_rnad.py: 強制ありで 4更新を続けた run と、2更新で止めて同じコマンドで 4 まで続けた run がログ・ネットで
   ビット単位で一致。checkpoint に集め方の設定が残り、再開で --open-* を付け忘れると止まる（--override-config で通す）。
   強制しない run の checkpoint には何も足さない。使えない組み合わせは起動時に止まる
+- リーグの局の強制（`--league-open-p`。定跡に従う相手を搾取する学習）: 自己対局モードの env でも
+  `opening_index_learner` で相手の側だけが強制される（偶数番目の局は先手が学習側）。相手のネットを Python 側で
+  指させる collect で、学習側の行は全部自分の手・相手の側だけに強制の記録が付く。train_rnad.py は相手を Rust で
+  指させる形・ネットで指させる形のどちらでも相手の側だけを強制し、報酬の整形と一緒に使える（学習側の強制は止める）
 """
 
 import json
@@ -201,6 +205,100 @@ def check_collect(tmp):
           f"（強制した側 {s['forced_frac']:.0%}、平均 {s['forced_moves']:.1f} 手）")
 
 
+def check_league_env(tmp):
+    """自己対局モードの env で、並びの偶奇で決めた学習側の相手だけを強制する（`--league-device gpu` の局）"""
+    book = openings.load_book(write_book(tmp))
+    kw = openings.env_kwargs(book, 1.0, sides="opponent")
+    env = tsuitate_rl.VecEnv(8, seed=4, auto_reset=False, planes=91, opening_index_learner=True, **kw)
+    for rnd in range(2):  # reset をはさんでも（局番号が進んでも）並びの偶奇で決まる
+        env.reset()
+        _, _, pl = env.observe()
+        assert pl.tolist() == [0, 1] * 4, "最初の手番は学習側（奇数番目は相手の先手が env の中で指した後）"
+        play_random(env, 7 + rnd)
+        fin = sorted(env.pop_finished(), key=lambda f: f["game_no"])
+        for i, f in enumerate(fin):
+            lc = i % 2
+            assert f["forced_line"][lc] is None and f["forced_moves"][lc] == 0, (i, f["forced_line"])
+            assert f["forced_line"][1 - lc] is not None and f["forced_moves"][1 - lc] >= 1, (i, f["forced_moves"])
+    # 学習側だけを強制する指定も同じ並びで読む
+    env = tsuitate_rl.VecEnv(4, seed=4, auto_reset=False, planes=91, opening_index_learner=True,
+                             **openings.env_kwargs(book, 1.0, sides="learner"))
+    env.reset()
+    play_random(env, 1)
+    for i, f in enumerate(sorted(env.pop_finished(), key=lambda f: f["game_no"])):
+        assert f["forced_line"][i % 2] is not None and f["forced_line"][1 - i % 2] is None
+    for bad in (dict(auto_reset=True), dict(opponents=["heuristic"]), dict(opening_sides="both")):
+        try:
+            tsuitate_rl.VecEnv(4, seed=0, planes=91, opening_index_learner=True, **{**dict(auto_reset=False), **kw, **bad})
+        except ValueError:
+            continue
+        raise AssertionError(f"opening_index_learner が通ってしまった: {bad}")
+    try:
+        tsuitate_rl.VecEnv(4, seed=0, planes=91, auto_reset=False, **kw)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("自己対局モードで opening_sides=opponent が（opening_index_learner なしで）通ってしまった")
+
+    # 相手のネットを Python 側で指させる collect: 学習側の行だけが残り、強制は相手の側だけ
+    torch.manual_seed(0)
+    net, opp = PolicyValueNet(16, 1, 91).eval(), PolicyValueNet(16, 1, 91).eval()
+    env = tsuitate_rl.VecEnv(8, seed=5, auto_reset=False, planes=91, opening_index_learner=True, **kw)
+    games = [("opp", i % 2) for i in range(8)]
+    batch = collect(env, net, torch.device("cpu"), compact_legal=True, opponents=games, opp_nets={"opp": opp})
+    fin = sorted(env.pop_finished(), key=lambda f: f["game_no"])
+    valid, player = np.asarray(batch["valid"]), np.asarray(batch["player"])
+    for i, f in enumerate(fin):
+        lc = i % 2
+        assert (player[valid[:, i], i] == lc).all(), "記録する行は学習側の手番だけ"
+        assert f["forced_line"][lc] is None and f["forced_line"][1 - lc] is not None
+        assert f["forced_moves"][1 - lc] >= 1 and int(valid[:, i].sum()) >= f["fouls"][lc]
+        r = np.asarray(batch["reward"])[:, i, lc].sum()
+        want = 0.0 if f["winner"] is None else (1.0 if f["winner"] == lc else -1.0)
+        assert abs(r - want) < 1e-6, (i, r, want)
+    print("L1 リーグの局の強制: 自己対局モードの env で相手の側だけ（並びの偶奇・reset をはさんでも同じ）・"
+          "相手をネットで指させる collect は学習側の行だけ・報酬の和 = 学習側の結果・使えない指定を止める")
+
+
+def check_league_train(tmp):
+    book = write_book(tmp)
+    base = ["--seed", "5", "--open-book", str(book), "--league-open-p", "1.0", "--league-frac", "1",
+            "--compact-legal"]
+    for name, extra in [
+        ("rust", ["--league", "heuristic"]),
+        ("gpu", ["--algo", "mmd", "--league", "rl_v15", "--league-device", "gpu", "--mmd-magnet", "uniform",
+                 "--shape", "d_capture_value=0.02,opp_fouls=0.05"]),
+    ]:
+        run_train(tmp / name, *base, *extra, steps=2)
+        log = [json.loads(x) for x in open(tmp / name / "log.jsonl") if x.strip()]
+        for x in log:
+            lo = x["league_opening"]
+            assert lo["forced_frac"] == 0.5 and lo["both_forced_frac"] == 0.0, (name, lo)
+            assert sum(sum(v) for v in lo["by_line"].values()) == 6, (name, lo["by_line"])
+            assert "opening" not in x, "自己対局の局は無い（--open-p は 0）"
+        cfg = json.loads((tmp / name / "config.json").read_text())["opening"]
+        assert cfg["p"] == 0.0 and cfg["league_p"] == 1.0 and cfg["league_sides"] == "opponent"
+        # 再開で付け忘れると止まる
+        r = run_train(tmp / name, *[a for a in base if a not in ("--league-open-p", "1.0")][:2], "--league-frac", "1",
+                      "--compact-legal", *extra, steps=3, check=False)
+        assert r.returncode != 0, name
+    # --open-p だけなら、リーグの局は強制しない（自己対局の局だけ。tsuitate-nn #24）
+    run_train(tmp / "selfonly", "--seed", "5", "--open-book", str(book), "--open-p", "1.0", "--league", "heuristic",
+              "--league-frac", "0.5", steps=1)
+    x = json.loads(open(tmp / "selfonly" / "log.jsonl").readline())
+    assert x["opening"]["forced_frac"] == 1.0 and "league_opening" not in x
+    for extra, msg in [
+        (["--open-book", str(book), "--league-open-p", "1.0"], "--league"),
+        (["--league-open-p", "1.0", "--league", "heuristic", "--league-frac", "1"], "--open-book"),
+        (["--open-book", str(book), "--league-open-p", "1.0", "--league-open-sides", "learner", "--league", "heuristic",
+          "--league-frac", "1", "--shape", "d_capture_value=0.02"], "--league-open-sides learner"),
+    ]:
+        r = run_train(tmp / "rej2", *extra, steps=1, check=False)
+        assert r.returncode != 0 and msg in (r.stderr + r.stdout), (extra, r.stderr[-500:])
+    print("L2 train_rnad.py --league-open-p: 相手を Rust で指させる形・ネットで指させる形（整形つき）とも相手の側だけを"
+          "強制・ラインごとの勝敗がログに出る・設定が残る・使えない組み合わせを止める")
+
+
 def run_train(out, *extra, steps, check=True):
     cmd = [sys.executable, str(TRAIN), "--anchor", "none", "--init", "none", "--batch", "6", "--steps", str(steps),
            "--channels", "16", "--blocks", "1", "--planes", "91", "--eval-every", "0", "--export-every", "2",
@@ -259,7 +357,6 @@ def check_train(tmp):
     for extra, msg in [
         (["--open-p", "0.5"], "--open-book"),
         (["--open-book", str(book)], "--open-p"),
-        (["--open-book", str(book), "--open-p", "0.5", "--league", "heuristic"], "--league"),
         (["--open-book", str(book), "--open-p", "0.5", "--speed", "1.0"], "--speed"),
         (["--open-book", str(book), "--open-p", "0.5", "--nyugyoku", "1.0"], "--nyugyoku"),
         (["--open-book", str(book), "--open-p", "0.5", "--open-len", "0:3"], "手数"),
@@ -282,4 +379,6 @@ if __name__ == "__main__":
         check_env(tmp)
         check_collect(tmp)
         check_train(tmp)
+        check_league_env(tmp)
+        check_league_train(tmp)
     print("ok")
