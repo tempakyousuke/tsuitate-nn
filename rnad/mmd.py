@@ -110,6 +110,13 @@ class MMDConfig:
     # 動く磁石（target / mix:target）の速さ。0 = 書き出しのターゲット（target_avg）をそのまま磁石にする。> 0 なら磁石だけを
     # 別の EMA（magnet_net、この係数）で動かし、書き出しの EMA とは切り離す
     magnet_avg: float = 0.0
+    # アドバンテージの正規化: 0 = しない（既定。本線は勝率が五分前後で |A| が 0.1〜0.3 の大きさにそろっている）。
+    # > 0 なら、その更新の A を max(std(A), この値) で割ってから使う（平均は引かない）。ゼロから強い相手に当たる学習では
+    # 1局も勝てず |A| が 0.005 前後しかなく、方策の項が小さすぎて方策がほとんど動かなかった（tsuitate-bot の
+    # docs/rl-fixed-opponent.md。PPO の実装で普通に行う正規化）。値は std の下限で、信号が無い（全局同じ結果で
+    # A が価値の誤差だけの）ときに雑音を 1 の大きさまで膨らませないためのもの。比のクリップ・KL・磁石の係数は
+    # 正規化後の A に対する大きさになる
+    adv_norm: float = 0.0
 
 
 PRESETS = {
@@ -292,7 +299,9 @@ def player_lambda_returns(batch, v, lam, unit="attempt"):
     （λ_i = λ。unit="turn" なら反則の試行だけ λ_i = 1、"attempt+check" なら王手をかけた手だけ、"turn+check" ならその両方。
     +check の2つは反則・王手を `own_next_flags` の観測から読む）。`v_trace_scalars` を η=0・π=μ=1・c=λ で呼んだ vt がこれと同じ
     （相手の手番の行は報酬を次の自分の手番へ運ぶだけ）。局の途中で切らないので bootstrap は無い。
-    **自己対局の batch に限る**（相手の手番が記録されない局では、有効でない行で carry が 0 に戻り途中が終局扱いになる）
+    相手を固定した局（相手の手番が行にならない）でもそのまま使える: `v_trace_scalars` は無効な行で carry を通すので、
+    学習側の行が続けてつながる（2026-11-10 から。それまでは carry が 0 に戻り、自己対局の batch に限っていた）。
+    ただし unit="turn" は「次の時刻に同じ側が指す = 反則」で反則を見るので、Rust の評価モード（学習側の行が毎時刻続く）では使えない
 
     λ_i = 1 の手は「減衰の時計を進めない」だけで責任を免れない: G_i = r_i + G_{i+1} なので、その手には次の自分の手と
     同じ重さで後ろの δ が届き、その手より前の手には1手ぶん減らずに届く
@@ -454,6 +463,7 @@ class MMDLearner:
         self.gen = torch.Generator()
         self.gen.manual_seed(seed)
         self.filt_hist = []
+        self._reg_scale = 1.0  # 近い方策への KL の係数の倍率（update の reward_scale の逆数）
         self.init_from = None
         self.last_grad_norms = []  # 直前の更新の歩ごとのクリップ前の勾配ノルム（bench_update.py が読む）
 
@@ -482,8 +492,8 @@ class MMDLearner:
     def update(self, batch, reward_scale=1.0):
         """batch で `steps × epochs` 歩進める。ログ用の dict を返す（R-NaD と共通のキー samples / loss_v / loss_nerd /
         alpha / reg_update を含む。stage_log.py がそのまま読む）"""
-        if reward_scale != 1.0:
-            raise ValueError("MMD は報酬の縮め（ボーナス）を使わない")
+        if reward_scale < 1.0:
+            raise ValueError(f"reward_scale {reward_scale} は 1 以上")
         for key in ("v_actor", "mu_logp", "legal_cols"):
             if key not in batch:
                 raise ValueError(f"batch に {key} が無い（collect(compact_legal=True, actor_extras=True) の batch が要る）")
@@ -492,6 +502,13 @@ class MMDLearner:
         t_start = time.time()
         mmd_t = self.mmd_time()
         temp = self.temperature()
+        # 報酬の整形（`shaping.Shaping`）で 1局の報酬が ±1 を超えるときは、報酬を 1/s に縮めて価値の頭（tanh）の範囲に収める。
+        # A も 1/s になるので、磁石と近い方策への KL の係数も同じ倍率で縮めて釣り合いを保つ（R-NaD が η を割るのと同じ。
+        # 報酬・正則化・価値の単位をまとめて変えるだけで、学ぶ方策の目的は変わらない）。s は学習の全体で固定する
+        self._reg_scale = 1.0 / reward_scale
+        if reward_scale != 1.0:
+            batch = {**batch, "reward": batch["reward"] / reward_scale}
+            temp = temp / reward_scale
         lr = self.scheduled_lr() * self.lr_scale
         for g in self.opt.param_groups:
             g["lr"] = lr
@@ -504,6 +521,9 @@ class MMDLearner:
         g_a = (g_td if cfg.gae_lambda == cfg.td_lambda and gae_unit == cfg.lambda_unit
                else player_lambda_returns(batch, v_act, cfg.gae_lambda, gae_unit))
         adv = g_a - v_act
+        adv_std = float(adv.std()) if n > 1 else 0.0
+        if cfg.adv_norm > 0:
+            adv = adv / max(adv_std, cfg.adv_norm)
         t_gae = time.time()
 
         if value_only:
@@ -562,11 +582,12 @@ class MMDLearner:
         t_train = time.time()
 
         # ---- ログ（ここから下は学習に影響しない）
+        # temperature は実際に損失へ掛けた値（reward_scale で縮めた後）
         out = {"samples": n, "alpha": 1.0, "reg_update": False, "algo": "mmd", "mmd_t": mmd_t,
                "temperature": temp, "lr_sched": lr, "value_only": value_only,
                "rows_kept": int(keep_p.sum()), "rows_val": int(keep_v.sum()), "rows_union": len(st.U),
                "keep_rate": float(keep_p.float().mean()), "w_max": float(wp.max()) if n else 0.0,
-               "prox_is_capped": capped, **sel_info}
+               "prox_is_capped": capped, "adv_std_raw": adv_std, **sel_info}
         if step_stats:
             ss = torch.stack(step_stats).cpu().double()
             gn = torch.stack(gnorms).cpu().double()
@@ -677,7 +698,7 @@ class MMDLearner:
         kl = (w * (p * (lp - prox)).sum(1)).sum() / m_pol
         mag = (w * (p * (lp - lrho)).sum(1)).sum() / m_pol
         lv = (wv * (v - g) ** 2).sum() / m_val
-        loss = cfg.pol_scale * pol + temp * mag + cfg.vf * lv + cfg.kl * kl
+        loss = cfg.pol_scale * pol + temp * mag + cfg.vf * lv + cfg.kl * self._reg_scale * kl
         with torch.no_grad():
             on = w > 0
             stats[0], stats[1], stats[2], stats[3] = pol.detach(), kl.detach(), mag.detach(), lv.detach()

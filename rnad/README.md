@@ -46,6 +46,9 @@ ARENA_MATCH_SEED=20260927 cargo run --release --bin arena -- 100 "rl_policy:<pol
 | `fetch_records.py` | GitHub Actions の対局記録を取る |
 | `league.py` | リーグ学習の相手の選び方（負けやすい相手ほど多く当てる） |
 | `guard.py` | 防御特化（玉の周りの固め）の監視値の集計 |
+| `shaping.py` | 報酬の整形（局の信号 `VecEnv.signals()` の差分 × 重みを報酬へ足す。plain / potential・負けるまでの長さ）と、信号の監視値の集計（下の「相手を固定してゼロから学習する」） |
+| `signal_report.py` | 学習ログの `signals` から、学習曲線（得点と主な信号を更新の窓ごとに）と、勝ち局と負け局を分ける信号の表（`--split`）を出す |
+| `ladder_eval.py` | ハンデの梯子（`<相手>@<ε>`）で run の書き出しを測り、ε50（得点が 0.5 になる ε）を出す。勝ちが出る前から同じ相手への近さを追う |
 | `speedlab.py` | 学習の速さの比較: 固定パネル（`panel`）で run の書き出しを測り（`eval`、局ごとに鍵を決めた共通乱数）、腕ごとの学習曲線と対照とのペア差をまとめる（`report`）。締まりの効果を除いて比べるには `eval --decode greedy\|temp:<T>`（記録名 `<which>@greedy` など）、途中から始めた run の起点の書き出しは `export-ck`、起点を何度で指すと締まった腕にそろうかは `temp-match`（`--seed` を変えると別の局になる。パネルの評価の乱数は学習中のパネルの記録と対にするため変えない） |
 | `log_windows.py` | 学習ログ（log.jsonl）の見張りの値（エントロピー・π>0.999 の割合・手数・反則・磁石への KL など）を step の窓ごとに平均して並べる。MMD の中止の門の形の指標はこの 100更新の窓の平均で見る（中央値は締まりを小さく見せる） |
 | `openings.py` | 序盤の強制の定跡ブック（tsuitate-bot の `joseki.json` の形式）の読み込み・系統ごとの重み・env へ渡す引数・ログの監視値（`train_rnad.py --open-book`） |
@@ -157,11 +160,14 @@ R-NaD の checkpoint から続ける（net ← 現在のネット、ターゲッ
 | `--mmd-steps` / `--mmd-chunk` / `--mmd-epochs` | 4（`mixinit` は 8）/ 2048 / 1 | 8 / 2048 / 1 | 1更新の Adam の歩数 / 逆伝播のチャンク / 何周するか |
 | `--mmd-max-grad-norm` / `--mmd-adam-b1` | 0.267 / 0.9 | 同じ | 勾配ノルムのクリップ（0 = なし）/ Adam の β1 |
 | `--mmd-value-warmup` / `--mmd-filt-window` / `--mmd-t-scale` | 0 / 1 / 1.0 | 同じ | 最初の N 更新は価値の頭だけ / quantile の窓 / 予定の t の刻み |
+| `--mmd-adv-norm` | 0（しない） | 同じ | A を max(std(A), この値) で割る（ゼロから強い相手に当たる学習向け。上の「相手を固定してゼロから学習する」） |
 | `--init-which` / `--init-step` | `target` / なし | — | `--init` の checkpoint のどのネットから始めるか（`both` 推奨）/ step の番号を続ける |
 
 - `--compact-legal` が要る。`--fast-collect`・`--pipeline`・`--device-batch`（`--packed` は無くてよい）・`--lr-warmup`・
   `--reset-adam`・`--reseed`・`--panel`・`--extra-ema`・`--export-current` は使える
-- 止める組み合わせ: `--fused`・`--reuse` > 1・`--lr-sched`・`--tail-avg`・`--league`・ボーナス（`--nyugyoku` / `--guard` /
+- `--league`（相手を固定した局）は使える（2026-11-10 から。`--mmd-lambda-unit turn` / `--mmd-gae-lambda-unit turn` とは使えない）。
+  報酬を足すなら `--shape` / `--lose-len`（上の「相手を固定してゼロから学習する」）
+- 止める組み合わせ: `--fused`・`--reuse` > 1・`--lr-sched`・`--tail-avg`・ボーナス（`--nyugyoku` / `--guard` /
   `--speed`）・`--aux-truth`、R-NaD だけの設定（`--lr` `--eta` `--beta` `--neurd-clip` `--inv-mu-cap` `--policy-loss`
   `--c-vtrace` `--c-ply` `--schedule` `--schedule-start` `--adam-b1`）を既定以外にしたとき。R-NaD の `out` を MMD で
   （またはその逆で）再開しようとしたとき
@@ -185,6 +191,101 @@ R-NaD の checkpoint から続ける（net ← 現在のネット、ターゲッ
 - テスト: `tests/test_mmd.py`（λ-return と素直なループ・閉形式、extras の収集、Ataraxos の式の密な参照との損失と勾配、
   decoupled PPO、端から端の勾配、行の選び方の不偏性、予定、再開のビット一致、R-NaD の checkpoint からの始め方、
   止める組み合わせ、煙テスト）
+
+## 相手を固定してゼロから学習する（報酬の整形・ハンデの梯子）
+
+既存のモデルを相手に、乱数初期化から「早くその相手に勝てるようになる学習方法」を探すための道具。
+設計・CPU のパイロットの結果・GPU での手順は tsuitate-bot の `docs/rl-fixed-opponent.md`。**どれも既定は使わない**
+（付けなければ本線は従来と同じ）。
+
+```sh
+# tsuitate-bot の rl-env を入れ直してから（VecEnv の signals / random_legal_actions・相手の <名前>@<ε> が要る）
+.venv/bin/python rnad/tests/test_shaping.py
+X=rl_mmdopen_v15
+# パイロットで離陸しやすかった設定（32ch×3・相手1体・駒得 ＋ 相手玉の周りへの利き ＋ 相手の反則。CPU 1スレッドで 1更新 約5〜9秒）
+.venv/bin/python -u rnad/train_rnad.py --algo mmd --init none --anchor none --eval-every 0 --planes 91 \
+    --channels 32 --blocks 3 --batch 64 --compact-legal --league $X --league-frac 1 --league-device gpu \
+    --shape d_capture_value=0.02,king_attack=0.03,opp_fouls=0.05 --shape-cap 1.0 \
+    --mmd-magnet uniform --mmd-temp 0.01,0,0.01,0.01 --mmd-lr 3e-4,0,3e-4,3e-4 \
+    --mmd-steps 8 --mmd-epochs 2 --mmd-adv-norm 0.001 \
+    --export-every 100 --export-current --checkpoint-every 50 --seed 1 --steps 600 --out out_rnad/fx_mat
+.venv/bin/python rnad/signal_report.py out_rnad/fx_mat --vs $X                 # 学習曲線（得点と信号。--vs でその相手への得点の列）
+.venv/bin/python rnad/signal_report.py out_rnad/fx_mat --split                 # 勝ち局と負け局を分ける信号
+.venv/bin/python rnad/ladder_eval.py out_rnad/fx_mat --opponent $X             # ハンデの梯子で測る（ε50）
+.venv/bin/python rnad/ladder_eval.py out_rnad/fx_mat --report
+# 勝ちが出てきたら、同じ out を --shape-decay <今の更新>:<今の更新 + 200> --steps <...> を付けて再開（勝敗だけの報酬へ戻す）
+
+# 腕（--shape の違い）× seed をまとめて回し、離陸の率と離陸までの局数を表にする（離陸 = 直近 50更新の勝率が 10% 以上）
+.venv/bin/python rnad/takeoff.py run --root out_rnad/tk --opponent $X --seeds 1,2,3,4,5,6 --steps 400 --jobs 4 \
+    --arm mat1='--shape d_capture_value=0.02 --shape-cap 1.0' \
+    --arm mat_katk_ofoul='--shape d_capture_value=0.02,king_attack=0.03,opp_fouls=0.05 --shape-cap 1.0' \
+    --arm katk_ofoul='--shape king_attack=0.03,opp_fouls=0.05 --shape-cap 1.0'
+.venv/bin/python rnad/takeoff.py report out_rnad/tk --horizon 400
+```
+
+**パイロットで分かったこと**（2026-11-10、詳細は上の doc）: 勝敗だけの報酬は 1局も勝てない間は信号が無い（約 2.9万局で勝率 0.0〜0.1% の
+まま）。駒得の報酬の 1本は約 1.9万局で離陸して 3.8万局で rl_mmdopen_v15 に五分（アリーナ 53.0% ± 9.8）になり、整形を 0 へ下げても
+保ったが、**4 seed 中 1本だけ**で、勝ち方は決まった1本の手順への特化（別系統の凍結版には 0〜2%）。**`fouls` のペナルティだけを
+付けるのは逆効果**（早く詰まされるほうが得になる）。梯子を `--league-weighting even` で回すと引き分けの多い最下段（ε = 1）に
+配分が張り付く。
+
+**駒得に何を足すと離陸が増えるか**（2026-11-11、上の doc の 8節。打ち切り 25,600局・腕ごとに 6 seed）:
+- **`--shape-cap` は 1.0（既定）にする**。上の「4 seed 中 1本」は上限 0.5 で回していて、駒得が +25 点で頭打ちになっていた
+  （駒得だけの腕は、上限 0.5 で 4本中1本・上限 1.0 で 6本中2本）
+- **駒得 ＋ 相手玉の周りへの利き ＋ 相手の反則（`king_attack=0.03,opp_fouls=0.05`）は 6本中6本が 1.2万〜2.3万局で離陸**。
+  片方ずつ足した腕は 6本中5本ずつ、駒得だけは 6本中2本、駒得 ＋ 王手（`checks=0.05`）は 6本中4本。利きか相手の反則を入れた
+  4腕を合わせて 24本中21本 対 6本中2本（Fisher の片側 p = 0.02）
+- **駒得は無くても離陸する**: 利き ＋ 相手の反則だけ（`--shape king_attack=0.03,opp_fouls=0.05`）で 6本中5本、離陸までの局数の
+  中央値は 1.36万局でいちばん少ない。片方だけ（利きだけ・相手の反則だけ）は 4本中1本で、その1本も続かなかった（2本ずつの試行）
+- 一手詰め・詰めろ（`mate_threat=0.3`）と、王手を外す報酬（`evasions=0.03,fouls_in_check=-0.03`）は離陸しなかった（1本ずつ）
+- 勝ち方は「詰み」と「遠くからの王手で相手を反則負けに追い込む」の2通りで、**駒得と利きの両方があると詰み、どちらかが欠けると
+  相手の反則負け**に寄る。離陸の直後のアリーナの勝率は駒得つきの組み合わせのほうが高い（rl_mmdopen_v15 に平均 32% 対 17%。
+  いちばん高い 1本は 17,600局で 58.3% ± 12.5）。どちらも学習の相手への特化（別系統の凍結版には 0〜8%）
+- **いちばん早く勝ち越した 1本は、駒得 ＋ 王手の seed 6**: ゼロから 19,200局（CPU 約 36分）でアリーナの rl_mmdopen_v15 に
+  84.5% ± 5.0（200局）。先手・後手それぞれ決まった1本の詰みの手順への特化で、1本だけの結果
+- **エンコーダ v4 の入力（`--king-foul-planes`。玉の移動で反則したマス）は、離陸を早くしなかった**（doc の 8.7節）:
+  駒得 ＋ 利き ＋ 相手の反則の腕で v2・v4 とも 8本中7本、離陸までの局数は打ち切り込みの平均 1.67万局 対 1.50万局（片側 p = 0.27）。
+  最初の 6 seed では差があるように見え（p = 0.09）、seed を 2つ足したら縮んだ。ネットはこの入力をまだ読んでいない
+  （前に玉で反則したマスへの繰り返しが v2 と同じ割合。プレーンを 0 にしても方策がほとんど変わらない）。
+  腕の引数に `--king-foul-planes` を足せば回る（相手が v2 でも `--league-device gpu` のまま）
+
+- **学習器は `--algo mmd`**（PPO 型）を `--league <相手> --league-frac 1` で使う。相手を固定した学習は一人用の RL で、
+  磁石は一様（= エントロピーの正則化）にする。R-NaD（既定）でも同じフラグで回る
+- **`--mmd-adv-norm <下限>`**: その更新の A を max(std(A), 下限) で割る。ゼロから強い相手に当たると1局も勝てず |A| が
+  0.005 前後しかなく、本線の設定のままでは方策がほとんど動かなかった（1更新の KL 0.00001 未満）。`--mmd-steps 8 --mmd-epochs 2`
+  （1更新 16歩）と合わせる。本線（勝率が五分前後）では付けない
+- **勝敗だけの報酬で1局も勝てない間は、学ぶ信号が無い**（価値が −1 に張り付き A が 0 になる）。整形かハンデのどちらかが要る
+
+| フラグ | 中身 |
+| --- | --- |
+| `--shape '鍵=重み,...'` | 局の信号に付ける重み。鍵は `tsuitate_rl.SIGNAL_NAMES` の名前（自分の信号）・`opp_<名前>`（相手の信号）・`d_<名前>`（自分 − 相手）。連続する2時点の Φ = Σ 重み × 信号 の差を報酬へ足す。例: `d_capture_value=0.02`（駒得。歩 1枚 0.02・飛車 0.19）/ `fouls=-0.05`（反則1回 −0.05）/ `d_checks=0.01` |
+| `--shape-mode plain\|potential` | `plain`（既定）= 差分をそのまま足す（目的が変わる。駒得して負けた局は負けが軽くなる）/ `potential` = 終局で累計を差し戻す（1局の合計は 0 = 最適方策を変えないポテンシャル型。価値の頭に「Φ が形勢」という事前知識を与えるのと同じ） |
+| `--shape-cap C` | 1局の Φ の変化の上限（±。既定 1.0）。勝敗 1 に対する整形の大きさの上限になる |
+| `--lose-len 'λ[:H]'` | 負けた側の終局の報酬に λ × min(手数, H) / H を足す（負けるまでの長さ。0 ≤ λ < 1 なので 負け < 引き分け < 勝ち は保つ） |
+| `--shape-decay '始め:終わり'` | 整形の倍率を更新回数で 1 → 0 へ線形に下げる（`--lose-len` にも掛かる）。勝ちが出てきたら勝敗だけの報酬へ戻す |
+| `--watch-signals` | 報酬は変えずに、局の信号の監視値だけを log.jsonl の `signals` に出す（`--shape` / `--lose-len` を付ければ常に出る） |
+| `--league '<相手>@<ε>,...'` | **ハンデつきの相手**: 相手の手番ごとに確率 ε で、相手の手を合法手の乱数手に差し替える（ε = 1 は全部が乱数手、0 = 本物）。`--league-weighting even`（勝率が五分前後の段に多く当てる）と組むと、同じ相手へ向かう梯子になる。`--league-device rust` / `gpu` の両方で使える |
+
+- 報酬は 1 + cap + λ で割って価値の頭（tanh）の範囲に収める（`reward_scale`。倍率で下げ切った後も変えない）。MMD は磁石の温度と
+  近い方策への KL の係数も同じ倍率で縮める（R-NaD が η を割るのと同じ）
+- 整形の設定（重み・形・上限・負けの長さ）は checkpoint（`collect_cfg`）と `config.json` に残り、再開で付け忘れる・変えると止まる
+  （`--override-config` で通す）。倍率の予定（`--shape-decay`）だけは再開で変えてよい（勝ちが出てきたのを見てから下げ始められる）
+- `--pipeline`・`--fast-collect`・`--open-book` とは一緒に使えない（速い収集は信号を読まない。強制した手の駒得が報酬に入る）。
+  自己対局の局がある設定で零和でない整形（反対称でない重み・`--lose-len`）を付けると注意を出す（R-NaD の前提が外れる）
+- ログ: `signals`（勝ち局・負け局・引き分けごとに、終局時と両者の受理手の合計が 20 / 40 / 60 に届いた時点の信号の平均と標準偏差。
+  並びは [自分の信号…, 相手の信号…, 自分 − 相手…]、名前は config.json の `signal_names`）・`shape_mult`（倍率）・`reward_scale`・
+  `adv_std_raw`（正規化の前の A の標準偏差）
+- **`--league-device gpu` の v-trace を直した**（2026-11-10）: 相手の手番を記録しない局では、局の途中の無効な行で carry が 0 に戻り、
+  終局の報酬が各局の最後の学習側の手番にしか届いていなかった（tsuitate-bot の docs/rl-learning-speed.md 9.8）。無効な行では carry を
+  通すようにした。自己対局と `--league-device rust` の値は変わらない（`tests/test_rnad.py` の参照との一致・`tests/test_shaping.py` の S3）
+- **`takeoff.py`**（腕 × seed の比較）: `run` は腕（`--arm 名前='<train_rnad.py の引数>'`）と seed の組を `--jobs` 本ずつ並べて回し、
+  離陸したら `--after`（既定 30）更新だけ続けて止める。途中で止めても同じコマンドで続きから回る（終わった run は飛ばす。
+  `--queue 腕:seed,...` で回す順を指定できる）。共通の引数は `--common`（既定は上のパイロットの CPU の設定。GPU なら
+  `--device cuda` と大きいネットに替える）。`report` は腕ごとの離陸した本数・離陸までの局数・打ち切り込みの中央値の表を出す
+  （`--extra 腕=dir,dir` で `run` の外で回した run も数える）
+- テスト: `tests/test_shaping.py`（重みの書式、合成の信号での plain / potential / 負けの長さ、v-trace の隙間、collect の報酬の合計と
+  対局の不変、相手を固定した batch の λ-return、reward_scale、ハンデつきの相手、train_rnad.py の配線）、
+  `tests/test_takeoff.py`（離陸の判定、ログの読み方と表）
 
 ## 序盤の強制（`--open-book`）
 

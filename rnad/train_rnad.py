@@ -41,12 +41,14 @@ from model import EXTENDED_PLANES, NUM_PLANES, NUM_PLANES_DEDUCED, PolicyValueNe
 from widen_planes import add_extra_flags, extras_from_args, widen_checkpoint
 from league import League
 import openings
+from shaping import Shaping
+from shaping import summarize as summarize_signals
 from mmd import PRESETS as MMD_PRESETS
 from mmd import LAMBDA_UNITS as MMD_LAMBDA_UNITS
 from mmd import MMDLearner
 from mmd import make_config as make_mmd_config
 from rnad import (PRECISIONS, MultiEnv, OpponentPool, PipelinedCollector, RNaDConfig, RNaDLearner, cfg_diff,
-                  collect, play_match, set_precision)
+                  collect, play_match, set_precision, split_noise)
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -177,12 +179,16 @@ def check_algo_args(ap, args):
     if not args.compact_legal:
         raise SystemExit("--algo mmd は --compact-legal と一緒に使う（収集方策の対数確率を合法手の添字の並びで持つ）")
     bad = [f for f, on in (("--fused", args.fused), ("--reuse", args.reuse != 1), ("--lr-sched", args.lr_sched),
-                           ("--tail-avg", args.tail_avg), ("--league", args.league), ("--nyugyoku", args.nyugyoku),
+                           ("--tail-avg", args.tail_avg), ("--nyugyoku", args.nyugyoku),
                            ("--guard", args.guard), ("--speed", args.speed), ("--aux-truth", args.aux_truth > 0)) if on]
     bad += ["--" + k.replace("_", "-") for k in RNAD_ONLY if getattr(args, k) != ap.get_default(k)]
     if bad:
         raise SystemExit(f"--algo mmd では使えない: {' '.join(bad)}（学習率は --mmd-lr、1つの batch を何周するかは "
-                         "--mmd-epochs。自己対局だけ・ボーナスなしで使う。docs/rl-learning-speed.md 10節）")
+                         "--mmd-epochs。報酬を足すなら --shape / --lose-len。docs/rl-learning-speed.md 10節）")
+    if args.league and "turn" in (args.mmd_lambda_unit, args.mmd_gae_lambda_unit):
+        # 相手を固定した局（docs/rl-fixed-opponent.md）。Rust の評価モードでは学習側の行が毎時刻続くので、
+        # 「次の時刻に同じ側が指す = 反則」で反則を見る turn は取り違える（turn+check は観測から読むので使える）
+        raise SystemExit("--league と --mmd-lambda-unit turn / --mmd-gae-lambda-unit turn は一緒に使えない（turn+check を使う）")
     try:
         return make_mmd_config(
             args.mmd_preset, filter=args.mmd_filter, value_rows=args.mmd_value_rows, filt_window=args.mmd_filt_window,
@@ -195,6 +201,7 @@ def check_algo_args(ap, args):
             temp_t_off=args.mmd_temp_t_off, lr=_floats4(args.mmd_lr, "mmd-lr"), lr_t_off=args.mmd_lr_t_off,
             t_scale=args.mmd_t_scale, steps=args.mmd_steps, chunk=args.mmd_chunk, epochs=args.mmd_epochs,
             max_grad_norm=args.mmd_max_grad_norm, adam_b1=args.mmd_adam_b1, value_warmup=args.mmd_value_warmup,
+            adv_norm=args.mmd_adv_norm,
             target_avg=args.target_avg)
     except ValueError as e:
         raise SystemExit(f"MMD の設定: {e}") from e
@@ -295,6 +302,25 @@ def main() -> None:
                          "どれも駒がぶつかった時点（どちらかの駒取り・王手）で止める")
     ap.add_argument("--open-weight", choices=["category", "line"], default="category",
                     help="ラインの選び方（category = 系統ごとに同じ確率 / line = ラインごとに一様）")
+    # ---- 報酬の整形（tsuitate-bot の docs/rl-fixed-opponent.md）。どれも既定は使わない = 報酬は勝敗だけ
+    ap.add_argument("--shape", default="",
+                    help="局の信号に付ける重み（カンマ区切りの '鍵=重み'。例 'd_capture_value=0.02,fouls=-0.03'）。"
+                         "鍵は tsuitate_rl.SIGNAL_NAMES の名前（自分の信号）・opp_<名前>（相手の信号）・d_<名前>（自分 − 相手）。"
+                         "連続する2時点の差 × 重みを報酬へ足す（rnad/shaping.py）")
+    ap.add_argument("--shape-mode", choices=["plain", "potential"], default="plain",
+                    help="plain = 差分をそのまま足す（目的が変わる。--shape-decay で 0 へ下げる想定）/ "
+                         "potential = 終局で累計を差し戻す（1局の合計は 0 = 最適方策を変えないポテンシャル型）")
+    ap.add_argument("--shape-cap", type=float, default=1.0,
+                    help="1局の整形の累計の上限（±。勝敗 1 に対する大きさ）。報酬の縮め方は 1 + これ + 負けの長さの λ で固定する")
+    ap.add_argument("--shape-decay", default="",
+                    help="整形の倍率の予定 '始め:終わり'（更新回数。始めまでは 1、終わり以後は 0、その間は線形）。"
+                         "--lose-len にも掛かる。空 = ずっと 1")
+    ap.add_argument("--lose-len", default="",
+                    help="負けるまでの長さの報酬 'λ[:H]': 負けた側の終局の報酬に λ × min(手数, H) / H を足す"
+                         "（0 ≤ λ < 1。H の既定は 200 = 手数上限）")
+    ap.add_argument("--watch-signals", action="store_true",
+                    help="報酬は変えずに、局の信号の監視値（勝ち局・負け局ごとの平均）だけを log.jsonl の signals に出す"
+                         "（--shape / --lose-len を付ければ常に出る）")
     ap.add_argument("--league", default="",
                     help="リーグ学習の相手（カンマ区切り。tsuitate-bot の strategy::make の名前、例 "
                          "'rl_v15,rl_v16,rl_policy:/path/policy.bin'）。空 = 自己対局だけ")
@@ -429,6 +455,9 @@ def main() -> None:
     mg.add_argument("--mmd-epochs", type=int, default=None, help="残した行を何周するか")
     mg.add_argument("--mmd-max-grad-norm", type=float, default=None, help="勾配ノルムのクリップ（0 = なし）")
     mg.add_argument("--mmd-adam-b1", type=float, default=None, help="Adam の β1（R-NaD の --adam-b1 とは別）")
+    mg.add_argument("--mmd-adv-norm", type=float, default=None,
+                    help="アドバンテージの正規化（0 = しない。> 0 なら A を max(std(A), この値) で割る。値は std の下限で 0.001 など。"
+                         "ゼロから強い相手に当たる学習向け。tsuitate-bot の docs/rl-fixed-opponent.md）")
     mg.add_argument("--mmd-value-warmup", type=int, default=None,
                     help="最初の N 更新は価値の頭だけを全行で学ぶ（幹と方策は止める）")
     ap.add_argument("--threads", type=int, default=0, help="torch のスレッド数（0 = 既定）")
@@ -456,6 +485,26 @@ def main() -> None:
     if args.device_batch and not (args.compact_legal and (args.packed or args.algo == "mmd")):
         raise SystemExit("--device-batch は --packed --compact-legal と一緒に使う（--algo mmd は --compact-legal だけ）")
     mcfg = check_algo_args(ap, args)
+    shape, signal_names = None, None
+    watch_signals = bool(args.shape or args.lose_len or args.watch_signals)
+    if watch_signals or args.shape_decay:
+        try:
+            shape = Shaping.from_spec(args.shape, args.shape_mode, args.shape_cap, args.lose_len, args.shape_decay)
+        except ValueError as e:
+            raise SystemExit(f"報酬の整形の設定: {e}") from e
+        if args.shape_decay and not shape.active:
+            raise SystemExit("--shape-decay は --shape か --lose-len と一緒に使う")
+        bad = [f for f, on in (("--pipeline", args.pipeline), ("--fast-collect", args.fast_collect),
+                               ("--open-book", args.open_book)) if on]
+        if bad:
+            # 収集の速い経路は信号を読まない。序盤の強制は、強制した手の駒得や手数が報酬に入る
+            raise SystemExit(f"報酬の整形・信号の監視は {' '.join(bad)} と一緒に使えない")
+        if shape.active and not shape.zero_sum and not (args.league and args.league_frac == 1.0):
+            print("注意: 整形が零和でない（重みが反対称でない・負けの長さ）のに自己対局の局がある。"
+                  "相手を固定した学習（--league ... --league-frac 1）で使う想定", flush=True)
+        signal_names = shape.names
+        if not shape.active:
+            shape = None  # 監視だけ
     open_kw, open_cfg = {}, None
     if args.open_p or args.open_book or args.open_len or args.open_weight != "category":
         if not (0.0 < args.open_p <= 1.0) or not args.open_book:
@@ -516,6 +565,9 @@ def main() -> None:
     # 固定でも報酬と η にそろって掛かるので、各区間の勝敗・ボーナス・正則化の比率は変わらない。
     # loss_v は 1/s²、v_target_mean・s_abs_mean は 1/s の単位になる（s の違う run は log の reward_scale で換算）
     reward_scale = 1.0 + lam_max + guard_max + speed_max
+    if shape is not None:
+        # 整形の累計は ±cap、負けの長さは λ まで（rnad/shaping.py）。倍率（--shape-decay）で下げ切った後も単位は変えない
+        reward_scale += shape.reward_scale - 1.0
     if args.nyugyoku_cond == "win" and (args.guard or args.speed):
         raise SystemExit("--nyugyoku-cond win は勝ち負けを終局の報酬の符号で見るので、--guard / --speed と併用できない")
     if args.speed_horizon < 1:
@@ -569,12 +621,24 @@ def main() -> None:
                  else {"rnad": dict(cfg.__dict__)})}
     if open_cfg is not None:
         record["opening"] = open_cfg
+    # checkpoint に残す整形の設定（倍率の予定は除く）
+    shape_cfg = None
+    if shape is not None:
+        record["shaping"] = shape.config()
+        shape_cfg = {k: v for k, v in shape.config().items() if k != "decay"}
+    if watch_signals:
+        record["signal_names"] = signal_names
     if ck is not None:
         diff = cfg_diff(ck["cfg"], learner_cfg)
         # 集め方の設定（序盤の強制）。再開で --open-* を付け忘れると黙って強制が止まるので、学習器の設定と同じく止める
         old_open = (ck.get("collect_cfg") or {}).get("opening")
         if old_open != open_cfg:
             diff["opening"] = (old_open, open_cfg)
+        # 報酬の整形も同じ（付け忘れると報酬の単位 reward_scale が黙って変わる）。倍率の予定（--shape-decay）だけは
+        # 再開で変えてよい（勝ちが出てきたのを見てから下げ始める使い方のため）
+        old_shape = (ck.get("collect_cfg") or {}).get("shaping")
+        if old_shape != shape_cfg:
+            diff["shaping"] = (old_shape, shape_cfg)
         if diff and not args.override_config:
             raise SystemExit(f"checkpoint と設定が違う: {diff}（(保存, 今)）。"
                              "意図した変更なら --override-config を付ける")
@@ -590,7 +654,7 @@ def main() -> None:
             print(f"乱数を --seed {args.seed} で作り直した（checkpoint の乱数状態は使わない）", flush=True)
         if diff:
             print(f"再開時に設定を上書き: {diff}")
-        if set(diff) - {"opening"}:
+        if set(diff) - {"opening", "shaping"}:
             learner.apply_cfg(learner_cfg, **({"old": ck["cfg"]} if args.algo == "mmd" else {}))
         elif args.algo == "mmd":
             pass  # MMD の学習率は毎更新で予定から入れ直す
@@ -618,14 +682,23 @@ def main() -> None:
                         weighting=args.league_weighting)
         if args.league_device == "gpu":
             # 相手の重みを PyTorch へ読む（凍結版は --frozen-models/<名前>.bin、rl_policy:<パス> はそのパス）
+            # ハンデつきの相手（<名前>@<ε>）は <名前> のネットを共有する（雑音の手は collect が差し替える）
             opp_nets = {}
-            for name in league.names:
+            for name in dict.fromkeys(split_noise(n)[0] for n in league.names):
                 path = (name[len("rl_policy:"):] if name.startswith("rl_policy:")
                         else pathlib.Path(args.frozen_models) / f"{name}.bin")
                 if not pathlib.Path(path).exists():
                     raise SystemExit(f"リーグの相手 {name} の重み {path} が無い（--league-device gpu は "
                                      "凍結版 rl_* と rl_policy:<パス> だけ）")
                 opp_nets[name] = read_weights(path).to(device).eval()
+            if any(split_noise(n)[1] > 0 for n in league.names) and not hasattr(tsuitate_rl.VecEnv, "random_legal_actions"):
+                raise SystemExit("ハンデつきの相手（<名前>@<ε>）には VecEnv.random_legal_actions が要る"
+                                 "（tsuitate-bot の rl-env を maturin develop で作り直す）")
+            # 相手の入力が学習側の観測より広いと読めない（相手のネットは学習側の env の観測を読む）
+            wide = {n: m.config["planes"] for n, m in opp_nets.items() if m.config["planes"] > init_net.config["planes"]}
+            if wide:
+                raise SystemExit(f"リーグの相手の入力（{wide}）が学習するネットの観測（{init_net.config['planes']}枚）より広い。"
+                                 "学習側を同じ版にする（v3 なら --opp-hand-planes など）か、--league-device rust を使う")
             # 全相手を1回の推論で指させる（相手ごとに推論すると相手の数だけ直列になり速くならない）
             opp_nets = OpponentPool(opp_nets)
         else:
@@ -651,7 +724,8 @@ def main() -> None:
     log = open(out / "log.jsonl", "a")
 
     def save_all():
-        save_checkpoint(learner, ck_path, None if open_cfg is None else {"opening": open_cfg})
+        collect_cfg = {k: v for k, v in (("opening", open_cfg), ("shaping", shape_cfg)) if v is not None}
+        save_checkpoint(learner, ck_path, collect_cfg or None)
         if extra_ema:
             tmp = out / "extra_ema.tmp"
             torch.save({"step": learner.step_count, "nets": {str(t): n.state_dict() for t, n in extra_ema.items()}}, tmp)
@@ -871,6 +945,7 @@ def main() -> None:
                                                 seed=args.seed * 1_000_003 + learner.step_count, auto_reset=False,
                                                 **env_kwargs(guard_lam, speed_lam), **obs_kw)
                 envs.append(league_env)
+            shape_mult = shape.multiplier(learner.step_count) if shape is not None else 1.0
             batch = collect(MultiEnv(envs), learner.net, device,
                             nyugyoku_lambda=lam, nyugyoku_mode=args.nyugyoku_mode,
                             nyugyoku_zero_sum=args.nyugyoku_sum == "zero",
@@ -878,8 +953,18 @@ def main() -> None:
                             opponents=(None if league_games is None else [None] * n_self + league_games),
                             opp_nets=(opp_nets if league_games is not None else None),
                             truth=cfg.aux_truth > 0, compact_legal=args.compact_legal, fast=args.fast_collect,
-                            actor_extras=args.algo == "mmd")
+                            actor_extras=args.algo == "mmd", shaping=shape, shape_mult=shape_mult,
+                            watch_signals=watch_signals,
+                            # ハンデの雑音の乱数（--league-device gpu。相手の配分の乱数 rng の続きから引く = 更新ごとに決まる）
+                            noise_rng=(rng if league_games is not None else None))
             t1 = time.time()
+            if watch_signals:
+                # 学習側の色（自己対局の局は −1 = 両方の側を数える）。Rust の評価モードは env が、GPU は配った並びが知っている
+                learner_col = np.full(args.batch, -1)
+                if league_env is not None:
+                    learner_col[n_self:] = (league_env.learner_colors() if league_games is None
+                                            else [c for _, c in league_games])
+                signals_rec = summarize_signals(batch.pop("shape_run"), batch["outcome"], learner_col)
             finished = env.pop_finished() if env is not None else []
             league_finished = league_env.pop_finished() if league_env is not None else []
             if league_games is not None:
@@ -937,6 +1022,12 @@ def main() -> None:
                 "nyugyoku_d": int((res == 0).sum()),
                 "king_advance_hist": np.bincount(batch["advance"][:n_self].ravel(), minlength=9).tolist(),
             })
+        if watch_signals:
+            # 局の信号の監視値（勝ち局・負け局ごとの平均と標準偏差。並びは [自分の信号…, 相手の信号…, 自分 − 相手…]、
+            # 名前は config.json の signal_names。rnad/signal_report.py が読む）
+            rec["signals"] = signals_rec
+            if shape is not None:
+                rec["shape_mult"] = shape_mult
         if open_kw and finished:
             # 序盤の強制の監視値（強制した側の割合・手数・やめた理由、最初の接触の手数、接触の前の反則）。
             # 強制した側の序盤の局面は学習の行に入らないので、pi_top_* やエントロピーは強制しない run と直接は比べられない
