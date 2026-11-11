@@ -200,10 +200,10 @@ R-NaD の checkpoint から続ける（net ← 現在のネット、ターゲッ
 # tsuitate-bot の rl-env を入れ直してから（VecEnv の signals / random_legal_actions・相手の <名前>@<ε> が要る）
 .venv/bin/python rnad/tests/test_shaping.py
 X=rl_mmdopen_v15
-# パイロットで離陸した設定（32ch×3・相手1体・駒得の報酬。CPU 1スレッドで 1更新 約5〜7秒）
+# パイロットで離陸しやすかった設定（32ch×3・相手1体・駒得 ＋ 相手玉の周りへの利き。CPU 1スレッドで 1更新 約5〜9秒）
 .venv/bin/python -u rnad/train_rnad.py --algo mmd --init none --anchor none --eval-every 0 --planes 91 \
     --channels 32 --blocks 3 --batch 64 --compact-legal --league $X --league-frac 1 --league-device gpu \
-    --shape d_capture_value=0.02 --shape-cap 0.5 \
+    --shape d_capture_value=0.02,king_attack=0.03 --shape-cap 1.0 \
     --mmd-magnet uniform --mmd-temp 0.01,0,0.01,0.01 --mmd-lr 3e-4,0,3e-4,3e-4 \
     --mmd-steps 8 --mmd-epochs 2 --mmd-adv-norm 0.001 \
     --export-every 100 --export-current --checkpoint-every 50 --seed 1 --steps 600 --out out_rnad/fx_mat
@@ -212,6 +212,13 @@ X=rl_mmdopen_v15
 .venv/bin/python rnad/ladder_eval.py out_rnad/fx_mat --opponent $X             # ハンデの梯子で測る（ε50）
 .venv/bin/python rnad/ladder_eval.py out_rnad/fx_mat --report
 # 勝ちが出てきたら、同じ out を --shape-decay <今の更新>:<今の更新 + 200> --steps <...> を付けて再開（勝敗だけの報酬へ戻す）
+
+# 腕（--shape の違い）× seed をまとめて回し、離陸の率と離陸までの局数を表にする（離陸 = 直近 50更新の勝率が 10% 以上）
+.venv/bin/python rnad/takeoff.py run --root out_rnad/tk --opponent $X --seeds 1,2,3,4,5,6 --steps 400 --jobs 4 \
+    --arm mat1='--shape d_capture_value=0.02 --shape-cap 1.0' \
+    --arm mat_katk='--shape d_capture_value=0.02,king_attack=0.03 --shape-cap 1.0' \
+    --arm mat_ofoul='--shape d_capture_value=0.02,opp_fouls=0.05 --shape-cap 1.0'
+.venv/bin/python rnad/takeoff.py report out_rnad/tk --horizon 400
 ```
 
 **パイロットで分かったこと**（2026-11-10、詳細は上の doc）: 勝敗だけの報酬は 1局も勝てない間は信号が無い（約 2.9万局で勝率 0.0〜0.1% の
@@ -219,6 +226,16 @@ X=rl_mmdopen_v15
 保ったが、**4 seed 中 1本だけ**で、勝ち方は決まった1本の手順への特化（別系統の凍結版には 0〜2%）。**`fouls` のペナルティだけを
 付けるのは逆効果**（早く詰まされるほうが得になる）。梯子を `--league-weighting even` で回すと引き分けの多い最下段（ε = 1）に
 配分が張り付く。
+
+**駒得に何を足すと離陸が増えるか**（2026-11-11、上の doc の 8節。打ち切り 25,600局・腕ごとに 5〜6 seed）:
+- **`--shape-cap` は 1.0（既定）にする**。上の「4 seed 中 1本」は上限 0.5 で回していて、駒得が +25 点で頭打ちになっていた
+  （駒得だけの腕は、上限 0.5 で 4本中1本・上限 1.0 で 6本中2本）
+- **駒得 ＋ 相手玉の周りへの利き（`king_attack=0.03`）と、駒得 ＋ 相手の反則（`opp_fouls=0.05`）は、どちらも 6本中5本が
+  1.2万〜2.2万局で離陸**（駒得だけは 6本中2本）。駒得 ＋ 王手（`checks=0.05`）は 5本中3本。本数が少なく言い切れる差ではない
+  （3つを合わせて Fisher の片側 p = 0.08）が、向きはそろっている
+- 一手詰め・詰めろ（`mate_threat=0.3`）と、王手を外す報酬（`evasions=0.03,fouls_in_check=-0.03`）は離陸しなかった（1本ずつ）
+- 勝ち方は「詰み」と「遠くからの王手で相手を反則負けに追い込む」の2通り。後者の 1本は 14,400局でアリーナの rl_mmdopen_v15 に
+  66.7% ± 11.9（どちらも学習の相手への特化）
 
 - **学習器は `--algo mmd`**（PPO 型）を `--league <相手> --league-frac 1` で使う。相手を固定した学習は一人用の RL で、
   磁石は一様（= エントロピーの正則化）にする。R-NaD（既定）でも同じフラグで回る
@@ -249,8 +266,14 @@ X=rl_mmdopen_v15
 - **`--league-device gpu` の v-trace を直した**（2026-11-10）: 相手の手番を記録しない局では、局の途中の無効な行で carry が 0 に戻り、
   終局の報酬が各局の最後の学習側の手番にしか届いていなかった（tsuitate-bot の docs/rl-learning-speed.md 9.8）。無効な行では carry を
   通すようにした。自己対局と `--league-device rust` の値は変わらない（`tests/test_rnad.py` の参照との一致・`tests/test_shaping.py` の S3）
+- **`takeoff.py`**（腕 × seed の比較）: `run` は腕（`--arm 名前='<train_rnad.py の引数>'`）と seed の組を `--jobs` 本ずつ並べて回し、
+  離陸したら `--after`（既定 30）更新だけ続けて止める。途中で止めても同じコマンドで続きから回る（終わった run は飛ばす。
+  `--queue 腕:seed,...` で回す順を指定できる）。共通の引数は `--common`（既定は上のパイロットの CPU の設定。GPU なら
+  `--device cuda` と大きいネットに替える）。`report` は腕ごとの離陸した本数・離陸までの局数・打ち切り込みの中央値の表を出す
+  （`--extra 腕=dir,dir` で `run` の外で回した run も数える）
 - テスト: `tests/test_shaping.py`（重みの書式、合成の信号での plain / potential / 負けの長さ、v-trace の隙間、collect の報酬の合計と
-  対局の不変、相手を固定した batch の λ-return、reward_scale、ハンデつきの相手、train_rnad.py の配線）
+  対局の不変、相手を固定した batch の λ-return、reward_scale、ハンデつきの相手、train_rnad.py の配線）、
+  `tests/test_takeoff.py`（離陸の判定、ログの読み方と表）
 
 ## 序盤の強制（`--open-book`）
 
