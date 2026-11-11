@@ -270,7 +270,8 @@ X=rl_mmdopen_v15
   近い方策への KL の係数も同じ倍率で縮める（R-NaD が η を割るのと同じ）
 - 整形の設定（重み・形・上限・負けの長さ）は checkpoint（`collect_cfg`）と `config.json` に残り、再開で付け忘れる・変えると止まる
   （`--override-config` で通す）。倍率の予定（`--shape-decay`）だけは再開で変えてよい（勝ちが出てきたのを見てから下げ始められる）
-- `--pipeline`・`--fast-collect`・`--open-book` とは一緒に使えない（速い収集は信号を読まない。強制した手の駒得が報酬に入る）。
+- `--pipeline`・`--fast-collect`・`--open-p`（自己対局の局の序盤の強制）とは一緒に使えない（速い収集は信号を読まない。
+  強制した手の駒得が報酬に入る）。リーグの局で**相手の側だけ**を定跡から指させる `--league-open-p` とは使える。
   自己対局の局がある設定で零和でない整形（反対称でない重み・`--lose-len`）を付けると注意を出す（R-NaD の前提が外れる）
 - ログ: `signals`（勝ち局・負け局・引き分けごとに、終局時と両者の受理手の合計が 20 / 40 / 60 に届いた時点の信号の平均と標準偏差。
   並びは [自分の信号…, 相手の信号…, 自分 − 相手…]、名前は config.json の `signal_names`）・`shape_mult`（倍率）・`reward_scale`・
@@ -304,7 +305,19 @@ X=rl_mmdopen_v15
   （既定はラインを切った後の最後まで）。`--open-weight`: `category`（既定。系統ごとに同じ確率）/ `line`
 - 止める条件: どちらかの駒取り・王手（両者とも止める）・その側の反則・予定の手数。定跡の最後の駒取りの手は指させない
   （初期配置の相手の駒に触れる手の手前で切る）
-- `--league` とは使える（強制するのは自己対局の局だけ。リーグの局は強制しない）。
+- `--league` とは使える（`--open-p` が強制するのは自己対局の局だけ）。
+- **リーグの局（相手を固定した局）の強制は `--league-open-p P`**（`--open-book` のブックを使う。`--open-p` とは別で、
+  片方だけでも指定できる）。`--league-open-sides opponent`（既定）なら相手の側だけ、`learner` なら学習側だけを、確率 P で
+  定跡から指させる。相手を Rust で指させる形・ネットで指させる形（`--league-device gpu`）・`--pipeline` のどれでも効く
+  - **定跡に従う相手を搾取する搾取役**: `--league <相手> --league-frac 1 --league-device gpu --open-book <ブック>
+    --league-open-p 1.0` ＋ 報酬の整形。ゼロから 3.2万〜5.1万局で、局ごとに定跡を引く相手（arena の `open:book:<相手>`）に
+    34〜52%（tsuitate-bot の `docs/rl-fixed-opponent.md` 9節。手口は seed ごとに違うので数本回して合わせる）
+  - **本線で搾取役を相手にするとき**: `--league "rl_policy:<搾取役の重み>,..." --league-open-p 0.25 --league-open-sides learner`
+    で、リーグの局でも本線の側が定跡から指す（小さいネットで動くことだけを確かめた。効果は測っていない）
+  - ログの `league_opening` に、強制の監視値と**ラインごとの学習側の [勝, 負, 分]**（`by_line`。ラインはブックの添字）
+  - `--league-open-adapt γ`（`--league-open-window`）: ラインの重みを学習側の直近の勝率で付け替える
+    （重み ∝ 元の重み × max(1 − 勝率, 0.05)^γ = 勝てていないラインの局を増やす。`openings.LineAdapter`）。
+    **試した 1組では全体が下がった**（勝てていたラインが崩れる。同 9.5節）ので、勧めない。`--pipeline` とは使えない
 - 使えない組み合わせ: `--guard`・`--speed`・`--nyugyoku`・`--c-ply`・`--mmd-lambda-unit turn`（`--mmd-gae-lambda-unit turn` も。`turn+check` は使える）。`--pipeline` は使える。
   `--open-len` / `--open-weight` は `--open-book` と `--open-p` と一緒に使う（片方だけなら止める）。起動時に tsuitate_rl が
   序盤の強制を知っているかを1局指して確かめる
@@ -315,7 +328,7 @@ X=rl_mmdopen_v15
   強制した側の序盤の局面は学習の行に入らないので、`pi_top_*` やエントロピーは強制しない run と直接は比べられない
 - 測る: `opening_eval.py entropy NAME=weights.bin ...`・`opening_eval.py robust --cand a.bin [--ref b.bin] --book joseki.json`
 - テスト: `tests/test_openings.py`（ブック・env の挙動と p = 0 がブックなしと同じ局・collect の不変量・再開のビット一致・
-  付け忘れの再開の停止・使えない組み合わせ）
+  付け忘れの再開の停止・使えない組み合わせ・リーグの局の強制〔相手の側だけ・ラインごとの勝敗〕・ラインの重みの付け替え）
 
 ## 防御特化（玉の周りの固め）モデル
 
