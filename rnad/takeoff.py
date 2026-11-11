@@ -97,11 +97,25 @@ def cmd_run(args):
     if len({n for n, _ in arms}) != len(arms):
         raise SystemExit("腕の名前が重複している")
     seeds = [int(s) for s in args.seeds.split(",")]
-    (root / "arms.json").write_text(json.dumps({"opponent": args.opponent, "common": args.common, "steps": args.steps,
-                                                "arms": dict(arms), "window": args.window,
-                                                "threshold": args.threshold}, ensure_ascii=False, indent=2))
-    # seed を外側に回す（途中で止めても腕ごとの本数がそろう）
+    # 腕の引数は足していく（腕を変えて回し直しても、前に回した腕の引数を残す）。同じ名前で引数が違えば止める
+    meta_path = root / "arms.json"
+    known = json.loads(meta_path.read_text()).get("arms", {}) if meta_path.exists() else {}
+    for name, extra in arms:
+        if known.get(name, extra) != extra:
+            raise SystemExit(f"腕 {name} の引数が前と違う（前: {known[name]} / 今: {extra}）。別の名前にする")
+    meta_path.write_text(json.dumps({"opponent": args.opponent, "common": args.common, "steps": args.steps,
+                                     "arms": {**known, **dict(arms)}, "window": args.window,
+                                     "threshold": args.threshold}, ensure_ascii=False, indent=2))
+    # seed を外側に回す（途中で止めても腕ごとの本数がそろう）。--queue があればその順（'腕:seed,...'）で、書いたものだけ回す
     queue = [(name, extra, s) for s in seeds for name, extra in arms]
+    if args.queue:
+        by_name = dict(arms)
+        queue = []
+        for item in args.queue.split(","):
+            name, sep, seed = item.strip().rpartition(":")
+            if not sep or name not in by_name:
+                raise SystemExit(f"--queue の '{item}' は '腕:seed'（腕は --arm で渡したもの）")
+            queue.append((name, by_name[name], int(seed)))
     running = {}  # Popen → (名前, run, 離陸を見つけた時の更新)
 
     def launch(name, extra, seed):
@@ -222,6 +236,7 @@ def main():
     r.add_argument("--opponent", required=True, help="学習の相手（train_rnad.py の --league）")
     r.add_argument("--arm", action="append", default=[], help="'名前=train_rnad.py の追加の引数'（何個でも）")
     r.add_argument("--seeds", default="1,2")
+    r.add_argument("--queue", default="", help="回す順を '腕:seed,腕:seed,...' で指定する（--seeds の代わり。書いたものだけ回す）")
     r.add_argument("--steps", type=int, default=400, help="打ち切りの更新回数")
     r.add_argument("--jobs", type=int, default=4, help="同時に回す本数")
     r.add_argument("--common", default=COMMON, help="全部の腕に共通の引数")
