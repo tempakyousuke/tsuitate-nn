@@ -96,17 +96,29 @@ def load_data(path: Path) -> pd.DataFrame:
     return df
 
 
+def average_ranks(x: np.ndarray) -> np.ndarray:
+    """1 始まりの順位。同率の値には平均順位を与える（scipy.stats.rankdata の method="average" と同じ）"""
+    x = np.asarray(x)
+    order = np.argsort(x, kind="mergesort")
+    xs = x[order]
+    first = np.flatnonzero(np.r_[True, xs[1:] != xs[:-1]])  # 同率の組の先頭（並べた後の位置）
+    counts = np.diff(np.r_[first, len(x)])
+    avg = first + (counts + 1) / 2.0  # 組の中の順位 first+1 … first+counts の平均
+    ranks = np.empty(len(x), dtype=np.float64)
+    ranks[order] = np.repeat(avg, counts)
+    return ranks
+
+
 def binary_metrics(p: np.ndarray, y: np.ndarray) -> dict:
-    p = np.clip(p, 1e-4, 1 - 1e-4)
-    logloss = float(-(y * np.log(p) + (1 - y) * np.log(1 - p)).mean())
-    brier = float(((p - y) ** 2).mean())
-    # AUC（順位ベース。scipy 無しで済ませる）
-    order = np.argsort(p)
-    ranks = np.empty(len(p), dtype=np.float64)
-    ranks[order] = np.arange(1, len(p) + 1)
+    # AUC（順位ベース = Mann–Whitney U。scipy 無しで済ませる）。同率の予測には平均順位を与え（与えないと行の並びで
+    # AUC が変わる）、対数損失のための clip の前の値で順位を付ける（clip すると端に張り付いた予測どうしが同率になる）
+    ranks = average_ranks(p)
     n_pos = y.sum()
     n_neg = len(y) - n_pos
     auc = float((ranks[y == 1].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)) if n_pos and n_neg else float("nan")
+    p = np.clip(p, 1e-4, 1 - 1e-4)
+    logloss = float(-(y * np.log(p) + (1 - y) * np.log(1 - p)).mean())
+    brier = float(((p - y) ** 2).mean())
     return {"logloss": logloss, "brier": brier, "auc": auc, "n": int(len(y))}
 
 
