@@ -164,7 +164,9 @@ class LineAdapter:
         return (out / out.sum() * self.base.sum()).tolist()
 
     def restore(self, log_path, step):
-        """再開: ログの step 以下の行から直近 window 更新を読み直す（同じ step が2回あれば後の行）"""
+        """再開: ログの step 以下の**更新の行**から直近 window 更新を読み直す（同じ step の更新の行が2回あれば後の行）。
+        錨の評価の行（`eval`）は同じ step の更新の行の後に書かれ、`league_opening` を持たないので読まない
+        （読むと、その step の勝敗を空で上書きしてしまう）"""
         rows = {}
         path = pathlib.Path(log_path)
         if path.exists():
@@ -172,6 +174,8 @@ class LineAdapter:
                 try:
                     x = json.loads(line)
                 except json.JSONDecodeError:
+                    continue
+                if not isinstance(x, dict) or "eval" in x:
                     continue
                 if isinstance(x.get("step"), int) and x["step"] <= step:
                     rows[x["step"]] = (x.get("league_opening") or {}).get("by_line")
