@@ -970,6 +970,14 @@ def pad_planes(net, planes: int):
     return wide.to(w.device)
 
 
+def module_shape(net) -> tuple:
+    """推論の形（ネットの型・パラメータとバッファの名前・形・dtype）。同じなら `stack_module_state` で積んで
+    先頭のネットの構造で推論しても、各ネット単体と同じ計算になる"""
+    return (type(net),
+            tuple((k, tuple(v.shape), v.dtype) for k, v in net.named_parameters()),
+            tuple((k, tuple(v.shape), v.dtype) for k, v in net.named_buffers()))
+
+
 class OpponentPool:
     """リーグの相手のネットを**まとめて1回の推論**で指させる（`collect` の `opp_nets` に渡す）。
 
@@ -978,6 +986,13 @@ class OpponentPool:
     同じ形のネットの重みを積み重ね（`torch.func.stack_module_state`）、`vmap` で全相手を一度に
     推論する。局の数が相手ごとに違うので、相手ごとの入力を最大の局数まで 0 で埋めて並べる
     （埋めた行は捨てる）。サンプリングは `sample_actions` と同じ（fp16 に丸めた入力・Gumbel-max）
+
+    積めるのは**推論の形（層の名前と形）が同じネットどうし**だけなので、形ごとに組に分けて組ごとに積む
+    （チャネル数・ブロック数が全員同じなら組は1つで、従来と同じ1回の推論）。`stack_module_state` は先頭のネットの
+    層の名前だけを並べ、推論も先頭のネットの構造で走るので、形の違う相手を1つに積むと、先頭より深い相手の余分な
+    ブロックが黙って落ちていた（浅い相手が後ろなら KeyError、チャネル数が違えば形の不一致で落ちる）。
+    `params` / `buffers` は組ごとの積み重ねのリスト。`forward(params, buffers, x)` は全相手の並び（`names`）の
+    入力 [K, m, ...] を受け、組ごとに推論して同じ並びの [K, m, A] を返す
     """
 
     def __init__(self, nets: dict):
@@ -989,12 +1004,33 @@ class OpponentPool:
         planes = max(n.config["planes"] for n in nets.values())
         self.planes = planes
         mods = [pad_planes(nets[n], planes).eval() for n in self.names]
-        self.params, self.buffers = stack_module_state(mods)
-        base = copy.deepcopy(mods[0]).to("meta")
+        by_shape = {}
+        for k, m in enumerate(mods):
+            by_shape.setdefault(module_shape(m), []).append(k)
+        self.groups = []  # [(全相手の並びでの添字, vmap した推論)]
+        self.params, self.buffers = [], []
+        for ks in by_shape.values():
+            p, b = stack_module_state([mods[k] for k in ks])
+            base = copy.deepcopy(mods[ks[0]]).to("meta")
 
-        def one(p, b, x):
-            return functional_call(base, (p, b), (x,))[0]
-        self.forward = torch.vmap(one)
+            def one(p, b, x, base=base):
+                return functional_call(base, (p, b), (x,))[0]
+            self.groups.append((ks, torch.vmap(one)))
+            self.params.append(p)
+            self.buffers.append(b)
+
+    def forward(self, params, buffers, x):
+        """x = 全相手の並び（`names`）の入力 [K, m, planes, 9, 9] → ロジット [K, m, A]（形の組ごとに推論して戻す）"""
+        if len(self.groups) == 1:
+            return self.groups[0][1](params[0], buffers[0], x)  # 組が1つ（全員同じ形）なら並びもそのまま
+        out = None
+        for (ks, fn), p, b in zip(self.groups, params, buffers):
+            idx = torch.as_tensor(ks, dtype=torch.long, device=x.device)
+            y = fn(p, b, x.index_select(0, idx))
+            if out is None:
+                out = y.new_empty((x.shape[0], *y.shape[1:]))
+            out[idx] = y
+        return out
 
     def __getitem__(self, name):
         if name not in self.index:

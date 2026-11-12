@@ -4,6 +4,8 @@
 
 - export_weights.read: write で書いた TSRLPV01 を読み戻すと、元のネットと同じ出力（BatchNorm は恒等に置き換え）。
   本線の checkpoint と、そこから書き出した policy_<step>.bin が手元にあれば、それでも突き合わせる
+- OpponentPool: 積み重ねた推論が相手ごとの推論と一致する。入力の版・ブロック数・チャネル数が違う相手を混ぜても
+  （形ごとの組に分けて積む）、並びに依らず一致する
 - collect(opponents=...): 相手を固定した局は学習側の手番だけが記録され（valid・player）、学習側の列の報酬の
   合計が勝敗と一致する。相手の列には何も入らない。自己対局の局は従来どおり両方の手番が記録される
 """
@@ -80,6 +82,37 @@ def check_pool():
     for name, bs in groups.items():
         assert all(mask[b, a] for b, a in zip(bs, acts[name])), "マスク外の手を選んだ"
     print("OK: OpponentPool の積み重ねた推論 = 相手ごとの推論、サンプルはマスク内")
+
+
+def check_pool_mixed_shapes():
+    """ブロック数・チャネル数が違う相手を1つの pool に入れても、相手ごとの推論と一致する（どの並びでも）。
+    以前は先頭のネットの構造で全員を推論していたので、先頭が浅いと深い相手の余分なブロックが黙って落ち、
+    逆の並びでは KeyError、チャネル数が違うと形の不一致で落ちた。env は使わない"""
+    torch.manual_seed(123)
+    specs = {"one_block": (8, 1), "two_blocks": (8, 2), "wide": (16, 1), "one_block_b": (8, 1)}
+    nets = {name: PolicyValueNet(ch, bl).eval() for name, (ch, bl) in specs.items()}
+    x = torch.randn(len(nets), 3, 86, 9, 9).half().float()
+    for order in (list(nets), list(reversed(nets)), ["two_blocks", "one_block", "one_block_b", "wide"]):
+        pool = OpponentPool({n: nets[n] for n in order})
+        assert len(pool.groups) == 3, [ks for ks, _ in pool.groups]  # (8, 1) の2体は同じ組に積む
+        xs = torch.stack([x[list(nets).index(n)] for n in order])
+        with torch.no_grad():
+            stacked = pool.forward(pool.params, pool.buffers, xs)
+            for name in order:
+                k = pool.index[name]
+                want = nets[name](xs[k])[0]
+                assert float((stacked[k] - want).abs().max()) < 1e-4, (order, name)
+        rng = np.random.default_rng(4)
+        mask = rng.random((8, 11259)) < 0.01
+        mask[:, 0] = True
+        obs = rng.random((8, 86, 9, 9), dtype=np.float32)
+        groups = {"one_block": np.array([0, 1]), "two_blocks": np.array([2, 3, 4]), "wide": np.array([5, 6, 7])}
+        acts = pool.sample(groups, obs, mask, DEV)
+        for name, bs in groups.items():
+            assert all(mask[b, a] for b, a in zip(bs, acts[name])), "マスク外の手を選んだ"
+    # 形が全員同じなら組は1つ（従来どおり1回の推論）
+    assert len(OpponentPool({"a": tiny_net(1), "b": tiny_net(2)}).groups) == 1
+    print("OK: ブロック数・チャネル数の違う相手を1つの pool に入れても、相手ごとの推論と一致する（並びに依らない）")
 
 
 def check_pool_mixed_planes():
@@ -169,5 +202,6 @@ def check_collect_opponents():
 if __name__ == "__main__":
     check_roundtrip()
     check_pool()
+    check_pool_mixed_shapes()
     check_pool_mixed_planes()
     check_collect_opponents()
