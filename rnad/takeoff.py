@@ -16,7 +16,8 @@ tsuitate-bot の docs/rl-fixed-opponent.md（8節）。乱数初期化から固�
 - `run` は腕ごとの引数に共通の引数（`COMMON`。パイロットで離陸した PPO 型の設定）を足して train_rnad.py を起動する。
   出力は `<root>/<腕>_s<seed>/`。終わった run・離陸で止めた run は飛ばす（途中で止まった run は checkpoint から続ける）
 - `report` は腕ごとに seed 別の離陸の局数（離陸しなければ「> 打ち切りの局数」）、離陸の率、離陸までの局数の中央値、
-  打ち切りを上限とした平均（離陸しなかった run は打ち切りの局数で数える。小さいほど速い）を出す
+  打ち切りを上限とした平均（離陸しなかった run は打ち切りの局数で数える。小さいほど速い）を出す。局数はログの各更新の
+  局数をその更新まで足したもの（途中で batch を変えた run でも、離陸より後の batch の大きさは混ざらない）
 """
 
 import argparse
@@ -25,11 +26,14 @@ import os
 import pathlib
 import shlex
 import signal
+import statistics
 import subprocess
 import sys
 import time
 
 HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+from stage_log import drop_rolled_back  # noqa: E402
 
 # パイロットで離陸した設定（32ch×3・64局/更新・相手固定・PPO 型。docs/rl-fixed-opponent.md 4.1節）
 COMMON = ("--algo mmd --init none --anchor none --eval-every 0 --channels 32 --blocks 3 --planes 91 --batch 64 "
@@ -39,10 +43,18 @@ COMMON = ("--algo mmd --init none --anchor none --eval-every 0 --channels 32 --b
           "--export-every 50 --export-current --checkpoint-every 25 --watch-signals")
 
 
+def _log_kind(x):
+    if "eval" in x:
+        return "eval"
+    return "update" if "league_games" in x or "update_sec" in x else None
+
+
 def read_log(run: pathlib.Path):
-    """log.jsonl → [(step, 勝ち, 局数)]（step の昇順。同じ step が2回あれば後のもの）"""
+    """log.jsonl → [(step, 勝ち, 局数)]（step の昇順）。checkpoint から再開して step が戻ったら、そこから先の前の run の
+    行を捨てて後の行を使う（stage_log.drop_rolled_back と同じ規約。同じ step を後の行で上書きするだけでは、まだ書き直されて
+    いない前の run の後続の step が残り、離陸を誤って見つける）"""
     path = run / "log.jsonl"
-    rows = {}
+    rows = []
     if path.exists():
         for line in open(path):
             line = line.strip()
@@ -52,10 +64,15 @@ def read_log(run: pathlib.Path):
                 x = json.loads(line)
             except json.JSONDecodeError:
                 continue  # 書きかけの行
-            lg = x.get("league_games")
-            if lg is not None and "step" in x:
-                rows[x["step"]] = (sum(v[0] for v in lg.values()), sum(sum(v) for v in lg.values()))
-    return [(s, *rows[s]) for s in sorted(rows)]
+            if isinstance(x, dict) and "step" in x:
+                rows.append(x)
+    kept, _, _ = drop_rolled_back(rows, _log_kind)
+    out = []
+    for kind, x in kept:
+        lg = x.get("league_games")
+        if kind == "update" and lg is not None:
+            out.append((x["step"], sum(v[0] for v in lg.values()), sum(sum(v) for v in lg.values())))
+    return out
 
 
 def find_takeoff(rows, window=50, threshold=0.10):
@@ -76,13 +93,20 @@ def find_takeoff(rows, window=50, threshold=0.10):
     return None
 
 
+def games_upto(rows, step):
+    """step までの局数（ログの各更新の局数を足す）。「step × run 全体の1更新あたりの平均局数」だと、途中で batch
+    （1更新の局数）を変えた run で、step より後の batch の大きさが混ざる"""
+    return sum(n for s, _, n in rows if s <= step)
+
+
 def run_status(run: pathlib.Path, window, threshold):
     rows = read_log(run)
     last = rows[-1][0] if rows else 0
     t = find_takeoff(rows, window, threshold)
     games = sum(n for _, _, n in rows)
     per = games / len(rows) if rows else 0.0
-    return {"rows": rows, "last": last, "takeoff": t, "games_per_update": per}
+    return {"rows": rows, "last": last, "takeoff": t, "games_per_update": per,
+            "takeoff_games": games_upto(rows, t) if t is not None else None}
 
 
 def cmd_run(args):
@@ -152,8 +176,7 @@ def cmd_run(args):
                 continue
             if st["takeoff"] is not None:
                 if seen is None:
-                    print(f"[takeoff] {run.name}: 更新 {st['takeoff']}（約 {st['takeoff'] * st['games_per_update']:,.0f} 局）",
-                          flush=True)
+                    print(f"[takeoff] {run.name}: 更新 {st['takeoff']}（{st['takeoff_games']:,} 局）", flush=True)
                     running[p] = (name, run, st["takeoff"])
                 if st["last"] >= st["takeoff"] + args.after:
                     p.send_signal(signal.SIGTERM)
@@ -196,30 +219,31 @@ def cmd_report(args):
             rows = st["rows"]
             if not rows:
                 continue
-            per = st["games_per_update"]
             t = st["takeoff"]
             if horizon and t is not None and t > horizon:
                 t = None
             limit = min(st["last"], horizon) if horizon else st["last"]
             pre.append(sum(w for s, w, _ in rows if s <= 200))
             if t is not None:
-                took.append(t * per)
-                restricted.append(t * per)
-                cells.append(f"{label}: **{fmt_games(t * per)}**")
+                g = games_upto(rows, t)
+                took.append(g)
+                restricted.append(g)
+                cells.append(f"{label}: **{fmt_games(g)}**")
                 n_valid += 1
             else:
                 # 打ち切りより前で止まっている run は「まだ分からない」ので率に数えない
                 short = horizon and st["last"] < horizon
-                cells.append(f"{label}: > {fmt_games(limit * per)}" + ("（途中）" if short else ""))
+                g = games_upto(rows, limit)
+                cells.append(f"{label}: > {fmt_games(g)}" + ("（途中）" if short else ""))
                 if not short:
-                    restricted.append(limit * per)
+                    restricted.append(g)
                     n_valid += 1
         if not cells:
             continue
-        med = sorted(took)[len(took) // 2] if took else None
+        med = statistics.median(took) if took else None  # 偶数本なら中央の2つの平均
         out.append((arm, len(took), n_valid, med, restricted))
         print(f"| `{arm}` | {len(took)} / {n_valid} | " + " ・ ".join(cells) + " | "
-              + (fmt_games(med) if med else "—") + " | "
+              + (fmt_games(med) if med is not None else "—") + " | "
               + (fmt_games(sum(restricted) / len(restricted)) if restricted else "—") + " | "
               + " / ".join(str(x) for x in pre) + " |")
     if meta.get("arms"):

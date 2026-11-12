@@ -47,9 +47,11 @@ import torch
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import tsuitate_rl  # noqa: E402
+from export_weights import fingerprint, stale_conditions  # noqa: E402
 from export_weights import read as read_weights  # noqa: E402
-from model import PolicyValueNet  # noqa: E402
+from model import PolicyValueNet, inference_net  # noqa: E402
 from rnad import pack_legal, play_match  # noqa: E402
+from stage_log import drop_rolled_back  # noqa: E402
 
 DEV = torch.device("cpu")
 EVAL_SEED = 777_000  # パネル評価の env の seed の基準（相手ごとに足す）
@@ -59,8 +61,9 @@ EVAL_SEED = 777_000  # パネル評価の env の seed の基準（相手ごと�
 
 
 def uniform_net(planes):
-    """マスク内一様に指すネット（方策の頭のロジットが常に 0）"""
-    net = PolicyValueNet(8, 1, planes)
+    """マスク内一様に指すネット（方策の頭のロジットが常に 0）。学習中のパネル（train_rnad.py --panel）でも作るので、
+    グローバルの乱数を引かない（`inference_net`）"""
+    net = inference_net({"channels": 8, "blocks": 1, "planes": planes})
     with torch.no_grad():
         net.p2.weight.zero_()
         net.p2.bias.zero_()
@@ -76,6 +79,7 @@ class Member:
         self.spec = spec
         self.net = None
         self.rust = None
+        self.path = path or None
         if path:
             self.net = read_weights(path).eval().to(device)
         elif name == "random":
@@ -330,14 +334,23 @@ def cmd_eval(args):
     device = pick_device(args.device)
     members = [Member(s, planes, device) for s in panel["members"]]
     members = [m for m in members if args.only is None or m.name in args.only]
+    # 観測は、パネル・相手・測られる側のネットのうち最も広い入力で書く（train_rnad.py --panel が学習するネットの枚数で
+    # 書くのと同じ）。v1 ⊂ v2 ⊂ v3 ⊂ v4 は先頭が同じなので、狭いネットは先頭だけを読む（PolicyValueNet.trunk が切る）。
+    # パネルの planes のままだと、入力を広げたネット（widen_planes.py や追加プレーンのフラグ）が次元の不一致で落ちる
+    base_planes = max([planes] + [m.net.config["planes"] for m in members if m.net is not None])
     only_steps = {int(x) for x in args.steps.split(",")} if args.steps else None
+    redo = getattr(args, "redo", False)
+    # 評価の条件（局数・相手ごとの seed・測られる側と相手の重みの指紋）。(step, which, 相手) の最後の行がこれと合えば
+    # 測り直さない。合わなければ（局数を増やした・再開で書き出しが変わった・同じ名前の相手の重みを差し替えた）測り直して
+    # 行を足す（集計の load_eval / load_outcomes は同じ (step, which, 相手) の後の行を使う）。Rust の戦略の相手は名前だけ
+    opp_fp = {m.name: fingerprint(m.path) for m in members if m.path}
     for run in map(pathlib.Path, args.runs):
         path = run / args.out_file
-        done = set()
+        last = {}
         if path.exists():
             for line in path.read_text().splitlines():
                 r = json.loads(line)
-                done.add((r["step"], r["which"], r["opponent"]))
+                last[(r["step"], r["which"], r["opponent"])] = r
         with open(path, "a") as f:
             for step, base_which, wpath in step_files(run):
                 if args.which and base_which not in args.which:
@@ -348,20 +361,30 @@ def cmd_eval(args):
                 if only_steps is not None and step not in only_steps:
                     continue
                 net = None
+                w_fp = fingerprint(wpath)
                 for m in members:
-                    if (step, which, m.name) in done:
-                        continue
+                    seed = EVAL_SEED + stable_seed(m.name)
+                    cond = {"games": args.games, "seed": seed, "weights": w_fp,
+                            **({"opponent_weights": opp_fp[m.name]} if m.name in opp_fp else {})}
+                    prev = last.get((step, which, m.name))
+                    if prev is not None and not redo:
+                        diff = stale_conditions(prev, cond)
+                        if not diff:
+                            continue
+                        print(f"{run.name} {which} {step} 対 {m.name}: 前の評価と条件が違うので測り直す（"
+                              + "、".join(f"{k} {a} → {b}" for k, a, b in diff) + "）", flush=True)
                     if net is None:
                         net = read_weights(wpath).eval().to(device)
                     t0 = time.time()
                     # 相手ごとに seed を固定 = どの書き出しも同じ対局条件（共通乱数）
-                    o = play_vs(net, m, args.games, EVAL_SEED + stable_seed(m.name), planes, per_game=True,
+                    o = play_vs(net, m, args.games, seed, max(base_planes, net.config["planes"]), per_game=True,
                                 device=device, a_temp=temp)
                     w, l, d = int((o > 0).sum()), int((o < 0).sum()), int((o == 0).sum())
                     rec = {"step": step, "which": which, "opponent": m.name, "w": w, "l": l, "d": d,
-                           "games": args.games, "outcomes": o.tolist(), "sec": round(time.time() - t0, 2)}
+                           **cond, "outcomes": o.tolist(), "sec": round(time.time() - t0, 2)}
                     f.write(json.dumps(rec) + "\n")
                     f.flush()
+                    last[(step, which, m.name)] = rec
                 print(f"{run.name} {which} {step}: 済", flush=True)
 
 
@@ -470,18 +493,35 @@ def load_eval(run: pathlib.Path, ratings, fname="panel_eval.jsonl"):
     return out
 
 
-def load_log(run: pathlib.Path):
-    """step → (累積局数, 累積の壁時計秒（自己対局＋更新）)"""
+def _log_kind(r):
+    if "eval" in r:
+        return "eval"
+    return "update" if "collect_sec" in r else None
+
+
+def update_rows(run: pathlib.Path):
+    """log.jsonl の更新の行（step の昇順）。checkpoint から再開して step が戻ったら、そこから先の前の run の行を捨てる
+    （stage_log.drop_rolled_back と同じ規約）。読めない行（書きかけの最後の行など）は飛ばす"""
     path = run / "log.jsonl"
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text().splitlines():
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    kept, _, _ = drop_rolled_back(rows, _log_kind)
+    return [r for k, r in kept if k == "update"]
+
+
+def load_log(run: pathlib.Path):
+    """step → (累積局数, 累積の壁時計秒（自己対局＋更新）)。**今の学習の経路**の局数・秒（再開で捨てた run の行は数えない。
+    捨てた run で実際に使った局数・秒は入らない）"""
     cum = {0: (0, 0.0)}
     games = 0
     sec = 0.0
-    if not path.exists():
-        return cum
-    for line in path.read_text().splitlines():
-        r = json.loads(line)
-        if "eval" in r or "collect_sec" not in r:
-            continue
+    for r in update_rows(run):
         league = r.get("league_games") or {}
         games += r.get("games", 0) + sum(sum(v) if isinstance(v, (list, tuple)) else 0 for v in league.values())
         sec += r["collect_sec"] + r["update_sec"]
@@ -508,15 +548,9 @@ def seed_of(run: pathlib.Path):
 
 
 def median_sec_per_update(run: pathlib.Path, from_step=0):
-    """log.jsonl の更新の行の (collect_sec + update_sec) の中央値（WSL の一時停止のような外れ値を入れない）"""
-    path = run / "log.jsonl"
-    xs = []
-    if path.exists():
-        for line in path.read_text().splitlines():
-            r = json.loads(line)
-            if "eval" in r or "collect_sec" not in r or r["step"] <= from_step:
-                continue
-            xs.append(r["collect_sec"] + r["update_sec"])
+    """log.jsonl の更新の行の (collect_sec + update_sec) の中央値（WSL の一時停止のような外れ値を入れない）。
+    再開で捨てた run の行は使わない（`update_rows`）"""
+    xs = [r["collect_sec"] + r["update_sec"] for r in update_rows(run) if r["step"] > from_step]
     return float(np.median(xs)) if xs else None
 
 
@@ -573,7 +607,8 @@ def _fmt_diff(xs, seed_means=None):
 def paired_section(arms, control, which, steps, args=None):
     """対照との**局ごとのペア差**（同じ seed・step・相手・局番号。評価は共通乱数なので局どうしが対になる）。
     得点（勝 1・分 0.5・負 0）の差を pt で。標準誤差は seed ごとに step・相手・局をまとめた平均の、seed 間の
-    ばらつき（seed が1つなら局ごとの差の標準誤差。step どうしの相関は無視するので小さめに出る）。
+    ばらつき（seed が1つなら局ごとの差の標準誤差。step どうしの相関は無視するので小さめに出る）。平均も seed ごとの
+    平均を等しく扱う（seed ごとに評価の回数・局数が違っても、平均と誤差の集計の単位がそろう）。
 
     `--pair-by wallclock` なら、腕の step を「(step − --from-step) × 秒/更新」の壁時計へ写し、対照の書き出しのうち
     同じ壁時計に最も近いものと対にする（列は腕の step。対応は表の下に書く）。`--control-any-seed` なら対照の seed が
@@ -637,8 +672,10 @@ def paired_section(arms, control, which, steps, args=None):
             cells.append(_fmt_diff(per_step.get(s, []), seed_means))
         allx = [v for vs in per_seed.values() for v in vs]
         if len(per_seed) > 1:
+            # 平均も標準誤差と同じく seed を等しく扱う（全局の合算の平均だと、評価の回数・局数の多い seed が平均を決め、
+            # 誤差の集計の単位とも、step ごとの欄・組ごとの小計とも食い違う）
             means = [np.mean(v) for v in per_seed.values()]
-            tot = f"{np.mean(allx):+.1f}±{np.std(means, ddof=1) / math.sqrt(len(means)):.1f}（seed 間、{len(means)} seed）"
+            tot = f"{np.mean(means):+.1f}±{np.std(means, ddof=1) / math.sqrt(len(means)):.1f}（seed 間、{len(means)} seed）"
         elif allx:
             tot = f"{np.mean(allx):+.1f}±{np.std(allx, ddof=1) / math.sqrt(len(allx)):.1f}（局ごと、1 seed）"
         else:
@@ -654,7 +691,9 @@ def paired_section(arms, control, which, steps, args=None):
                 gcells.append((_fmt_diff(xs, means) or "—") + f"（{len(xs)}組）")
             group_rows.append(f"| {arm} | " + " | ".join(gcells) + " |")
     lines.append("")
-    lines.append("step ごとの ± は seed が2本以上なら seed ごとの平均の標準誤差、1本なら局ごとの標準誤差（その書き出しを固定したときの誤差）。")
+    lines.append("step ごとの ± は seed が2本以上なら seed ごとの平均の標準誤差、1本なら局ごとの標準誤差（その書き出しを固定したときの誤差）。"
+                 "全体の欄も seed が2本以上なら seed ごとの平均（step・相手・局をまとめたもの）を等しく扱った平均とその標準誤差"
+                 "（評価の回数・局数が seed ごとに違っても、多く測った seed に引っ張られない）。")
     if pr.by == "wallclock":
         lines.append("壁時計の対応（腕の step → 対照の step、秒/更新 " + ", ".join(f"{a} {v:.2f}" for a, v in sorted(pr.spu.items()))
                      + f"、起点 {pr.base}）: " + ", ".join(f"{a} {s}→{c}" for (a, s), c in sorted(mapping.items())))
@@ -919,6 +958,9 @@ def main():
     p.add_argument("--out-file", default="panel_eval.jsonl",
                    help="結果を書く run の中のファイル名（局数の違う測り直しはループ内の 1,024局と混ぜない）")
     p.add_argument("--steps", default="", help="この step だけ測る（カンマ区切り）")
+    p.add_argument("--redo", action="store_true",
+                   help="評価済みの (step, which, 相手) も測り直す（行を足す。集計は後の行を使う）。--redo なしでも、"
+                        "局数・seed・測られる側と相手の重みの指紋が前の評価と違えば測り直す")
     p.add_argument("--decode", default="sample",
                    help="測られる側の指し方: sample（温度 1、既定）/ greedy / temp:<T>。sample 以外は which を "
                         "<which>@greedy / <which>@t<T> の名前で記録する（report --which current@greedy で読む）")

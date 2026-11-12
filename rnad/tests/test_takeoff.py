@@ -3,8 +3,11 @@
     .venv/bin/python rnad/tests/test_takeoff.py
 
 - find_takeoff: 直近 window 更新の勝率がしきい値以上になった最初の更新。頭の window 更新に満たない区間では判定しない
-- read_log: 同じ step が2回あれば後のもの・書きかけの行は飛ばす・相手が複数なら合算
-- report: 離陸した run の数、打ち切りより前で止まった run は率に数えない、打ち切りを上限にした平均
+- read_log: 同じ step が2回あれば後のもの・書きかけの行は飛ばす・相手が複数なら合算。再開で step が戻ったら
+  前の run の後続の行を捨てる（stage_log.load_log と同じ規約）
+- report: 離陸した run の数、打ち切りより前で止まった run は率に数えない、打ち切りを上限にした平均。
+  離陸・打ち切りまでの局数は、その更新までの各更新の局数の和（途中で batch を変えた run でも後の batch が混ざらない）。
+  離陸までの局数の中央値は、偶数本なら中央の2つの平均
 """
 
 import io
@@ -39,12 +42,15 @@ def check_find():
 
 
 def write_run(root, name, wins, games=64, dup=False, opponents=("x",)):
+    """games は1更新の局数（更新ごとのリストも可。途中で batch を変えた run）"""
     run = root / name
     run.mkdir(parents=True)
+    per = games if isinstance(games, (list, tuple)) else [games] * len(wins)
+    games = per[-1]
     with open(run / "log.jsonl", "w") as f:
         for i, w in enumerate(wins):
             lg = {o: [0, 0, 0] for o in opponents}
-            lg[opponents[0]] = [w, games - w, 0]
+            lg[opponents[0]] = [w, per[i] - w, 0]
             f.write(json.dumps({"step": i + 1, "league_games": lg}) + "\n")
             f.write(json.dumps({"step": i + 1, "eval": "target"}) + "\n")  # 評価の行（league_games なし）は読まない
         if dup:  # 再開で同じ step がもう1回書かれた（後のものを使う）
@@ -87,7 +93,76 @@ def check_read_and_report():
           "打ち切りを上限にした平均")
 
 
+def check_batch_change():
+    """途中で batch（1更新の局数）を変えた run: 離陸までの局数・打ち切りまでの局数は、その更新までの各更新の局数の和
+    （run 全体の1更新あたりの平均 × 更新数だと、離陸より後の batch が混ざる）"""
+    with tempfile.TemporaryDirectory() as d:
+        root = pathlib.Path(d)
+        # 前半 50更新は 64局（16勝 = 25%）、後半 50更新は 128局。step 50 で離陸 = 50 × 64 = 3,200局（平均を掛けると 4,800局）
+        v = write_run(root, "v_s1", [16] * 50 + [0] * 50, games=[64] * 50 + [128] * 50)
+        st = takeoff.run_status(v, 50, 0.10)
+        assert st["takeoff"] == 50 and st["takeoff_games"] == 3200, st["takeoff_games"]
+        # 離陸しない run: 打ち切り 60 更新までは 50 × 64 + 10 × 128 = 4,480局（平均を掛けると 5,760局）
+        write_run(root, "w_s1", [0] * 100, games=[64] * 50 + [128] * 50)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            takeoff.cmd_report(SimpleNamespace(roots=[str(root)], extra=[], window=50, threshold=0.10, horizon=60))
+        out = buf.getvalue()
+        line_v = next(x for x in out.splitlines() if x.startswith("| `v`"))
+        assert "**3.2k**" in line_v and "| 3.2k | 3.2k |" in line_v, line_v
+        line_w = next(x for x in out.splitlines() if x.startswith("| `w`"))
+        assert "> 4.5k" in line_w and "| — | 4.5k |" in line_w, line_w
+    print("K4 report: 途中で batch を変えた run でも、離陸・打ち切りまでの局数はその更新までの局数の和")
+
+
+def check_median():
+    """離陸までの局数の中央値: 離陸した run が偶数本なら中央の2つの平均（大きい側ではない）。奇数本なら真ん中"""
+    with tempfile.TemporaryDirectory() as d:
+        root = pathlib.Path(d)
+        write_run(root, "m_s1", [16] * 50, games=64)  # step 50 で離陸 = 3,200局
+        write_run(root, "m_s2", [0] * 100 + [16] * 50, games=64)  # step 120 で離陸 = 7,680局
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            takeoff.cmd_report(SimpleNamespace(roots=[str(root)], extra=[], window=50, threshold=0.10, horizon=0))
+        cols = next(x for x in buf.getvalue().splitlines() if x.startswith("| `m`")).split(" | ")
+        # 列: 腕 / 離陸した run / seed ごと / 中央値 / 打ち切りを上限にした平均 / 離陸の前の勝ち
+        assert cols[1] == "2 / 2" and cols[3] == "5.4k", cols  # (3,200 + 7,680) / 2 = 5,440（大きい側の 7.7k ではない）
+        write_run(root, "m_s3", [0] * 200 + [16] * 50, games=64)  # step 220 で離陸 = 14,080局
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            takeoff.cmd_report(SimpleNamespace(roots=[str(root)], extra=[], window=50, threshold=0.10, horizon=0))
+        cols = next(x for x in buf.getvalue().splitlines() if x.startswith("| `m`")).split(" | ")
+        assert cols[1] == "3 / 3" and cols[3] == "7.7k" and cols[4] == "8.3k", cols  # 平均は (3.2k + 7.68k + 14.08k) / 3
+    print("K5 report: 離陸までの局数の中央値は、偶数本なら中央の2つの平均")
+
+
+def check_rollback():
+    """read_log / run_status: checkpoint から再開して step が戻ったら、そこから先の前の run の行を捨てる。
+    step 1, 2, 3, 2 なら今の経路は 1, 2 で、前の run の step 3 の勝ちで離陸を見つけない（last も 2）"""
+    with tempfile.TemporaryDirectory() as d:
+        run = pathlib.Path(d) / "r_s1"
+        run.mkdir()
+        rows = [{"step": s, "games": 0, "league_games": {"opp": [w, 8 - w, 0]}, "collect_sec": 6, "update_sec": 4}
+                for s, w in [(1, 0), (2, 0), (3, 8), (2, 0)]]
+        rows.insert(3, {"step": 3, "eval": "target", "eval_vs_anchor": 0.5})
+        (run / "log.jsonl").write_text("\n".join(map(json.dumps, rows)) + "\n")
+        r = takeoff.read_log(run)
+        assert r == [(1, 0, 8), (2, 0, 8)], r
+        assert takeoff.find_takeoff(r, window=1, threshold=0.5) is None
+        st = takeoff.run_status(run, 1, 0.5)
+        assert st["last"] == 2 and st["takeoff"] is None, st
+        # 同じ out で step 0 から回し直した（評価の行 step 0 が先に出る）: 前の run の行を全部捨てる
+        rows = [{"step": 1, "league_games": {"opp": [8, 0, 0]}}, {"step": 2, "league_games": {"opp": [8, 0, 0]}},
+                {"step": 0, "eval": "target", "eval_vs_anchor": 0.5}, {"step": 1, "league_games": {"opp": [0, 8, 0]}}]
+        (run / "log.jsonl").write_text("\n".join(map(json.dumps, rows)) + "\n")
+        assert takeoff.read_log(run) == [(1, 0, 8)]
+    print("K3 read_log: 再開で step が戻ったら前の run の後続の行を捨てる（前の run の勝ちで離陸を見つけない）")
+
+
 if __name__ == "__main__":
     check_find()
     check_read_and_report()
+    check_rollback()
+    check_batch_change()
+    check_median()
     print("ok")

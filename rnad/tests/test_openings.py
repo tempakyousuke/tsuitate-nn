@@ -15,6 +15,8 @@
   `opening_index_learner` で相手の側だけが強制される（偶数番目の局は先手が学習側）。相手のネットを Python 側で
   指させる collect で、学習側の行は全部自分の手・相手の側だけに強制の記録が付く。train_rnad.py は相手を Rust で
   指させる形・ネットで指させる形のどちらでも相手の側だけを強制し、報酬の整形と一緒に使える（学習側の強制は止める）
+- ラインの重みの付け替え（`--league-open-adapt`）: 再開でログから直近の勝敗を作り直すとき、同じ step の後に書かれる
+  錨の評価の行で勝敗を上書きしない（`LineAdapter.restore`）
 """
 
 import json
@@ -331,6 +333,38 @@ def check_adapt(tmp):
           "train_rnad.py の再開でログがビット単位で一致")
 
 
+def check_adapt_restore(tmp):
+    """LineAdapter.restore: 錨の評価の行（同じ step の更新の行の後に書かれ、by_line を持たない）で勝敗を上書きしない。
+    同じ step の更新の行が2回あれば後の行・checkpoint より後の行は使わない。env は使わない"""
+    by_line = {"0": [8, 0, 0], "1": [0, 8, 0]}
+    want = openings.LineAdapter([1.0, 1.0], 2)
+    want.push(by_line)
+    rows = [{"step": 1, "league_opening": {"by_line": by_line}}, {"step": 1, "eval": "target"},
+            {"step": 1, "eval": "current"}]
+    path = tmp / "restore_log.jsonl"
+    path.write_text("\n".join(map(json.dumps, rows)) + "\n")
+    got = openings.LineAdapter([1.0, 1.0], 2)
+    got.restore(path, 1)
+    assert got.weights() == want.weights() != [1.0, 1.0], got.weights()
+    # 再開で書き直した更新の行（後の行を使う）・評価の行・checkpoint（step 3）より後の行・書きかけの行
+    rows = [{"step": 1, "league_opening": {"by_line": {"0": [0, 8, 0]}}},
+            {"step": 2, "league_opening": {"by_line": {"1": [0, 8, 0]}}},
+            {"step": 3, "league_opening": {"by_line": {"1": [8, 0, 0]}}},
+            {"step": 3, "eval": "target", "eval_vs_anchor": 0.5},
+            {"step": 4, "league_opening": {"by_line": {"0": [8, 0, 0]}}},
+            {"step": 2, "league_opening": {"by_line": {"0": [8, 0, 0]}}},
+            {"step": 2, "eval": "current", "eval_vs_anchor": 0.5}]
+    path.write_text("\n".join(map(json.dumps, rows)) + '\n{"step": 3, "league_opening": ')
+    got = openings.LineAdapter([1.0, 1.0], 2, window=2)
+    got.restore(path, 3)
+    want = openings.LineAdapter([1.0, 1.0], 2, window=2)
+    want.push({"0": [8, 0, 0]})
+    want.push({"1": [8, 0, 0]})
+    assert got.weights() == want.weights(), (got.weights(), want.weights())
+    assert [dict(r) for r in got.recent] == [{0: [8, 0, 0]}, {1: [8, 0, 0]}]
+    print("A2 LineAdapter.restore: 評価の行で勝敗を上書きしない・同じ step の更新の行は後の行・checkpoint より後の行は使わない")
+
+
 def run_train(out, *extra, steps, check=True):
     cmd = [sys.executable, str(TRAIN), "--anchor", "none", "--init", "none", "--batch", "6", "--steps", str(steps),
            "--channels", "16", "--blocks", "1", "--planes", "91", "--eval-every", "0", "--export-every", "2",
@@ -415,4 +449,5 @@ if __name__ == "__main__":
         check_league_env(tmp)
         check_league_train(tmp)
         check_adapt(tmp)
+        check_adapt_restore(tmp)
     print("ok")

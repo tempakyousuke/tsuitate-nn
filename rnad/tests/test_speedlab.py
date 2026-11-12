@@ -10,6 +10,10 @@
   `--control-any-seed` で seed 2 も対になる、`--vs-step` で同じ run の起点と対になる、`--groups` の小計、`--eval-file`
 - 締まりを除いた比べ方: keyed_actions の温度（同じ乱数のまま softmax(logits/T) から引く。0 は greedy）、play_vs の温度が
   測られる側だけに掛かること、eval --decode の記録名、export-ck（checkpoint → 書き出し）、temp-match の値
+- eval: パネルより入力の広いネットも測れる（観測はパネル・相手・測られる側のうち最も広い枚数。play_vs を差し替えて確かめる）
+- eval の評価済みの判定: 局数・seed・測られる側と相手の重みの指紋が前の評価と同じなら飛ばし、違えば測り直す・--redo
+- load_log: checkpoint から再開して step が戻ったら、そこから先の前の run の行を捨てる（累積の局数・秒は今の経路のもの）
+- 対照とのペア差の全体の欄: seed が2本以上なら平均も標準誤差も seed ごとの平均を等しく扱う
 """
 
 import argparse
@@ -190,6 +194,167 @@ def check_decode():
         assert n1 > 0 and e1 > e5 > 0 and h0 == 1.0, (e1, e5, h1, h5, h0)
     print("締まりを除いた比べ方: play_vs の温度は測られる側だけ・greedy は決定的・eval --decode の記録名・"
           f"export-ck（出力の差 < 1e-4）・temp-match（エントロピー T1 {e1:.2f} > T0.5 {e5:.2f}、T0 は π>0.999 が 100%）")
+
+
+class FakePlay:
+    """`S.play_vs` の代わり（env を使わない）。渡った planes の観測で測られる側と相手のネットを推論してみて
+    （入力の枚数が足りなければ実物と同じく落ちる）、呼ばれた (測られる側の枚数, planes, 局数) を記録し、
+    局番号ごとの結果を `result` で返す"""
+
+    def __init__(self, result=1):
+        self.calls = []
+        self.result = result
+
+    def __call__(self, a_net, b, games, seed, planes, per_game=False, device=DEV, a_temp=1.0):
+        x = torch.zeros(1, planes, 9, 9)
+        with torch.no_grad():
+            a_net(x)
+            if b.net is not None:
+                b.net(x)
+        self.calls.append((a_net.config["planes"], planes, games))
+        return np.full(games, self.result, dtype=np.int64)
+
+
+@contextlib.contextmanager
+def fake_play(fake):
+    orig = S.play_vs
+    S.play_vs = fake
+    try:
+        yield fake
+    finally:
+        S.play_vs = orig
+
+
+def eval_args(runs, panel, games, **kw):
+    return argparse.Namespace(**{"runs": [str(r) for r in runs], "panel": str(panel), "games": games, "which": None,
+                                 "every": 0, "only": None, "device": "cpu", "out_file": "panel_eval.jsonl",
+                                 "steps": "", "decode": "sample", **kw})
+
+
+def check_eval_planes():
+    """eval: パネル（86枚）より入力の広いネット（91枚。widen_planes.py や追加プレーンのフラグで広げたもの）も測れる。
+    観測はパネル・相手・測られる側のうち最も広い枚数で書き、狭いネットは先頭だけを読む（学習中の --panel と同じ）。
+    play_vs を差し替えて、渡る planes で両者を推論できることを確かめる（env は使わない）"""
+    from export_weights import write
+    from model import NUM_PLANES, NUM_PLANES_DEDUCED, PolicyValueNet
+    torch.manual_seed(12)
+    with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+        tmp = pathlib.Path(tmp)
+        run = tmp / "run_s1"
+        run.mkdir()
+        write(PolicyValueNet(8, 1, NUM_PLANES_DEDUCED).eval(), run / "policy_1.bin")
+        write(PolicyValueNet(8, 1, NUM_PLANES).eval(), run / "policy_2.bin")
+        (tmp / "panel.json").write_text(json.dumps({"planes": NUM_PLANES, "members": ["random"],
+                                                    "ratings": {"random": 0}}))
+        with fake_play(FakePlay()) as fake:
+            S.cmd_eval(eval_args([run], tmp / "panel.json", 2))
+        assert sorted(fake.calls) == [(NUM_PLANES, NUM_PLANES, 2), (NUM_PLANES_DEDUCED, NUM_PLANES_DEDUCED, 2)], fake.calls
+        # パネルの相手のネットのほうが広ければ、その枚数で書く（86枚のネットも先頭だけを読む）
+        write(PolicyValueNet(8, 1, NUM_PLANES_DEDUCED).eval(), tmp / "opp.bin")
+        (tmp / "panel2.json").write_text(json.dumps({"planes": NUM_PLANES, "members": ["random", f"opp={tmp / 'opp.bin'}"],
+                                                     "ratings": {"random": 0, "opp": 100}}))
+        with fake_play(FakePlay()) as fake:
+            S.cmd_eval(eval_args([run], tmp / "panel2.json", 2, out_file="panel2_eval.jsonl"))
+        assert {p for _, p, _ in fake.calls} == {NUM_PLANES_DEDUCED} and len(fake.calls) == 4, fake.calls
+    print("eval: パネルより入力の広いネットも測れる（観測はパネル・相手・測られる側のうち最も広い枚数）")
+
+
+def check_eval_cache():
+    """eval の評価済みの判定: 局数・seed・測られる側と相手の重みの指紋が前の評価（同じ (step, which, 相手) の最後の行）と
+    同じなら測り直さず、違えば測り直して行を足す（集計は後の行を使う）。--redo は同じ条件でも測り直す。
+    指紋の無い前の行（学習中の --panel の行など）は局数だけを確かめる。play_vs を差し替える（env は使わない）"""
+    from export_weights import write
+    from model import NUM_PLANES, PolicyValueNet
+    torch.manual_seed(12)
+    with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+        tmp = pathlib.Path(tmp)
+        run = tmp / "run_s1"
+        run.mkdir()
+        write(PolicyValueNet(8, 1, NUM_PLANES).eval(), run / "policy_1.bin")
+        write(PolicyValueNet(8, 1, NUM_PLANES).eval(), tmp / "opp.bin")
+        (tmp / "panel.json").write_text(json.dumps({"planes": NUM_PLANES, "members": ["random", f"opp={tmp / 'opp.bin'}"],
+                                                    "ratings": {"random": 0, "opp": 100}}))
+        ratings = {"random": 0, "opp": 100}
+
+        def ev(games, result=1, **kw):
+            with fake_play(FakePlay(result)) as fake:
+                S.cmd_eval(eval_args([run], tmp / "panel.json", games, **kw))
+            rows = [json.loads(s) for s in (run / "panel_eval.jsonl").read_text().splitlines()]
+            return len(fake.calls), rows
+
+        n, rows = ev(2)
+        assert n == 2 and len(rows) == 2 and {r["games"] for r in rows} == {2}
+        assert all(r["weights"] == S.fingerprint(run / "policy_1.bin") for r in rows)
+        assert {r["opponent"]: "opponent_weights" in r for r in rows} == {"random": False, "opp": True}
+        assert ev(2) == (0, rows), "同じ条件で測り直した"
+        # 局数を増やした: 測り直して行を足す。集計は後の行（4局）を使う
+        n, rows = ev(4, result=-1)
+        assert n == 2 and len(rows) == 4 and [r["games"] for r in rows[2:]] == [4, 4], rows
+        assert S.load_eval(run, ratings)[(1, "target")][3] == 8
+        assert all(len(o) == 4 and (o < 0).all() for o in S.load_outcomes(run).values())
+        assert ev(4)[0] == 0
+        # 同じ step の書き出しが変わった（再開で書き直した等）: 両方の相手を測り直す
+        write(PolicyValueNet(8, 1, NUM_PLANES).eval(), run / "policy_1.bin")
+        n, rows = ev(4)
+        assert n == 2 and len(rows) == 6 and rows[-1]["weights"] == S.fingerprint(run / "policy_1.bin")
+        assert ev(4)[0] == 0
+        # 同じ名前の相手の重みを差し替えた: その相手だけ測り直す
+        write(PolicyValueNet(8, 1, NUM_PLANES).eval(), tmp / "opp.bin")
+        n, rows = ev(4)
+        assert n == 1 and len(rows) == 7 and rows[-1]["opponent"] == "opp", rows[-1]
+        # --redo: 同じ条件でも測り直す
+        n, rows = ev(4, redo=True)
+        assert n == 2 and len(rows) == 9
+        # 指紋の無い前の行（学習中の --panel が書いた行）: 局数が同じなら使う、違えば測り直す
+        (run / "panel_eval.jsonl").write_text("".join(
+            json.dumps({"step": 1, "which": "target", "opponent": o, "w": 4, "l": 0, "d": 0, "games": 4,
+                        "outcomes": [1] * 4}) + "\n" for o in ("random", "opp")))
+        assert ev(4)[0] == 0
+        n, rows = ev(6)
+        assert n == 2 and len(rows) == 4
+    print("eval の評価済みの判定: 局数・seed・重みの指紋が前の評価と同じなら飛ばし、違えば測り直して行を足す（集計は後の行）・"
+          "--redo・指紋の無い前の行は局数だけ確かめる")
+
+
+def check_log_rollback():
+    """load_log / median_sec_per_update: checkpoint から再開して step が戻ったら、そこから先の前の run の行を捨てる
+    （step 1, 2, 3, 2 なら今の経路は 1, 2。前の run の 3 を残さず、重なった 2 を二重に足さない）。書きかけの行は飛ばす"""
+    from stage_log import load_log as stage_load_log
+    with tempfile.TemporaryDirectory() as tmp:
+        run = pathlib.Path(tmp) / "run_s1"
+        run.mkdir()
+        rows = [{"step": s, "games": 0, "league_games": {"opp": [w, 8 - w, 0]}, "collect_sec": 6, "update_sec": sec}
+                for s, w, sec in [(1, 0, 4), (2, 0, 4), (3, 8, 40), (2, 0, 4)]]
+        rows.insert(3, {"step": 3, "eval": "target", "eval_vs_anchor": 0.5})
+        (run / "log.jsonl").write_text("\n".join(map(json.dumps, rows)) + '\n{"step": 3, "games"')
+        assert S.load_log(run) == {0: (0, 0.0), 1: (8, 10.0), 2: (16, 20.0)}, S.load_log(run)
+        assert S.median_sec_per_update(run) == 10.0
+        with contextlib.redirect_stderr(io.StringIO()):
+            assert [r["step"] for r in stage_load_log(run / "log.jsonl")[0]] == [1, 2]
+    print("load_log: 再開で step が戻ったら前の run の後続の行を捨てる（累積の局数・秒は今の経路のもの）")
+
+
+def check_paired_seed_weights():
+    """対照とのペア差の「step > 0 の全体」欄: seed が2本以上なら、平均も標準誤差と同じく seed ごとの平均を等しく扱う。
+    seed 1 は対照比 +5pt を 10回、seed 2 は −10pt を 1回だけ測った（評価の回数が違う）とき、全体は (5 − 10) / 2 = −2.5pt
+    （全局の合算の (5×10 − 10) / 11 = +3.6pt ではない）。step 1 の欄と同じ値になる"""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        for sd, steps in [(1, range(1, 11)), (2, [1])]:
+            for label in ["arm", "control"]:
+                run = root / f"{label}_s{sd}"
+                run.mkdir()
+                rows = []
+                for step in steps:
+                    outcomes = (([1] + [0] * 9 if sd == 1 else [-1] * 2 + [0] * 8) if label == "arm" else [0] * 10)
+                    rows.append({"step": step, "which": "target", "opponent": "opp", "outcomes": outcomes})
+                (run / "panel_eval.jsonl").write_text("\n".join(map(json.dumps, rows)) + "\n")
+        arms = {label: [(root / f"{label}_s{sd}", {}, {}) for sd in (1, 2)] for label in ["arm", "control"]}
+        lines = S.paired_section(arms, "control", "target", list(range(1, 11)))
+    row = next(x for x in lines if x.startswith("| arm |")).split(" | ")
+    assert row[1] == "-2.5±7.5", row
+    assert row[-2] == "-2.5±7.5（seed 間、2 seed）", row
+    print("ペア差の全体の欄: seed ごとの平均を等しく扱う（評価の回数の多い seed に引っ張られない）")
 
 
 def check_seed_salt():
@@ -449,6 +614,10 @@ if __name__ == "__main__":
     check_keyed_actions()
     check_keyed_temp()
     check_decode()
+    check_eval_planes()
+    check_eval_cache()
+    check_log_rollback()
     check_seed_salt()
     check_fit()
     check_report()
+    check_paired_seed_weights()

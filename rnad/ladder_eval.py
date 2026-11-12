@@ -9,7 +9,8 @@ tsuitate-bot の docs/rl-fixed-opponent.md。強い相手にゼロから当た�
 同じ相手への近さを1つの数で追える。
 
 - run の書き出し（`current_<step>.bin`。無ければ `policy_<step>.bin`）を、段ごとに `--games` 局（先後同数）サンプリングで指させる
-- 結果は `<run>/ladder_eval.jsonl` に1行ずつ足す（同じ step・同じ段は測り直さない）。手の乱数は torch の乱数を
+- 結果は `<run>/ladder_eval.jsonl` に1行ずつ足す（同じ step・同じ段は、局数・seed・書き出しの重みの指紋が前の評価と
+  同じなら測り直さない。違えば測り直して行を足し、集計は後の行を使う。`--redo` で同じ条件でも測り直す）。手の乱数は torch の乱数を
   step と段によらない固定の seed から作るので、書き出しどうしの差は同じ乱数列の上で比べられる（共通乱数ではない）
 - ε50 は段の得点を ε の小さい順に見て、0.5 をまたぐ最初の区間の線形補間。全段で 0.5 未満なら「> 最大の ε」、
   全段で 0.5 以上なら「0」
@@ -86,6 +87,7 @@ def load_rows(run: pathlib.Path):
 
 
 def cmd_eval(args):
+    from export_weights import fingerprint, stale_conditions
     from export_weights import read as read_weights
     from model import NUM_PLANES
     device = torch.device(args.device)
@@ -108,10 +110,17 @@ def cmd_eval(args):
         with open(run / "ladder_eval.jsonl", "a") as f:
             for step in steps:
                 net = None
+                w_fp = fingerprint(files[step])
                 for e in eps:
                     opp = args.opponent if e == 0 else f"{args.opponent}@{e:g}"
-                    if (args.which, step, opp) in done:
-                        continue
+                    cond = {"games": args.games, "seed": args.seed, "weights": w_fp}
+                    prev = done.get((args.which, step, opp))
+                    if prev is not None and not getattr(args, "redo", False):
+                        diff = stale_conditions(prev, cond)
+                        if not diff:
+                            continue
+                        print(f"{run.name} {args.which}_{step} 対 {opp}: 前の評価と条件が違うので測り直す（"
+                              + "、".join(f"{k} {a} → {b}" for k, a, b in diff) + "）", flush=True)
                     if net is None:
                         net = read_weights(files[step]).to(device).eval()
                     t0 = time.time()
@@ -120,7 +129,7 @@ def cmd_eval(args):
                     w, l, d = int((res > 0).sum()), int((res < 0).sum()), int((res == 0).sum())
                     lc = [x["learner"] for x in fin]
                     rec = {"which": args.which, "step": step, "opponent": opp, "base": args.opponent, "eps": e,
-                           "w": w, "l": l, "d": d, "games": args.games, "seed": args.seed,
+                           "w": w, "l": l, "d": d, **cond,
                            "plies": float(np.mean([x["plies"] for x in fin])),
                            "fouls": float(np.mean([x["fouls"][c] for x, c in zip(fin, lc)])),
                            "opp_fouls": float(np.mean([x["fouls"][1 - c] for x, c in zip(fin, lc)])),
@@ -128,6 +137,7 @@ def cmd_eval(args):
                            "sec": time.time() - t0}
                     f.write(json.dumps(rec) + "\n")
                     f.flush()
+                    done[(args.which, step, opp)] = rec
                     print(f"{run.name} {args.which}_{step} 対 {opp}: {w}勝{l}敗{d}分 = {(w + 0.5 * d) / args.games:.3f} "
                           f"（手数 {rec['plies']:.0f}・反則 {rec['fouls']:.1f}、{rec['sec']:.0f}s）", flush=True)
 
@@ -165,6 +175,9 @@ def main():
     ap.add_argument("--steps", default="", help="測る step（カンマ区切り。空 = 全部）")
     ap.add_argument("--every", type=int, default=0, help="この倍数の step だけ測る（最後の書き出しは必ず測る）")
     ap.add_argument("--seed", type=int, default=20261110)
+    ap.add_argument("--redo", action="store_true",
+                    help="測った step・段も測り直す（行を足す。集計は後の行を使う）。--redo なしでも、局数・seed・"
+                         "書き出しの重みの指紋が前の評価と違えば測り直す")
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--device", default="cpu")
     args = ap.parse_args()
