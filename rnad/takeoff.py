@@ -16,7 +16,8 @@ tsuitate-bot の docs/rl-fixed-opponent.md（8節）。乱数初期化から固�
 - `run` は腕ごとの引数に共通の引数（`COMMON`。パイロットで離陸した PPO 型の設定）を足して train_rnad.py を起動する。
   出力は `<root>/<腕>_s<seed>/`。終わった run・離陸で止めた run は飛ばす（途中で止まった run は checkpoint から続ける）
 - `report` は腕ごとに seed 別の離陸の局数（離陸しなければ「> 打ち切りの局数」）、離陸の率、離陸までの局数の中央値、
-  打ち切りを上限とした平均（離陸しなかった run は打ち切りの局数で数える。小さいほど速い）を出す
+  打ち切りを上限とした平均（離陸しなかった run は打ち切りの局数で数える。小さいほど速い）を出す。局数はログの各更新の
+  局数をその更新まで足したもの（途中で batch を変えた run でも、離陸より後の batch の大きさは混ざらない）
 """
 
 import argparse
@@ -91,13 +92,20 @@ def find_takeoff(rows, window=50, threshold=0.10):
     return None
 
 
+def games_upto(rows, step):
+    """step までの局数（ログの各更新の局数を足す）。「step × run 全体の1更新あたりの平均局数」だと、途中で batch
+    （1更新の局数）を変えた run で、step より後の batch の大きさが混ざる"""
+    return sum(n for s, _, n in rows if s <= step)
+
+
 def run_status(run: pathlib.Path, window, threshold):
     rows = read_log(run)
     last = rows[-1][0] if rows else 0
     t = find_takeoff(rows, window, threshold)
     games = sum(n for _, _, n in rows)
     per = games / len(rows) if rows else 0.0
-    return {"rows": rows, "last": last, "takeoff": t, "games_per_update": per}
+    return {"rows": rows, "last": last, "takeoff": t, "games_per_update": per,
+            "takeoff_games": games_upto(rows, t) if t is not None else None}
 
 
 def cmd_run(args):
@@ -167,8 +175,7 @@ def cmd_run(args):
                 continue
             if st["takeoff"] is not None:
                 if seen is None:
-                    print(f"[takeoff] {run.name}: 更新 {st['takeoff']}（約 {st['takeoff'] * st['games_per_update']:,.0f} 局）",
-                          flush=True)
+                    print(f"[takeoff] {run.name}: 更新 {st['takeoff']}（{st['takeoff_games']:,} 局）", flush=True)
                     running[p] = (name, run, st["takeoff"])
                 if st["last"] >= st["takeoff"] + args.after:
                     p.send_signal(signal.SIGTERM)
@@ -211,23 +218,24 @@ def cmd_report(args):
             rows = st["rows"]
             if not rows:
                 continue
-            per = st["games_per_update"]
             t = st["takeoff"]
             if horizon and t is not None and t > horizon:
                 t = None
             limit = min(st["last"], horizon) if horizon else st["last"]
             pre.append(sum(w for s, w, _ in rows if s <= 200))
             if t is not None:
-                took.append(t * per)
-                restricted.append(t * per)
-                cells.append(f"{label}: **{fmt_games(t * per)}**")
+                g = games_upto(rows, t)
+                took.append(g)
+                restricted.append(g)
+                cells.append(f"{label}: **{fmt_games(g)}**")
                 n_valid += 1
             else:
                 # 打ち切りより前で止まっている run は「まだ分からない」ので率に数えない
                 short = horizon and st["last"] < horizon
-                cells.append(f"{label}: > {fmt_games(limit * per)}" + ("（途中）" if short else ""))
+                g = games_upto(rows, limit)
+                cells.append(f"{label}: > {fmt_games(g)}" + ("（途中）" if short else ""))
                 if not short:
-                    restricted.append(limit * per)
+                    restricted.append(g)
                     n_valid += 1
         if not cells:
             continue
