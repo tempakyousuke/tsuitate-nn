@@ -11,6 +11,7 @@
 - 締まりを除いた比べ方: keyed_actions の温度（同じ乱数のまま softmax(logits/T) から引く。0 は greedy）、play_vs の温度が
   測られる側だけに掛かること、eval --decode の記録名、export-ck（checkpoint → 書き出し）、temp-match の値
 - eval: パネルより入力の広いネットも測れる（観測はパネル・相手・測られる側のうち最も広い枚数。play_vs を差し替えて確かめる）
+- eval の評価済みの判定: 局数・seed・測られる側と相手の重みの指紋が前の評価と同じなら飛ばし、違えば測り直す・--redo
 """
 
 import argparse
@@ -254,6 +255,63 @@ def check_eval_planes():
             S.cmd_eval(eval_args([run], tmp / "panel2.json", 2, out_file="panel2_eval.jsonl"))
         assert {p for _, p, _ in fake.calls} == {NUM_PLANES_DEDUCED} and len(fake.calls) == 4, fake.calls
     print("eval: パネルより入力の広いネットも測れる（観測はパネル・相手・測られる側のうち最も広い枚数）")
+
+
+def check_eval_cache():
+    """eval の評価済みの判定: 局数・seed・測られる側と相手の重みの指紋が前の評価（同じ (step, which, 相手) の最後の行）と
+    同じなら測り直さず、違えば測り直して行を足す（集計は後の行を使う）。--redo は同じ条件でも測り直す。
+    指紋の無い前の行（学習中の --panel の行など）は局数だけを確かめる。play_vs を差し替える（env は使わない）"""
+    from export_weights import write
+    from model import NUM_PLANES, PolicyValueNet
+    torch.manual_seed(12)
+    with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+        tmp = pathlib.Path(tmp)
+        run = tmp / "run_s1"
+        run.mkdir()
+        write(PolicyValueNet(8, 1, NUM_PLANES).eval(), run / "policy_1.bin")
+        write(PolicyValueNet(8, 1, NUM_PLANES).eval(), tmp / "opp.bin")
+        (tmp / "panel.json").write_text(json.dumps({"planes": NUM_PLANES, "members": ["random", f"opp={tmp / 'opp.bin'}"],
+                                                    "ratings": {"random": 0, "opp": 100}}))
+        ratings = {"random": 0, "opp": 100}
+
+        def ev(games, result=1, **kw):
+            with fake_play(FakePlay(result)) as fake:
+                S.cmd_eval(eval_args([run], tmp / "panel.json", games, **kw))
+            rows = [json.loads(s) for s in (run / "panel_eval.jsonl").read_text().splitlines()]
+            return len(fake.calls), rows
+
+        n, rows = ev(2)
+        assert n == 2 and len(rows) == 2 and {r["games"] for r in rows} == {2}
+        assert all(r["weights"] == S.fingerprint(run / "policy_1.bin") for r in rows)
+        assert {r["opponent"]: "opponent_weights" in r for r in rows} == {"random": False, "opp": True}
+        assert ev(2) == (0, rows), "同じ条件で測り直した"
+        # 局数を増やした: 測り直して行を足す。集計は後の行（4局）を使う
+        n, rows = ev(4, result=-1)
+        assert n == 2 and len(rows) == 4 and [r["games"] for r in rows[2:]] == [4, 4], rows
+        assert S.load_eval(run, ratings)[(1, "target")][3] == 8
+        assert all(len(o) == 4 and (o < 0).all() for o in S.load_outcomes(run).values())
+        assert ev(4)[0] == 0
+        # 同じ step の書き出しが変わった（再開で書き直した等）: 両方の相手を測り直す
+        write(PolicyValueNet(8, 1, NUM_PLANES).eval(), run / "policy_1.bin")
+        n, rows = ev(4)
+        assert n == 2 and len(rows) == 6 and rows[-1]["weights"] == S.fingerprint(run / "policy_1.bin")
+        assert ev(4)[0] == 0
+        # 同じ名前の相手の重みを差し替えた: その相手だけ測り直す
+        write(PolicyValueNet(8, 1, NUM_PLANES).eval(), tmp / "opp.bin")
+        n, rows = ev(4)
+        assert n == 1 and len(rows) == 7 and rows[-1]["opponent"] == "opp", rows[-1]
+        # --redo: 同じ条件でも測り直す
+        n, rows = ev(4, redo=True)
+        assert n == 2 and len(rows) == 9
+        # 指紋の無い前の行（学習中の --panel が書いた行）: 局数が同じなら使う、違えば測り直す
+        (run / "panel_eval.jsonl").write_text("".join(
+            json.dumps({"step": 1, "which": "target", "opponent": o, "w": 4, "l": 0, "d": 0, "games": 4,
+                        "outcomes": [1] * 4}) + "\n" for o in ("random", "opp")))
+        assert ev(4)[0] == 0
+        n, rows = ev(6)
+        assert n == 2 and len(rows) == 4
+    print("eval の評価済みの判定: 局数・seed・重みの指紋が前の評価と同じなら飛ばし、違えば測り直して行を足す（集計は後の行）・"
+          "--redo・指紋の無い前の行は局数だけ確かめる")
 
 
 def check_seed_salt():
@@ -514,6 +572,7 @@ if __name__ == "__main__":
     check_keyed_temp()
     check_decode()
     check_eval_planes()
+    check_eval_cache()
     check_seed_salt()
     check_fit()
     check_report()

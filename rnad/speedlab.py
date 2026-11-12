@@ -47,6 +47,7 @@ import torch
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import tsuitate_rl  # noqa: E402
+from export_weights import fingerprint, stale_conditions  # noqa: E402
 from export_weights import read as read_weights  # noqa: E402
 from model import PolicyValueNet, inference_net  # noqa: E402
 from rnad import pack_legal, play_match  # noqa: E402
@@ -77,6 +78,7 @@ class Member:
         self.spec = spec
         self.net = None
         self.rust = None
+        self.path = path or None
         if path:
             self.net = read_weights(path).eval().to(device)
         elif name == "random":
@@ -336,13 +338,18 @@ def cmd_eval(args):
     # パネルの planes のままだと、入力を広げたネット（widen_planes.py や追加プレーンのフラグ）が次元の不一致で落ちる
     base_planes = max([planes] + [m.net.config["planes"] for m in members if m.net is not None])
     only_steps = {int(x) for x in args.steps.split(",")} if args.steps else None
+    redo = getattr(args, "redo", False)
+    # 評価の条件（局数・相手ごとの seed・測られる側と相手の重みの指紋）。(step, which, 相手) の最後の行がこれと合えば
+    # 測り直さない。合わなければ（局数を増やした・再開で書き出しが変わった・同じ名前の相手の重みを差し替えた）測り直して
+    # 行を足す（集計の load_eval / load_outcomes は同じ (step, which, 相手) の後の行を使う）。Rust の戦略の相手は名前だけ
+    opp_fp = {m.name: fingerprint(m.path) for m in members if m.path}
     for run in map(pathlib.Path, args.runs):
         path = run / args.out_file
-        done = set()
+        last = {}
         if path.exists():
             for line in path.read_text().splitlines():
                 r = json.loads(line)
-                done.add((r["step"], r["which"], r["opponent"]))
+                last[(r["step"], r["which"], r["opponent"])] = r
         with open(path, "a") as f:
             for step, base_which, wpath in step_files(run):
                 if args.which and base_which not in args.which:
@@ -353,20 +360,30 @@ def cmd_eval(args):
                 if only_steps is not None and step not in only_steps:
                     continue
                 net = None
+                w_fp = fingerprint(wpath)
                 for m in members:
-                    if (step, which, m.name) in done:
-                        continue
+                    seed = EVAL_SEED + stable_seed(m.name)
+                    cond = {"games": args.games, "seed": seed, "weights": w_fp,
+                            **({"opponent_weights": opp_fp[m.name]} if m.name in opp_fp else {})}
+                    prev = last.get((step, which, m.name))
+                    if prev is not None and not redo:
+                        diff = stale_conditions(prev, cond)
+                        if not diff:
+                            continue
+                        print(f"{run.name} {which} {step} 対 {m.name}: 前の評価と条件が違うので測り直す（"
+                              + "、".join(f"{k} {a} → {b}" for k, a, b in diff) + "）", flush=True)
                     if net is None:
                         net = read_weights(wpath).eval().to(device)
                     t0 = time.time()
                     # 相手ごとに seed を固定 = どの書き出しも同じ対局条件（共通乱数）
-                    o = play_vs(net, m, args.games, EVAL_SEED + stable_seed(m.name),
-                                max(base_planes, net.config["planes"]), per_game=True, device=device, a_temp=temp)
+                    o = play_vs(net, m, args.games, seed, max(base_planes, net.config["planes"]), per_game=True,
+                                device=device, a_temp=temp)
                     w, l, d = int((o > 0).sum()), int((o < 0).sum()), int((o == 0).sum())
                     rec = {"step": step, "which": which, "opponent": m.name, "w": w, "l": l, "d": d,
-                           "games": args.games, "outcomes": o.tolist(), "sec": round(time.time() - t0, 2)}
+                           **cond, "outcomes": o.tolist(), "sec": round(time.time() - t0, 2)}
                     f.write(json.dumps(rec) + "\n")
                     f.flush()
+                    last[(step, which, m.name)] = rec
                 print(f"{run.name} {which} {step}: 済", flush=True)
 
 
@@ -924,6 +941,9 @@ def main():
     p.add_argument("--out-file", default="panel_eval.jsonl",
                    help="結果を書く run の中のファイル名（局数の違う測り直しはループ内の 1,024局と混ぜない）")
     p.add_argument("--steps", default="", help="この step だけ測る（カンマ区切り）")
+    p.add_argument("--redo", action="store_true",
+                   help="評価済みの (step, which, 相手) も測り直す（行を足す。集計は後の行を使う）。--redo なしでも、"
+                        "局数・seed・測られる側と相手の重みの指紋が前の評価と違えば測り直す")
     p.add_argument("--decode", default="sample",
                    help="測られる側の指し方: sample（温度 1、既定）/ greedy / temp:<T>。sample 以外は which を "
                         "<which>@greedy / <which>@t<T> の名前で記録する（report --which current@greedy で読む）")

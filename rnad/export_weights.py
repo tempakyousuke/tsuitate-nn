@@ -12,6 +12,7 @@ Rust のテストがこれと突き合わせる。`--tiny` は学習なしの小
 """
 
 import argparse
+import hashlib
 import json
 import pathlib
 import struct
@@ -66,6 +67,23 @@ def write(net: PolicyValueNet, path: pathlib.Path) -> None:
         f.write(hb)
         for _, t in ts:
             f.write(t.numpy().astype("<f4").tobytes())
+
+
+def fingerprint(path) -> str:
+    """重みファイルの指紋（内容の sha256 の先頭16桁）。評価の記録に残し、同じ名前の書き出しが再開や書き直しで
+    変わったこと・同じ名前の相手の重みが差し替わったことを見分ける（speedlab.py eval・ladder_eval.py）"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()[:16]
+
+
+def stale_conditions(row: dict, cond: dict) -> list:
+    """評価済みの行 `row` が今の評価の条件 `cond`（局数・seed・重みの指紋など）と食い違う項目 [(名前, 前, 今)]。
+    行に無い項目（指紋を残す前の行や、学習中の train_rnad.py --panel の行）は確かめようがないので数えない。
+    局数（games）は行に無くても食い違いとして数える"""
+    return [(k, row.get(k), v) for k, v in cond.items() if (k in row or k == "games") and row.get(k) != v]
 
 
 def read(path) -> PolicyValueNet:
