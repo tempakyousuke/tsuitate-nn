@@ -19,7 +19,7 @@ import struct
 import numpy as np
 import torch
 
-from model import PolicyValueNet
+from model import PolicyValueNet, inference_net
 
 MAGIC = b"TSRLPV01"
 
@@ -87,7 +87,7 @@ def read(path) -> PolicyValueNet:
         off += 4 * n
     if off != len(data):
         raise ValueError(f"{path} の長さがヘッダと合わない")
-    net = PolicyValueNet.from_config(header)
+    net = inference_net(header)  # 重みは下で全部書き込むので、初期化でグローバルの乱数を引かない
 
     def put(conv, bn, w, b):
         conv.weight.copy_(w.reshape(conv.weight.shape))

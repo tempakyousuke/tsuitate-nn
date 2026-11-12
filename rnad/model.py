@@ -141,6 +141,17 @@ class PolicyValueNet(nn.Module):
         return logits, v
 
 
+def inference_net(config: dict) -> PolicyValueNet:
+    """推論にだけ使うネット（重みを後から書き込む、または初期値の乱数で手が変わらないネット）を、
+    **グローバルの乱数（CPU）を消費せずに**作る。形は `config`（`PolicyValueNet.from_config` と同じ）。
+
+    `PolicyValueNet` の初期化は CPU のグローバル乱数を引く。checkpoint から乱数状態を戻した後でリーグの相手や
+    パネルのネットを作ると、その分だけ続く対局のサンプリングがずれ、同じ seed・設定でも中断なしの学習と
+    再開した学習が一致しなくなる。初期化で引いた乱数の状態を元に戻す（作られるネットの初期値は同じ）"""
+    with torch.random.fork_rng(devices=[]):
+        return PolicyValueNet.from_config(config)
+
+
 NUM_TRUTH_CLASSES = 15
 
 

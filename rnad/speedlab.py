@@ -48,7 +48,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import tsuitate_rl  # noqa: E402
 from export_weights import read as read_weights  # noqa: E402
-from model import PolicyValueNet  # noqa: E402
+from model import PolicyValueNet, inference_net  # noqa: E402
 from rnad import pack_legal, play_match  # noqa: E402
 
 DEV = torch.device("cpu")
@@ -59,8 +59,9 @@ EVAL_SEED = 777_000  # パネル評価の env の seed の基準（相手ごと�
 
 
 def uniform_net(planes):
-    """マスク内一様に指すネット（方策の頭のロジットが常に 0）"""
-    net = PolicyValueNet(8, 1, planes)
+    """マスク内一様に指すネット（方策の頭のロジットが常に 0）。学習中のパネル（train_rnad.py --panel）でも作るので、
+    グローバルの乱数を引かない（`inference_net`）"""
+    net = inference_net({"channels": 8, "blocks": 1, "planes": planes})
     with torch.no_grad():
         net.p2.weight.zero_()
         net.p2.bias.zero_()

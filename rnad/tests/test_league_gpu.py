@@ -6,6 +6,8 @@
   本線の checkpoint と、そこから書き出した policy_<step>.bin が手元にあれば、それでも突き合わせる
 - OpponentPool: 積み重ねた推論が相手ごとの推論と一致する。入力の版・ブロック数・チャネル数が違う相手を混ぜても
   （形ごとの組に分けて積む）、並びに依らず一致する
+- 推論にだけ使うネットの構築（read・pad_planes・OpponentPool・speedlab.Member）はグローバルの乱数を引かない
+  （checkpoint の乱数状態を戻した後に作っても、中断なしの学習と再開した学習の対局がずれない）
 - collect(opponents=...): 相手を固定した局は学習側の手番だけが記録され（valid・player）、学習側の列の報酬の
   合計が勝敗と一致する。相手の列には何も入らない。自己対局の局は従来どおり両方の手番が記録される
 """
@@ -115,6 +117,67 @@ def check_pool_mixed_shapes():
     print("OK: ブロック数・チャネル数の違う相手を1つの pool に入れても、相手ごとの推論と一致する（並びに依らない）")
 
 
+def check_rng_untouched():
+    """推論にだけ使うネットの構築（相手の重みの読込 read・入力を広げる pad_planes・OpponentPool・パネルの相手）が
+    CPU のグローバル乱数を引かない。学習の再開は checkpoint の乱数状態を戻した後でリーグの相手・パネルを作るので、
+    ここで乱数を引くと中断なしの学習と再開した学習の対局がずれる（--league-device gpu を CPU で回したとき）。env は使わない"""
+    import speedlab
+    from model import NUM_PLANES_DEDUCED, NUM_PLANES_V4
+    from rnad import pad_planes
+    with tempfile.TemporaryDirectory() as d:
+        path = pathlib.Path(d) / "opp.bin"
+        write(tiny_net(5), path)
+        torch.manual_seed(42)
+        state = torch.get_rng_state()
+        net86 = PolicyValueNet(8, 1).eval()  # 学習するネットの初期化は乱数を引く（検査の前提）
+        assert not torch.equal(torch.get_rng_state(), state)
+        state = torch.get_rng_state()
+        a = read(path)
+        wide = pad_planes(net86, NUM_PLANES_V4)
+        pool = OpponentPool({"a": a, "wide": wide, "v1": net86, "deep": read(path)})
+        speedlab.Member("random", NUM_PLANES_DEDUCED)
+        speedlab.Member(f"opp={path}", NUM_PLANES_DEDUCED)
+        assert torch.equal(torch.get_rng_state(), state), "推論用のネットの構築がグローバルの乱数を引いた"
+        x = torch.rand(4, NUM_PLANES_V4, 9, 9)
+        with torch.no_grad():
+            assert float((wide(x)[0] - net86(x)[0]).abs().max()) < 1e-5  # 乱数を引かなくても同じ関数
+            assert float((a(x)[0] - tiny_net(5).eval()(x)[0]).abs().max()) < 1e-4
+        assert len(pool.names) == 4
+    print("OK: 相手の重みの読込・pad_planes・OpponentPool・パネルの相手の構築はグローバルの乱数を引かない")
+
+
+def check_resume_cpu_league():
+    """`--device cpu --league-device gpu`（相手も PyTorch の CPU 推論）の学習: 3更新を続けて回したものと、1更新で止めて
+    同じ出力先で3更新まで再開したものの最終 checkpoint のネットが一致する（相手の重みの読込が、checkpoint から戻した
+    乱数状態をずらさない）"""
+    import subprocess
+    train = HERE.parent / "train_rnad.py"
+    with tempfile.TemporaryDirectory() as d:
+        tmp = pathlib.Path(d)
+        opp = tmp / "opp.bin"
+        torch.manual_seed(0)
+        write(PolicyValueNet(8, 1).eval(), opp)
+        common = ["--init", "none", "--anchor", "none", "--channels", "8", "--blocks", "1", "--batch", "2",
+                  "--eval-every", "0", "--export-every", "0", "--checkpoint-every", "0", "--threads", "1",
+                  "--device", "cpu", "--seed", "3", "--league", f"rl_policy:{opp}", "--league-frac", "1",
+                  "--league-device", "gpu", "--packed", "--compact-legal"]
+
+        def run(out, steps):
+            cmd = [sys.executable, str(train), *common, "--steps", str(steps), "--out", str(out)]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            assert r.returncode == 0, f"train_rnad.py が落ちた: {' '.join(cmd)}\n{r.stderr[-2000:]}"
+
+        run(tmp / "a", 3)
+        run(tmp / "b", 1)
+        run(tmp / "b", 3)
+        ca = torch.load(tmp / "a" / "checkpoint.pt", map_location="cpu", weights_only=False)
+        cb = torch.load(tmp / "b" / "checkpoint.pt", map_location="cpu", weights_only=False)
+        assert ca["net"].keys() == cb["net"].keys()
+        bad = [k for k in ca["net"] if not torch.equal(ca["net"][k], cb["net"][k])]
+        assert not bad, f"続けて回した学習と再開した学習のネットが違う: {bad[:5]}（{len(bad)} 個）"
+    print("OK: CPU で相手を PyTorch で指させる学習を1更新で止めて再開しても、続けて回したものとネットが一致する")
+
+
 def check_pool_mixed_planes():
     """入力の版が違う相手（v1 86枚・v2 91枚・v3 101枚・v4 102枚〔組の選び方も違う〕）を1つの pool に積んでも、
     相手ごとの推論と一致する。v3 / v4 の組のプレーンには 0 でない値を入れて確かめる（初期局面では全部 0 で、
@@ -203,5 +266,7 @@ if __name__ == "__main__":
     check_roundtrip()
     check_pool()
     check_pool_mixed_shapes()
+    check_rng_untouched()
     check_pool_mixed_planes()
     check_collect_opponents()
+    check_resume_cpu_league()
