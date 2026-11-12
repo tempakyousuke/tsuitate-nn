@@ -10,6 +10,7 @@
   `--control-any-seed` で seed 2 も対になる、`--vs-step` で同じ run の起点と対になる、`--groups` の小計、`--eval-file`
 - 締まりを除いた比べ方: keyed_actions の温度（同じ乱数のまま softmax(logits/T) から引く。0 は greedy）、play_vs の温度が
   測られる側だけに掛かること、eval --decode の記録名、export-ck（checkpoint → 書き出し）、temp-match の値
+- eval: パネルより入力の広いネットも測れる（観測はパネル・相手・測られる側のうち最も広い枚数。play_vs を差し替えて確かめる）
 """
 
 import argparse
@@ -190,6 +191,69 @@ def check_decode():
         assert n1 > 0 and e1 > e5 > 0 and h0 == 1.0, (e1, e5, h1, h5, h0)
     print("締まりを除いた比べ方: play_vs の温度は測られる側だけ・greedy は決定的・eval --decode の記録名・"
           f"export-ck（出力の差 < 1e-4）・temp-match（エントロピー T1 {e1:.2f} > T0.5 {e5:.2f}、T0 は π>0.999 が 100%）")
+
+
+class FakePlay:
+    """`S.play_vs` の代わり（env を使わない）。渡った planes の観測で測られる側と相手のネットを推論してみて
+    （入力の枚数が足りなければ実物と同じく落ちる）、呼ばれた (測られる側の枚数, planes, 局数) を記録し、
+    局番号ごとの結果を `result` で返す"""
+
+    def __init__(self, result=1):
+        self.calls = []
+        self.result = result
+
+    def __call__(self, a_net, b, games, seed, planes, per_game=False, device=DEV, a_temp=1.0):
+        x = torch.zeros(1, planes, 9, 9)
+        with torch.no_grad():
+            a_net(x)
+            if b.net is not None:
+                b.net(x)
+        self.calls.append((a_net.config["planes"], planes, games))
+        return np.full(games, self.result, dtype=np.int64)
+
+
+@contextlib.contextmanager
+def fake_play(fake):
+    orig = S.play_vs
+    S.play_vs = fake
+    try:
+        yield fake
+    finally:
+        S.play_vs = orig
+
+
+def eval_args(runs, panel, games, **kw):
+    return argparse.Namespace(**{"runs": [str(r) for r in runs], "panel": str(panel), "games": games, "which": None,
+                                 "every": 0, "only": None, "device": "cpu", "out_file": "panel_eval.jsonl",
+                                 "steps": "", "decode": "sample", **kw})
+
+
+def check_eval_planes():
+    """eval: パネル（86枚）より入力の広いネット（91枚。widen_planes.py や追加プレーンのフラグで広げたもの）も測れる。
+    観測はパネル・相手・測られる側のうち最も広い枚数で書き、狭いネットは先頭だけを読む（学習中の --panel と同じ）。
+    play_vs を差し替えて、渡る planes で両者を推論できることを確かめる（env は使わない）"""
+    from export_weights import write
+    from model import NUM_PLANES, NUM_PLANES_DEDUCED, PolicyValueNet
+    torch.manual_seed(12)
+    with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+        tmp = pathlib.Path(tmp)
+        run = tmp / "run_s1"
+        run.mkdir()
+        write(PolicyValueNet(8, 1, NUM_PLANES_DEDUCED).eval(), run / "policy_1.bin")
+        write(PolicyValueNet(8, 1, NUM_PLANES).eval(), run / "policy_2.bin")
+        (tmp / "panel.json").write_text(json.dumps({"planes": NUM_PLANES, "members": ["random"],
+                                                    "ratings": {"random": 0}}))
+        with fake_play(FakePlay()) as fake:
+            S.cmd_eval(eval_args([run], tmp / "panel.json", 2))
+        assert sorted(fake.calls) == [(NUM_PLANES, NUM_PLANES, 2), (NUM_PLANES_DEDUCED, NUM_PLANES_DEDUCED, 2)], fake.calls
+        # パネルの相手のネットのほうが広ければ、その枚数で書く（86枚のネットも先頭だけを読む）
+        write(PolicyValueNet(8, 1, NUM_PLANES_DEDUCED).eval(), tmp / "opp.bin")
+        (tmp / "panel2.json").write_text(json.dumps({"planes": NUM_PLANES, "members": ["random", f"opp={tmp / 'opp.bin'}"],
+                                                     "ratings": {"random": 0, "opp": 100}}))
+        with fake_play(FakePlay()) as fake:
+            S.cmd_eval(eval_args([run], tmp / "panel2.json", 2, out_file="panel2_eval.jsonl"))
+        assert {p for _, p, _ in fake.calls} == {NUM_PLANES_DEDUCED} and len(fake.calls) == 4, fake.calls
+    print("eval: パネルより入力の広いネットも測れる（観測はパネル・相手・測られる側のうち最も広い枚数）")
 
 
 def check_seed_salt():
@@ -449,6 +513,7 @@ if __name__ == "__main__":
     check_keyed_actions()
     check_keyed_temp()
     check_decode()
+    check_eval_planes()
     check_seed_salt()
     check_fit()
     check_report()

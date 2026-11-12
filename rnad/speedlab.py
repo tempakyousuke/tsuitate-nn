@@ -331,6 +331,10 @@ def cmd_eval(args):
     device = pick_device(args.device)
     members = [Member(s, planes, device) for s in panel["members"]]
     members = [m for m in members if args.only is None or m.name in args.only]
+    # 観測は、パネル・相手・測られる側のネットのうち最も広い入力で書く（train_rnad.py --panel が学習するネットの枚数で
+    # 書くのと同じ）。v1 ⊂ v2 ⊂ v3 ⊂ v4 は先頭が同じなので、狭いネットは先頭だけを読む（PolicyValueNet.trunk が切る）。
+    # パネルの planes のままだと、入力を広げたネット（widen_planes.py や追加プレーンのフラグ）が次元の不一致で落ちる
+    base_planes = max([planes] + [m.net.config["planes"] for m in members if m.net is not None])
     only_steps = {int(x) for x in args.steps.split(",")} if args.steps else None
     for run in map(pathlib.Path, args.runs):
         path = run / args.out_file
@@ -356,8 +360,8 @@ def cmd_eval(args):
                         net = read_weights(wpath).eval().to(device)
                     t0 = time.time()
                     # 相手ごとに seed を固定 = どの書き出しも同じ対局条件（共通乱数）
-                    o = play_vs(net, m, args.games, EVAL_SEED + stable_seed(m.name), planes, per_game=True,
-                                device=device, a_temp=temp)
+                    o = play_vs(net, m, args.games, EVAL_SEED + stable_seed(m.name),
+                                max(base_planes, net.config["planes"]), per_game=True, device=device, a_temp=temp)
                     w, l, d = int((o > 0).sum()), int((o < 0).sum()), int((o == 0).sum())
                     rec = {"step": step, "which": which, "opponent": m.name, "w": w, "l": l, "d": d,
                            "games": args.games, "outcomes": o.tolist(), "sec": round(time.time() - t0, 2)}
