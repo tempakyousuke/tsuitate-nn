@@ -13,6 +13,7 @@
 - eval: パネルより入力の広いネットも測れる（観測はパネル・相手・測られる側のうち最も広い枚数。play_vs を差し替えて確かめる）
 - eval の評価済みの判定: 局数・seed・測られる側と相手の重みの指紋が前の評価と同じなら飛ばし、違えば測り直す・--redo
 - load_log: checkpoint から再開して step が戻ったら、そこから先の前の run の行を捨てる（累積の局数・秒は今の経路のもの）
+- 対照とのペア差の全体の欄: seed が2本以上なら平均も標準誤差も seed ごとの平均を等しく扱う
 """
 
 import argparse
@@ -333,6 +334,29 @@ def check_log_rollback():
     print("load_log: 再開で step が戻ったら前の run の後続の行を捨てる（累積の局数・秒は今の経路のもの）")
 
 
+def check_paired_seed_weights():
+    """対照とのペア差の「step > 0 の全体」欄: seed が2本以上なら、平均も標準誤差と同じく seed ごとの平均を等しく扱う。
+    seed 1 は対照比 +5pt を 10回、seed 2 は −10pt を 1回だけ測った（評価の回数が違う）とき、全体は (5 − 10) / 2 = −2.5pt
+    （全局の合算の (5×10 − 10) / 11 = +3.6pt ではない）。step 1 の欄と同じ値になる"""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        for sd, steps in [(1, range(1, 11)), (2, [1])]:
+            for label in ["arm", "control"]:
+                run = root / f"{label}_s{sd}"
+                run.mkdir()
+                rows = []
+                for step in steps:
+                    outcomes = (([1] + [0] * 9 if sd == 1 else [-1] * 2 + [0] * 8) if label == "arm" else [0] * 10)
+                    rows.append({"step": step, "which": "target", "opponent": "opp", "outcomes": outcomes})
+                (run / "panel_eval.jsonl").write_text("\n".join(map(json.dumps, rows)) + "\n")
+        arms = {label: [(root / f"{label}_s{sd}", {}, {}) for sd in (1, 2)] for label in ["arm", "control"]}
+        lines = S.paired_section(arms, "control", "target", list(range(1, 11)))
+    row = next(x for x in lines if x.startswith("| arm |")).split(" | ")
+    assert row[1] == "-2.5±7.5", row
+    assert row[-2] == "-2.5±7.5（seed 間、2 seed）", row
+    print("ペア差の全体の欄: seed ごとの平均を等しく扱う（評価の回数の多い seed に引っ張られない）")
+
+
 def check_seed_salt():
     """keyed_uniform は salt と局番号を XOR で混ぜるので、局数より小さい桁だけが違う salt は同じ鍵の組を使う（学習中のパネルの
     記録と対にするため変えない）。seed を振るときは seed_salt を通し、違う seed で違う局になる（temp-match の --seed）"""
@@ -596,3 +620,4 @@ if __name__ == "__main__":
     check_seed_salt()
     check_fit()
     check_report()
+    check_paired_seed_weights()

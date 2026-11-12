@@ -607,7 +607,8 @@ def _fmt_diff(xs, seed_means=None):
 def paired_section(arms, control, which, steps, args=None):
     """対照との**局ごとのペア差**（同じ seed・step・相手・局番号。評価は共通乱数なので局どうしが対になる）。
     得点（勝 1・分 0.5・負 0）の差を pt で。標準誤差は seed ごとに step・相手・局をまとめた平均の、seed 間の
-    ばらつき（seed が1つなら局ごとの差の標準誤差。step どうしの相関は無視するので小さめに出る）。
+    ばらつき（seed が1つなら局ごとの差の標準誤差。step どうしの相関は無視するので小さめに出る）。平均も seed ごとの
+    平均を等しく扱う（seed ごとに評価の回数・局数が違っても、平均と誤差の集計の単位がそろう）。
 
     `--pair-by wallclock` なら、腕の step を「(step − --from-step) × 秒/更新」の壁時計へ写し、対照の書き出しのうち
     同じ壁時計に最も近いものと対にする（列は腕の step。対応は表の下に書く）。`--control-any-seed` なら対照の seed が
@@ -671,8 +672,10 @@ def paired_section(arms, control, which, steps, args=None):
             cells.append(_fmt_diff(per_step.get(s, []), seed_means))
         allx = [v for vs in per_seed.values() for v in vs]
         if len(per_seed) > 1:
+            # 平均も標準誤差と同じく seed を等しく扱う（全局の合算の平均だと、評価の回数・局数の多い seed が平均を決め、
+            # 誤差の集計の単位とも、step ごとの欄・組ごとの小計とも食い違う）
             means = [np.mean(v) for v in per_seed.values()]
-            tot = f"{np.mean(allx):+.1f}±{np.std(means, ddof=1) / math.sqrt(len(means)):.1f}（seed 間、{len(means)} seed）"
+            tot = f"{np.mean(means):+.1f}±{np.std(means, ddof=1) / math.sqrt(len(means)):.1f}（seed 間、{len(means)} seed）"
         elif allx:
             tot = f"{np.mean(allx):+.1f}±{np.std(allx, ddof=1) / math.sqrt(len(allx)):.1f}（局ごと、1 seed）"
         else:
@@ -688,7 +691,9 @@ def paired_section(arms, control, which, steps, args=None):
                 gcells.append((_fmt_diff(xs, means) or "—") + f"（{len(xs)}組）")
             group_rows.append(f"| {arm} | " + " | ".join(gcells) + " |")
     lines.append("")
-    lines.append("step ごとの ± は seed が2本以上なら seed ごとの平均の標準誤差、1本なら局ごとの標準誤差（その書き出しを固定したときの誤差）。")
+    lines.append("step ごとの ± は seed が2本以上なら seed ごとの平均の標準誤差、1本なら局ごとの標準誤差（その書き出しを固定したときの誤差）。"
+                 "全体の欄も seed が2本以上なら seed ごとの平均（step・相手・局をまとめたもの）を等しく扱った平均とその標準誤差"
+                 "（評価の回数・局数が seed ごとに違っても、多く測った seed に引っ張られない）。")
     if pr.by == "wallclock":
         lines.append("壁時計の対応（腕の step → 対照の step、秒/更新 " + ", ".join(f"{a} {v:.2f}" for a, v in sorted(pr.spu.items()))
                      + f"、起点 {pr.base}）: " + ", ".join(f"{a} {s}→{c}" for (a, s), c in sorted(mapping.items())))
