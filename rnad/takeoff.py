@@ -30,6 +30,8 @@ import sys
 import time
 
 HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+from stage_log import drop_rolled_back  # noqa: E402
 
 # パイロットで離陸した設定（32ch×3・64局/更新・相手固定・PPO 型。docs/rl-fixed-opponent.md 4.1節）
 COMMON = ("--algo mmd --init none --anchor none --eval-every 0 --channels 32 --blocks 3 --planes 91 --batch 64 "
@@ -39,10 +41,18 @@ COMMON = ("--algo mmd --init none --anchor none --eval-every 0 --channels 32 --b
           "--export-every 50 --export-current --checkpoint-every 25 --watch-signals")
 
 
+def _log_kind(x):
+    if "eval" in x:
+        return "eval"
+    return "update" if "league_games" in x or "update_sec" in x else None
+
+
 def read_log(run: pathlib.Path):
-    """log.jsonl → [(step, 勝ち, 局数)]（step の昇順。同じ step が2回あれば後のもの）"""
+    """log.jsonl → [(step, 勝ち, 局数)]（step の昇順）。checkpoint から再開して step が戻ったら、そこから先の前の run の
+    行を捨てて後の行を使う（stage_log.drop_rolled_back と同じ規約。同じ step を後の行で上書きするだけでは、まだ書き直されて
+    いない前の run の後続の step が残り、離陸を誤って見つける）"""
     path = run / "log.jsonl"
-    rows = {}
+    rows = []
     if path.exists():
         for line in open(path):
             line = line.strip()
@@ -52,10 +62,15 @@ def read_log(run: pathlib.Path):
                 x = json.loads(line)
             except json.JSONDecodeError:
                 continue  # 書きかけの行
-            lg = x.get("league_games")
-            if lg is not None and "step" in x:
-                rows[x["step"]] = (sum(v[0] for v in lg.values()), sum(sum(v) for v in lg.values()))
-    return [(s, *rows[s]) for s in sorted(rows)]
+            if isinstance(x, dict) and "step" in x:
+                rows.append(x)
+    kept, _, _ = drop_rolled_back(rows, _log_kind)
+    out = []
+    for kind, x in kept:
+        lg = x.get("league_games")
+        if kind == "update" and lg is not None:
+            out.append((x["step"], sum(v[0] for v in lg.values()), sum(sum(v) for v in lg.values())))
+    return out
 
 
 def find_takeoff(rows, window=50, threshold=0.10):

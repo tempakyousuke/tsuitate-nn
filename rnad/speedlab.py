@@ -51,6 +51,7 @@ from export_weights import fingerprint, stale_conditions  # noqa: E402
 from export_weights import read as read_weights  # noqa: E402
 from model import PolicyValueNet, inference_net  # noqa: E402
 from rnad import pack_legal, play_match  # noqa: E402
+from stage_log import drop_rolled_back  # noqa: E402
 
 DEV = torch.device("cpu")
 EVAL_SEED = 777_000  # パネル評価の env の seed の基準（相手ごとに足す）
@@ -492,18 +493,35 @@ def load_eval(run: pathlib.Path, ratings, fname="panel_eval.jsonl"):
     return out
 
 
-def load_log(run: pathlib.Path):
-    """step → (累積局数, 累積の壁時計秒（自己対局＋更新）)"""
+def _log_kind(r):
+    if "eval" in r:
+        return "eval"
+    return "update" if "collect_sec" in r else None
+
+
+def update_rows(run: pathlib.Path):
+    """log.jsonl の更新の行（step の昇順）。checkpoint から再開して step が戻ったら、そこから先の前の run の行を捨てる
+    （stage_log.drop_rolled_back と同じ規約）。読めない行（書きかけの最後の行など）は飛ばす"""
     path = run / "log.jsonl"
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text().splitlines():
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    kept, _, _ = drop_rolled_back(rows, _log_kind)
+    return [r for k, r in kept if k == "update"]
+
+
+def load_log(run: pathlib.Path):
+    """step → (累積局数, 累積の壁時計秒（自己対局＋更新）)。**今の学習の経路**の局数・秒（再開で捨てた run の行は数えない。
+    捨てた run で実際に使った局数・秒は入らない）"""
     cum = {0: (0, 0.0)}
     games = 0
     sec = 0.0
-    if not path.exists():
-        return cum
-    for line in path.read_text().splitlines():
-        r = json.loads(line)
-        if "eval" in r or "collect_sec" not in r:
-            continue
+    for r in update_rows(run):
         league = r.get("league_games") or {}
         games += r.get("games", 0) + sum(sum(v) if isinstance(v, (list, tuple)) else 0 for v in league.values())
         sec += r["collect_sec"] + r["update_sec"]
@@ -530,15 +548,9 @@ def seed_of(run: pathlib.Path):
 
 
 def median_sec_per_update(run: pathlib.Path, from_step=0):
-    """log.jsonl の更新の行の (collect_sec + update_sec) の中央値（WSL の一時停止のような外れ値を入れない）"""
-    path = run / "log.jsonl"
-    xs = []
-    if path.exists():
-        for line in path.read_text().splitlines():
-            r = json.loads(line)
-            if "eval" in r or "collect_sec" not in r or r["step"] <= from_step:
-                continue
-            xs.append(r["collect_sec"] + r["update_sec"])
+    """log.jsonl の更新の行の (collect_sec + update_sec) の中央値（WSL の一時停止のような外れ値を入れない）。
+    再開で捨てた run の行は使わない（`update_rows`）"""
+    xs = [r["collect_sec"] + r["update_sec"] for r in update_rows(run) if r["step"] > from_step]
     return float(np.median(xs)) if xs else None
 
 

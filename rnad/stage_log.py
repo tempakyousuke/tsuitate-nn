@@ -54,45 +54,61 @@ WHICH = ("target", "current")
 # ---------------------------------------------------------------- 読み込み
 
 
-def load_log(path):
-    """log.jsonl を (更新の行, 評価の行) に分ける（どちらも step の昇順）。読めない行（学習中の書きかけの最後の行など）は飛ばす。
+def drop_rolled_back(rows, kind):
+    """読んだ順の log.jsonl の行 → (今の学習の経路の行 [(種類, 行)]（読んだ順）, step が戻った回数, 捨てた行数)。
+    `kind(行)` は "update"（更新の行）/ "eval"（評価の行）/ None（数えない行。捨てる）。
 
     落ちて checkpoint.pt から再開した run は、checkpoint の step C より後の行がもう一度（ファイルの後ろに）書かれる
     （log.jsonl は追記）。step が戻ったら、そこから先の前の行を捨てて後の行を使う: 更新の行の step がそれまでの更新の行の
     最大以下なら、前の行のうち step がそれ以上の更新・評価を捨てる。step 0 の評価の行（同じ out で step 0 から回し直した。
-    評価だけが先に出るのは step 0 のときだけ）なら前の行を全部捨てる。再開した run は起点で評価しないので、区切り C の
-    評価は前の run のものが残る"""
-    updates, evals = [], []
+    評価だけが先に出るのは step 0 のときだけ）なら前の行を全部捨てる。残った更新の行は step が狭義に増える。
+    同じ step の行を後の行で上書きするだけでは、まだ書き直されていない前の run の後続の step（1, 2, 3, 2 の 3）が残る。
+    `load_log`・speedlab.py の `load_log`・takeoff.py の `read_log` が同じ規約で読む"""
+    kept = []
     top_u = top = -1  # それまでの更新の行の最大の step / 全部の行の最大の step
     restarts = dropped = 0
+    for r in rows:
+        k = kind(r)
+        if k not in ("update", "eval"):
+            continue
+        s = r["step"]
+        if (s <= top_u) if k == "update" else (s == 0 < top):
+            n0 = len(kept)
+            kept = [(kk, x) for kk, x in kept if x["step"] < s]
+            restarts, dropped = restarts + 1, dropped + n0 - len(kept)
+            top_u = max([x["step"] for kk, x in kept if kk == "update"], default=-1)
+            top = max([top_u] + [x["step"] for kk, x in kept if kk == "eval"])
+        kept.append((k, r))
+        top = max(top, s)
+        if k == "update":
+            top_u = max(top_u, s)
+    return kept, restarts, dropped
+
+
+def _stage_kind(r):
+    if "eval" in r and "eval_vs_anchor" in r:
+        return "eval"
+    return "update" if "update_sec" in r else None
+
+
+def load_log(path):
+    """log.jsonl を (更新の行, 評価の行) に分ける（どちらも step の昇順）。読めない行（学習中の書きかけの最後の行など）は飛ばす。
+
+    再開で step が戻ったら、そこから先の前の run の行を捨てて後の行を使う（`drop_rolled_back`）。再開した run は
+    起点で評価しないので、区切り C の評価は前の run のものが残る"""
+    rows = []
     with open(path) as f:
         for ln, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 continue
             try:
-                r = json.loads(line)
+                rows.append(json.loads(line))
             except json.JSONDecodeError:
                 print(f"[stage_log] {path}:{ln} を読めないので飛ばす", file=sys.stderr)
-                continue
-            if "eval" in r and "eval_vs_anchor" in r:
-                is_eval = True
-            elif "update_sec" in r:
-                is_eval = False
-            else:
-                continue
-            s = r["step"]
-            if (s <= top_u) if not is_eval else (s == 0 < top):
-                n0 = len(updates) + len(evals)
-                updates = [u for u in updates if u["step"] < s]
-                evals = [e for e in evals if e["step"] < s]
-                restarts, dropped = restarts + 1, dropped + n0 - len(updates) - len(evals)
-                top_u = max([u["step"] for u in updates], default=-1)
-                top = max([top_u] + [e["step"] for e in evals])
-            (evals if is_eval else updates).append(r)
-            top = max(top, s)
-            if not is_eval:
-                top_u = max(top_u, s)
+    kept, restarts, dropped = drop_rolled_back(rows, _stage_kind)
+    updates = [r for k, r in kept if k == "update"]
+    evals = [r for k, r in kept if k == "eval"]
     if restarts:
         print(f"[stage_log] {path}: step が戻った（再開）のが {restarts} 回。前の run の行 {dropped} 行を捨てて後の行を使う",
               file=sys.stderr)

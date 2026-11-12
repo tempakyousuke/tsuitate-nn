@@ -3,7 +3,8 @@
     .venv/bin/python rnad/tests/test_takeoff.py
 
 - find_takeoff: 直近 window 更新の勝率がしきい値以上になった最初の更新。頭の window 更新に満たない区間では判定しない
-- read_log: 同じ step が2回あれば後のもの・書きかけの行は飛ばす・相手が複数なら合算
+- read_log: 同じ step が2回あれば後のもの・書きかけの行は飛ばす・相手が複数なら合算。再開で step が戻ったら
+  前の run の後続の行を捨てる（stage_log.load_log と同じ規約）
 - report: 離陸した run の数、打ち切りより前で止まった run は率に数えない、打ち切りを上限にした平均
 """
 
@@ -87,7 +88,31 @@ def check_read_and_report():
           "打ち切りを上限にした平均")
 
 
+def check_rollback():
+    """read_log / run_status: checkpoint から再開して step が戻ったら、そこから先の前の run の行を捨てる。
+    step 1, 2, 3, 2 なら今の経路は 1, 2 で、前の run の step 3 の勝ちで離陸を見つけない（last も 2）"""
+    with tempfile.TemporaryDirectory() as d:
+        run = pathlib.Path(d) / "r_s1"
+        run.mkdir()
+        rows = [{"step": s, "games": 0, "league_games": {"opp": [w, 8 - w, 0]}, "collect_sec": 6, "update_sec": 4}
+                for s, w in [(1, 0), (2, 0), (3, 8), (2, 0)]]
+        rows.insert(3, {"step": 3, "eval": "target", "eval_vs_anchor": 0.5})
+        (run / "log.jsonl").write_text("\n".join(map(json.dumps, rows)) + "\n")
+        r = takeoff.read_log(run)
+        assert r == [(1, 0, 8), (2, 0, 8)], r
+        assert takeoff.find_takeoff(r, window=1, threshold=0.5) is None
+        st = takeoff.run_status(run, 1, 0.5)
+        assert st["last"] == 2 and st["takeoff"] is None, st
+        # 同じ out で step 0 から回し直した（評価の行 step 0 が先に出る）: 前の run の行を全部捨てる
+        rows = [{"step": 1, "league_games": {"opp": [8, 0, 0]}}, {"step": 2, "league_games": {"opp": [8, 0, 0]}},
+                {"step": 0, "eval": "target", "eval_vs_anchor": 0.5}, {"step": 1, "league_games": {"opp": [0, 8, 0]}}]
+        (run / "log.jsonl").write_text("\n".join(map(json.dumps, rows)) + "\n")
+        assert takeoff.read_log(run) == [(1, 0, 8)]
+    print("K3 read_log: 再開で step が戻ったら前の run の後続の行を捨てる（前の run の勝ちで離陸を見つけない）")
+
+
 if __name__ == "__main__":
     check_find()
     check_read_and_report()
+    check_rollback()
     print("ok")

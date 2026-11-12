@@ -12,6 +12,7 @@
   測られる側だけに掛かること、eval --decode の記録名、export-ck（checkpoint → 書き出し）、temp-match の値
 - eval: パネルより入力の広いネットも測れる（観測はパネル・相手・測られる側のうち最も広い枚数。play_vs を差し替えて確かめる）
 - eval の評価済みの判定: 局数・seed・測られる側と相手の重みの指紋が前の評価と同じなら飛ばし、違えば測り直す・--redo
+- load_log: checkpoint から再開して step が戻ったら、そこから先の前の run の行を捨てる（累積の局数・秒は今の経路のもの）
 """
 
 import argparse
@@ -314,6 +315,24 @@ def check_eval_cache():
           "--redo・指紋の無い前の行は局数だけ確かめる")
 
 
+def check_log_rollback():
+    """load_log / median_sec_per_update: checkpoint から再開して step が戻ったら、そこから先の前の run の行を捨てる
+    （step 1, 2, 3, 2 なら今の経路は 1, 2。前の run の 3 を残さず、重なった 2 を二重に足さない）。書きかけの行は飛ばす"""
+    from stage_log import load_log as stage_load_log
+    with tempfile.TemporaryDirectory() as tmp:
+        run = pathlib.Path(tmp) / "run_s1"
+        run.mkdir()
+        rows = [{"step": s, "games": 0, "league_games": {"opp": [w, 8 - w, 0]}, "collect_sec": 6, "update_sec": sec}
+                for s, w, sec in [(1, 0, 4), (2, 0, 4), (3, 8, 40), (2, 0, 4)]]
+        rows.insert(3, {"step": 3, "eval": "target", "eval_vs_anchor": 0.5})
+        (run / "log.jsonl").write_text("\n".join(map(json.dumps, rows)) + '\n{"step": 3, "games"')
+        assert S.load_log(run) == {0: (0, 0.0), 1: (8, 10.0), 2: (16, 20.0)}, S.load_log(run)
+        assert S.median_sec_per_update(run) == 10.0
+        with contextlib.redirect_stderr(io.StringIO()):
+            assert [r["step"] for r in stage_load_log(run / "log.jsonl")[0]] == [1, 2]
+    print("load_log: 再開で step が戻ったら前の run の後続の行を捨てる（累積の局数・秒は今の経路のもの）")
+
+
 def check_seed_salt():
     """keyed_uniform は salt と局番号を XOR で混ぜるので、局数より小さい桁だけが違う salt は同じ鍵の組を使う（学習中のパネルの
     記録と対にするため変えない）。seed を振るときは seed_salt を通し、違う seed で違う局になる（temp-match の --seed）"""
@@ -573,6 +592,7 @@ if __name__ == "__main__":
     check_decode()
     check_eval_planes()
     check_eval_cache()
+    check_log_rollback()
     check_seed_salt()
     check_fit()
     check_report()
