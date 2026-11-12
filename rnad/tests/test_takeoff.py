@@ -6,7 +6,8 @@
 - read_log: 同じ step が2回あれば後のもの・書きかけの行は飛ばす・相手が複数なら合算。再開で step が戻ったら
   前の run の後続の行を捨てる（stage_log.load_log と同じ規約）
 - report: 離陸した run の数、打ち切りより前で止まった run は率に数えない、打ち切りを上限にした平均。
-  離陸・打ち切りまでの局数は、その更新までの各更新の局数の和（途中で batch を変えた run でも後の batch が混ざらない）
+  離陸・打ち切りまでの局数は、その更新までの各更新の局数の和（途中で batch を変えた run でも後の batch が混ざらない）。
+  離陸までの局数の中央値は、偶数本なら中央の2つの平均
 """
 
 import io
@@ -114,6 +115,27 @@ def check_batch_change():
     print("K4 report: 途中で batch を変えた run でも、離陸・打ち切りまでの局数はその更新までの局数の和")
 
 
+def check_median():
+    """離陸までの局数の中央値: 離陸した run が偶数本なら中央の2つの平均（大きい側ではない）。奇数本なら真ん中"""
+    with tempfile.TemporaryDirectory() as d:
+        root = pathlib.Path(d)
+        write_run(root, "m_s1", [16] * 50, games=64)  # step 50 で離陸 = 3,200局
+        write_run(root, "m_s2", [0] * 100 + [16] * 50, games=64)  # step 120 で離陸 = 7,680局
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            takeoff.cmd_report(SimpleNamespace(roots=[str(root)], extra=[], window=50, threshold=0.10, horizon=0))
+        cols = next(x for x in buf.getvalue().splitlines() if x.startswith("| `m`")).split(" | ")
+        # 列: 腕 / 離陸した run / seed ごと / 中央値 / 打ち切りを上限にした平均 / 離陸の前の勝ち
+        assert cols[1] == "2 / 2" and cols[3] == "5.4k", cols  # (3,200 + 7,680) / 2 = 5,440（大きい側の 7.7k ではない）
+        write_run(root, "m_s3", [0] * 200 + [16] * 50, games=64)  # step 220 で離陸 = 14,080局
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            takeoff.cmd_report(SimpleNamespace(roots=[str(root)], extra=[], window=50, threshold=0.10, horizon=0))
+        cols = next(x for x in buf.getvalue().splitlines() if x.startswith("| `m`")).split(" | ")
+        assert cols[1] == "3 / 3" and cols[3] == "7.7k" and cols[4] == "8.3k", cols  # 平均は (3.2k + 7.68k + 14.08k) / 3
+    print("K5 report: 離陸までの局数の中央値は、偶数本なら中央の2つの平均")
+
+
 def check_rollback():
     """read_log / run_status: checkpoint から再開して step が戻ったら、そこから先の前の run の行を捨てる。
     step 1, 2, 3, 2 なら今の経路は 1, 2 で、前の run の step 3 の勝ちで離陸を見つけない（last も 2）"""
@@ -142,4 +164,5 @@ if __name__ == "__main__":
     check_read_and_report()
     check_rollback()
     check_batch_change()
+    check_median()
     print("ok")

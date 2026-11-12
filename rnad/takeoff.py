@@ -26,6 +26,7 @@ import os
 import pathlib
 import shlex
 import signal
+import statistics
 import subprocess
 import sys
 import time
@@ -239,10 +240,10 @@ def cmd_report(args):
                     n_valid += 1
         if not cells:
             continue
-        med = sorted(took)[len(took) // 2] if took else None
+        med = statistics.median(took) if took else None  # 偶数本なら中央の2つの平均
         out.append((arm, len(took), n_valid, med, restricted))
         print(f"| `{arm}` | {len(took)} / {n_valid} | " + " ・ ".join(cells) + " | "
-              + (fmt_games(med) if med else "—") + " | "
+              + (fmt_games(med) if med is not None else "—") + " | "
               + (fmt_games(sum(restricted) / len(restricted)) if restricted else "—") + " | "
               + " / ".join(str(x) for x in pre) + " |")
     if meta.get("arms"):
