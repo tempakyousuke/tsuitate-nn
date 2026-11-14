@@ -88,8 +88,7 @@ def check_collect(tmp):
     book = openings.load_book(write_book(tmp))
     net = small_net()
     n, cap = 24, 0.5
-    # 手数の差も入れる: 定跡の手は静かな手が多く、駒得と玉への利きだけだと強制の手で Φ が動かないことがある
-    sh = Shaping.from_spec(SPEC + ",d_moves=0.02", "plain", cap, names=NAMES)
+    sh = Shaping.from_spec(SPEC, "plain", cap, names=NAMES)
 
     def make():
         return tsuitate_rl.VecEnv(n, seed=5, auto_reset=False, planes=NUM_PLANES_DEDUCED,
@@ -112,9 +111,15 @@ def check_collect(tmp):
     assert float(base["reward"].sum(-1).abs().max()) < 1e-6
     assert np.allclose(r.total, np.clip(sh.potential(r.sig) - r.phi0, -cap, cap) * 0.7, atol=1e-5)
     assert float(np.abs(r.total).sum()) > 0, "整形が載っていない"
-    # 強制の手を見ない形（従来の式）とは違う報酬になる = 繰り入れが効いている
-    old = np.clip(sh.potential(r.sig) - sh.potential(twin.signals()), -cap, cap) * 0.7
-    assert not np.allclose(old, r.total, atol=1e-4)
+    # 強制の手を見ない形（従来の式）とは違う報酬になる = 繰り入れが効いている。定跡の手は静かな手が多く、駒得と玉への利きでは
+    # 強制の手で Φ が動かないことがあるので、必ず動く信号（自分の受理手の数）で確かめる
+    shm = Shaping.from_spec("moves=0.01", "plain", 5.0, names=NAMES)
+    env = make()
+    rm = collect(env, net, DEV, generator=torch.Generator().manual_seed(11), compact_legal=True, shaping=shm)["shape_run"]
+    old = shm.potential(rm.sig) - shm.potential(twin.signals())
+    late = rm.forced_n > forced_at_reset
+    assert np.allclose(rm.total, shm.potential(rm.sig) - rm.phi0, atol=1e-5)
+    assert (rm.total[late] < old[late] - 1e-6).any() and np.allclose(rm.total[~late], old[~late], atol=1e-5)
     for fast in ["py"] + (["rust"] if HAS_RUST else []):
         for wrap in (False, True):
             b = run(fast, wrap)
