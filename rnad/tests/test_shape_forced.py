@@ -88,7 +88,8 @@ def check_collect(tmp):
     book = openings.load_book(write_book(tmp))
     net = small_net()
     n, cap = 24, 0.5
-    sh = Shaping.from_spec(SPEC, "plain", cap, names=NAMES)
+    # 手数の差も入れる: 定跡の手は静かな手が多く、駒得と玉への利きだけだと強制の手で Φ が動かないことがある
+    sh = Shaping.from_spec(SPEC + ",d_moves=0.02", "plain", cap, names=NAMES)
 
     def make():
         return tsuitate_rl.VecEnv(n, seed=5, auto_reset=False, planes=NUM_PLANES_DEDUCED,
