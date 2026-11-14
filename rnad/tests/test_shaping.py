@@ -469,8 +469,8 @@ def check_train(tmp):
             assert set(x["league"]) == set(extra[1].split(",")) and sum(sum(v) for v in x["league_games"].values()) == 6
     # 使えない組み合わせ
     for extra, msg in ((["--shape", "nope=1"], "知らない"), (["--shape-decay", "1:3"], "--shape-decay"),
-                       (["--shape", "fouls=-0.1", "--pipeline"], "--pipeline"),
-                       (["--shape", "fouls=-0.1", "--fast-collect", "py"], "--fast-collect"),
+                       # --pipeline・--fast-collect・--open-p とは使える（tests/test_shape_forced.py）。--pipeline のリーグだけ止める
+                       (["--shape", "fouls=-0.1", "--pipeline", "--league", "heuristic"], "--pipeline"),
                        (["--league", "heuristic", "--mmd-lambda-unit", "turn"], "turn"),
                        (["--lose-len", "1.5"], "λ")):
         r = run_train(tmp / "rej", *extra, steps=1, check=False)

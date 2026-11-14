@@ -80,7 +80,7 @@ ARENA_MATCH_SEED=20260927 cargo run --release --bin arena -- 100 "rl_policy:<pol
 | フラグ | 中身 |
 | --- | --- |
 | `--packed` | 方策の計算を合法手に詰めて行う（数式は同じ。`tests/test_packed.py`）。重み 0 の正則化ネットの順伝播は常に省く |
-| `--pipeline` | 自己対局を別スレッド・別 CUDA ストリームで集め、更新と重ねる（1更新遅れの方策。ボーナスなし・補助ヘッドなしの設定。`--guard` / `--speed` / `--nyugyoku` / `--aux-truth` / `--shape` / `--league-device gpu` と併用すると止まる。`--league`（`--league-device rust`）とは使える: リーグの局も同じスレッドで集め、相手の配分はその batch を使う step の乱数で決める。`tests/test_mmd.py` の T15） |
+| `--pipeline` | 自己対局を別スレッド・別 CUDA ストリームで集め、更新と重ねる（1更新遅れの方策。ボーナスなし・補助ヘッドなしの設定。`--guard` / `--speed` / `--nyugyoku` / `--aux-truth` / `--league-device gpu` と併用すると止まる。自己対局だけなら `--shape` とは使える（リーグと `--shape` の併用は止まる。`tests/test_shape_forced.py`）。`--league`（`--league-device rust`）とは使える: リーグの局も同じスレッドで集め、相手の配分はその batch を使う step の乱数で決める。`tests/test_mmd.py` の T15） |
 | `--compact-legal` | batch の合法手のマスクを添字で持つ（768局で 0.79GB → 11MB。`--pipeline` のメモリ対策） |
 | `--fast-collect py\|rust` | 自己対局の収集の CPU の仕事を減らす（**batch はビット単位で同じ**。`tests/test_fast_collect.py`）。py は Python だけ（生きている局の行を1回だけ抜く・観測を fp16 で送る・合法手の添字を1回だけ作る）、rust は加えて Rust 側で生きている局だけを観測する（`VecEnv.observe_alive_f16_csr`。tsuitate-bot の rl-env を `maturin develop` で作り直す）。`--compact-legal` と一緒に使い、`--league-device gpu`・入玉ボーナス・補助ヘッドとは使えない |
 | `--device-batch` | batch を更新の頭で1回だけ GPU へ送り、チャンクごとの転送と同期をなくす（**結果はビット単位で同じ**。`tests/test_fast_update.py`）。`--packed --compact-legal` と一緒に使う。GPU のメモリを batch あたり約1GB 使う |
@@ -288,8 +288,14 @@ X=rl_mmdopen_v15
   近い方策への KL の係数も同じ倍率で縮める（R-NaD が η を割るのと同じ）
 - 整形の設定（重み・形・上限・負けの長さ）は checkpoint（`collect_cfg`）と `config.json` に残り、再開で付け忘れる・変えると止まる
   （`--override-config` で通す）。倍率の予定（`--shape-decay`）だけは再開で変えてよい（勝ちが出てきたのを見てから下げ始められる）
-- `--pipeline`・`--fast-collect`・`--open-p`（自己対局の局の序盤の強制）とは一緒に使えない（速い収集は信号を読まない。
-  強制した手の駒得が報酬に入る）。リーグの局で**相手の側だけ**を定跡から指させる `--league-open-p` とは使える。
+- `--pipeline`・`--fast-collect`・`--open-p`（自己対局の局の序盤の強制）と一緒に使える（2026-11-15〜。それまでは止めていた）。
+  **強制した手は方策が選んだ手ではないので、その手で動いた整形の量は報酬にしない**: 強制の手が指された env.step の Φ の変化を
+  基準（Φ の初期値）へ繰り入れる（`shaping.ShapeRun`。同じ step に方策の手が混ざっていてもその step は丸ごと数えない =
+  相手がまだ強制の途中の間は整形が付かない。収集の頭の reset で指した強制の手はもともと基準に入っている）。
+  `--pipeline` の倍率（`--shape-decay`）は、`--pipeline` なしと同じく「その batch を使う step」の値。
+  止めたままの組み合わせ: `--pipeline` のリーグ（集める側のスレッドの env から学習側の色を持ち出していないので監視値を作れない）と、
+  リーグの局で学習側を定跡から指させる `--league-open-sides learner`（試していない）。リーグの局で**相手の側だけ**を定跡から
+  指させる `--league-open-p` とは使える。
   自己対局の局がある設定で零和でない整形（反対称でない重み・`--lose-len`）を付けると注意を出す（R-NaD の前提が外れる）
 - ログ: `signals`（勝ち局・負け局・引き分けごとに、終局時と両者の受理手の合計が 20 / 40 / 60 に届いた時点の信号の平均と標準偏差。
   並びは [自分の信号…, 相手の信号…, 自分 − 相手…]、名前は config.json の `signal_names`）・`shape_mult`（倍率）・`reward_scale`・
@@ -304,6 +310,8 @@ X=rl_mmdopen_v15
   （`--extra 腕=dir,dir` で `run` の外で回した run も数える）
 - テスト: `tests/test_shaping.py`（重みの書式、合成の信号での plain / potential / 負けの長さ、v-trace の隙間、collect の報酬の合計と
   対局の不変、相手を固定した batch の λ-return、reward_scale、ハンデつきの相手、train_rnad.py の配線）、
+  `tests/test_shape_forced.py`（強制の手が指された step を数えないこと、強制つきの自己対局で速い収集が従来と同じ batch を返すこと、
+  `--shape` ＋ `--open-p` ＋ `--pipeline` ＋ `--fast-collect` の配線）、
   `tests/test_takeoff.py`（離陸の判定、ログの読み方と表）
 
 ## 序盤の強制（`--open-book`）
