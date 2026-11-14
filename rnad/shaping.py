@@ -175,9 +175,16 @@ class ShapeRun:
     """1回の収集（`rnad.collect`）のあいだの整形の状態。作る（収集の頭の信号を渡す）→ env.step のたびに `step`。
 
     監視値も一緒に集める: 終局の信号と、両者の受理手の合計が `SNAP_PLIES` に届いた時点の信号（局ごと）。
-    `shaping=None`（整形なし）なら監視だけ（`step` は 0 を返す）"""
+    `shaping=None`（整形なし）なら監視だけ（`step` は 0 を返す）。
 
-    def __init__(self, names, sig0, shaping=None, mult=1.0):
+    **序盤の強制**（env の `--open-p`）: 強制した手は方策が選んだ手ではないので、その手で動いた Φ は報酬にしない。
+    `forced0` / `step(forced=...)` に各側の強制した手の数（`VecEnv.forced_moves()` [B, 2]）を渡すと、**強制の手が
+    指された env.step の Φ の変化を基準（Φ の初期値）へ繰り入れる**（その step の整形は 0。同じ step に方策の手が
+    混ざっていても、その step は丸ごと数えない = 相手がまだ強制の途中の間は整形が付かない）。収集の頭の reset で
+    指した強制の手は `sig0` に入っているので、もともと数えない。強制の手が反則で止まったとき（手数は増えない）は
+    見分けないが、反則では盤面が動かない（動くのは反則の数の信号だけ）"""
+
+    def __init__(self, names, sig0, shaping=None, mult=1.0, forced0=None):
         self.shaping = shaping
         self.mult = float(mult)
         self.sig = sig0.copy()
@@ -185,16 +192,26 @@ class ShapeRun:
         self.moves_k = list(names).index("moves")
         self.phi0 = shaping.potential(sig0) if shaping is not None else None
         self.phic = np.zeros((B, 2))
+        self.raw = np.zeros((B, 2))  # Φ − Φ(基準)（切る前・倍率を掛ける前）
+        self.forced_n = None if forced0 is None else np.asarray(forced0).sum(axis=1)
         self.total = np.zeros((B, 2))  # 局ごとの整形の合計（監視用）
         self.capped = np.zeros((B, 2), dtype=bool)  # Φ が上限に当たったことがあるか（監視用）
         self.ended = np.zeros(B, dtype=bool)
         self.snaps = np.full((len(SNAP_PLIES),) + sig0.shape, np.nan, dtype=np.float32)
         self.snap_done = np.zeros((len(SNAP_PLIES), B), dtype=bool)
 
-    def step(self, sig, done, rew):
+    def step(self, sig, done, rew, forced=None):
         """env.step の後の信号 `sig` [B, 2, K]・この step で終局した局 `done` [B]・env の報酬 `rew` [B, 2] → 足す報酬 [B, 2]。
-        前の step までに終局した局（auto_reset=False で止まっている局）には何も足さない"""
+        前の step までに終局した局（auto_reset=False で止まっている局）には何も足さない。
+        `forced` [B, 2] は各側の強制した手の数（作るときに `forced0` を渡したとき。増えた局はこの step の Φ の変化を数えない）"""
         live = ~self.ended
+        if (forced is None) != (self.forced_n is None):
+            raise ValueError("強制した手の数は、作るとき（forced0）と step（forced）の両方に渡す")
+        moved = None
+        if forced is not None:
+            forced_n = np.asarray(forced).sum(axis=1)
+            moved = live & (forced_n > self.forced_n)
+            self.forced_n = np.where(live, forced_n, self.forced_n)
         add = np.zeros((len(sig), 2))
         plies = sig[:, 0, self.moves_k] + sig[:, 1, self.moves_k]
         for j, thr in enumerate(SNAP_PLIES):
@@ -205,6 +222,11 @@ class ShapeRun:
         if sh is not None and sh.active:
             if sh.has_weights:
                 raw = sh.potential(sig) - self.phi0
+                if moved is not None and moved.any():
+                    # 強制の手が指された step: Φ の変化を基準へ繰り入れる（Φ − 基準は前の step のまま）
+                    self.phi0[moved] += raw[moved] - self.raw[moved]
+                    raw[moved] = self.raw[moved]
+                self.raw = np.where(live[:, None], raw, self.raw)
                 self.capped |= live[:, None] & (np.abs(raw) >= sh.cap)
                 phic = np.clip(raw, -sh.cap, sh.cap) * self.mult
                 if sh.mode == "potential":

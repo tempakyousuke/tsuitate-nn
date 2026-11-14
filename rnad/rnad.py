@@ -1119,6 +1119,9 @@ class MultiEnv:
     def signals(self):
         return np.concatenate([e.signals() for e in self.envs])
 
+    def forced_moves(self):
+        return np.concatenate([e.forced_moves() for e in self.envs])
+
     def random_legal_actions(self, u):
         return np.concatenate([e.random_legal_actions(np.ascontiguousarray(x)) if (x >= 0).any()
                                else np.full(e.num_envs, -1, dtype=np.int64)
@@ -1207,7 +1210,7 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
 
     `fast="py"` / `"rust"` は**同じ batch をビット単位で同じに作る、CPU の仕事を減らした経路**（`_collect_fast`。
     docs/rl-learning-speed.md「さらに速くする」の S1）。自己対局（opponents なし）・入玉ボーナスなし・truth なし・
-    `compact_legal=True` に限る。"rust" は `VecEnv.observe_alive_f16_csr`（rl-env を作り直した tsuitate_rl）を使う
+    `compact_legal=True` に限る（報酬の整形と信号の監視は使える）。"rust" は `VecEnv.observe_alive_f16_csr`（rl-env を作り直した tsuitate_rl）を使う
     """
     if actor_extras and not compact_legal:
         raise ValueError("collect(actor_extras=True) は compact_legal=True に限る")
@@ -1215,13 +1218,18 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
     if fast:
         if fast not in ("py", "rust"):
             raise ValueError(f"fast {fast!r}（'py' か 'rust'）")
-        if opponents is not None or nyugyoku_lambda != 0 or truth or not compact_legal or watch_signals:
+        if opponents is not None or nyugyoku_lambda != 0 or truth or not compact_legal:
             raise ValueError("collect(fast=...) は自己対局（opponents なし）・入玉ボーナスなし・truth なし・"
-                             "報酬の整形と信号の監視なし・compact_legal=True に限る")
+                             "compact_legal=True に限る")
         if fast == "rust" and not all(hasattr(e, "observe_alive_f16_csr") for e in getattr(env, "envs", [env])):
             raise ValueError("collect(fast='rust') には VecEnv.observe_alive_f16_csr が要る（tsuitate-bot の rl-env を"
                              " maturin develop で作り直す）")
-        return _collect_fast(env, net, device, max_steps, generator, rust=fast == "rust", extras=actor_extras)
+        shape_run = None
+        if watch_signals:
+            env.reset()  # 整形の基準（収集の頭の信号）は reset の後に読む
+            shape_run = _start_shape_run(env, shaping, shape_mult)
+        return _collect_fast(env, net, device, max_steps, generator, rust=fast == "rust", extras=actor_extras,
+                             shape_run=shape_run)
     env.reset()
     B = env.num_envs
     obs_l, legal_l, act_l, mu_l, t_l, b_l, truth_l = [], [], [], [], [], [], []
@@ -1234,13 +1242,7 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
     last_act = np.full((B, 2), -1, dtype=np.int64)
     outcome = np.zeros((B, 2), dtype=np.float32)
     pending = []  # nyugyoku_win_only のとき、終局まで保留する (時刻, 局, 側, ボーナス)
-    shape_run = None
-    if watch_signals:
-        from shaping import ShapeRun, env_signal_names
-        names = shaping.names if shaping is not None else env_signal_names()
-        if names is None or not all(hasattr(e, "signals") for e in getattr(env, "envs", [env])):
-            raise ValueError("局の信号（VecEnv.signals）が無い。tsuitate-bot の rl-env を maturin develop で作り直す")
-        shape_run = ShapeRun(names, env.signals(), shaping, shape_mult)
+    shape_run = _start_shape_run(env, shaping, shape_mult) if watch_signals else None
     for t in range(max_steps):
         alive = env.alive()
         if not alive.any():
@@ -1326,7 +1328,7 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
         outcome[done] = rew[done]
         if shape_run is not None:
             # 勝敗（outcome）は env の報酬のまま。学習の報酬にだけ整形を足す
-            rew = rew + shape_run.step(env.signals(), done, rew)
+            rew = rew + _shape_step(shape_run, env, done, rew)
         valid[t, idx] = True
         player[t, idx] = torch.from_numpy(pl[idx].astype(np.int64))
         # ボーナスは過去の時刻へ足すので、この時刻の報酬は上書きでなく加算
@@ -1378,8 +1380,26 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
     }
 
 
+def _start_shape_run(env, shaping, shape_mult):
+    """収集の頭（env.reset の後）で整形・監視の状態を作る（`shaping=None` なら監視だけ）。
+    env が強制した手の数（`forced_moves`）を出せるなら渡す = 強制の手で動いた Φ を報酬にしない（`ShapeRun`）"""
+    from shaping import ShapeRun, env_signal_names
+    envs = getattr(env, "envs", [env])
+    names = shaping.names if shaping is not None else env_signal_names()
+    if names is None or not all(hasattr(e, "signals") for e in envs):
+        raise ValueError("局の信号（VecEnv.signals）が無い。tsuitate-bot の rl-env を maturin develop で作り直す")
+    forced0 = env.forced_moves() if all(hasattr(e, "forced_moves") for e in envs) else None
+    return ShapeRun(names, env.signals(), shaping, shape_mult, forced0=forced0)
+
+
+def _shape_step(shape_run, env, done, rew):
+    """env.step の後に呼ぶ: この step の整形の報酬 [B, 2]（監視値も進める）"""
+    forced = env.forced_moves() if shape_run.forced_n is not None else None
+    return shape_run.step(env.signals(), done, rew, forced=forced)
+
+
 @torch.no_grad()
-def _collect_fast(env, net, device, max_steps, generator, rust, extras=False):
+def _collect_fast(env, net, device, max_steps, generator, rust, extras=False, shape_run=None):
     """`collect(..., compact_legal=True)`（自己対局・入玉ボーナスなし・truth なし）と**ビット単位で同じ batch** を返す。
 
     数式と乱数の消費の順は同じで、CPU の仕事だけを減らす（2026-10-24 の計測で、768局の収集の CPU 時間の半分が
@@ -1390,9 +1410,12 @@ def _collect_fast(env, net, device, max_steps, generator, rust, extras=False):
       「float32 を送ってデバイスで .half().float()」と同じ。fp16 への丸めはどちらも最近接偶数）
     - 合法手の添字（CSR）を1回だけ作り、batch とデバイス上の密なマスク（scatter で作る。密なマスクを送らない）の両方に使う
     - 入玉・前進の記帳（λ=0 では entered / advance を付けるだけ）を局ごとの Python ループからベクトル演算にする
-    `extras` なら `collect(actor_extras=True)` と同じ `v_actor` / `mu_logp` も返す（乱数は消費しない）
+    `extras` なら `collect(actor_extras=True)` と同じ `v_actor` / `mu_logp` も返す（乱数は消費しない）。
+    `shape_run`（`_start_shape_run`。呼ぶ側が env.reset の後に作るので、ここでは reset しない）があれば報酬へ整形を足し、
+    `shape_run` に入れて返す（`collect` と同じ。勝敗 outcome は env の報酬のまま）
     """
-    env.reset()
+    if shape_run is None:
+        env.reset()
     B = env.num_envs
     obs_l, cols_l, cnt_l, act_l, mu_l, t_l, b_l = [], [], [], [], [], [], []
     v_l, lp_l = [], []
@@ -1446,10 +1469,12 @@ def _collect_fast(env, net, device, max_steps, generator, rust, extras=False):
         actions = np.full(B, -1, dtype=np.int64)
         actions[idx] = a.numpy()
         rew, done = env.step(actions)
+        outcome[done] = rew[done]
+        if shape_run is not None:
+            rew = rew + _shape_step(shape_run, env, done, rew)
         valid[t, idx] = True
         player[t, idx] = torch.from_numpy(p_sel)
         reward[t] += torch.from_numpy(rew)
-        outcome[done] = rew[done]
         obs_l.append(oh)
         cols_l.append(cols16)
         cnt_l.append(counts32)
@@ -1462,6 +1487,7 @@ def _collect_fast(env, net, device, max_steps, generator, rust, extras=False):
     T = t + 1
     return {
         **({"v_actor": torch.cat(v_l), "mu_logp": torch.cat(lp_l)} if extras else {}),
+        **({"shape_run": shape_run} if shape_run is not None else {}),
         "legal_cols": torch.cat(cols_l), "legal_counts": torch.cat(cnt_l),
         "obs": torch.cat(obs_l), "action": torch.cat(act_l),
         "mu_a": torch.cat(mu_l), "t": torch.cat(t_l), "b": torch.cat(b_l),
@@ -1498,7 +1524,7 @@ class PipelinedCollector:
         self.generator.manual_seed(seed)
         self.stream = torch.cuda.Stream(device=device, priority=-1) if device.type == "cuda" else None
 
-    def _work(self, net, ready, opening_seed, league):
+    def _work(self, net, ready, opening_seed, league, shape_mult):
         if not hasattr(self.local, "env"):
             self.local.env = self.env_factory()  # 自己対局の局が無い（リーグだけ）なら None
         self_env = self.local.env
@@ -1510,19 +1536,21 @@ class PipelinedCollector:
         envs = [e for e in (self_env, league_env) if e is not None]
         env = envs[0] if len(envs) == 1 else MultiEnv(envs)
         t0 = time.time()
+        kw = self.collect_kw if shape_mult is None else {**self.collect_kw, "shape_mult": shape_mult}
         if self.stream is None:
-            batch = collect(env, net, self.device, generator=self.generator, **self.collect_kw)
+            batch = collect(env, net, self.device, generator=self.generator, **kw)
         else:
             self.stream.wait_event(ready)  # 写しを作り終えてから使う
             with torch.cuda.stream(self.stream):
-                batch = collect(env, net, self.device, generator=self.generator, **self.collect_kw)
+                batch = collect(env, net, self.device, generator=self.generator, **kw)
             self.stream.synchronize()
         finished = self_env.pop_finished() if self_env is not None else []
         league_finished = league_env.pop_finished() if league_env is not None else []
         return batch, finished, time.time() - t0, league_finished
 
-    def submit(self, net, opening_seed=None, league=None):
-        """`league` はリーグの env を作る関数（集める側のスレッドの中で呼ぶ。VecEnv は unsendable）。None = 自己対局だけ"""
+    def submit(self, net, opening_seed=None, league=None, shape_mult=None):
+        """`league` はリーグの env を作る関数（集める側のスレッドの中で呼ぶ。VecEnv は unsendable）。None = 自己対局だけ。
+        `shape_mult` は報酬の整形の倍率（collect_kw に shaping を渡したとき。batch ごとに変わるのでここで渡す）"""
         if self.future is not None:
             raise RuntimeError("前の batch を受け取る前に次を頼んだ")
         snap = copy.deepcopy(net).eval()
@@ -1531,7 +1559,7 @@ class PipelinedCollector:
         if self.stream is not None:
             ready = torch.cuda.Event()
             ready.record()  # 既定のストリーム上で写しを作り終えた印
-        self.future = self.pool.submit(self._work, snap, ready, opening_seed, league)
+        self.future = self.pool.submit(self._work, snap, ready, opening_seed, league, shape_mult)
 
     def result(self):
         """(batch, 自己対局の終局した局, 集めるのにかかった秒)。リーグの終局した局は `league_finished` に置く"""

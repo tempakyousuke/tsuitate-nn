@@ -505,13 +505,13 @@ def main() -> None:
             raise SystemExit(f"報酬の整形の設定: {e}") from e
         if args.shape_decay and not shape.active:
             raise SystemExit("--shape-decay は --shape か --lose-len と一緒に使う")
-        bad = [f for f, on in (("--pipeline", args.pipeline), ("--fast-collect", args.fast_collect),
-                               ("--open-p", args.open_p),
+        bad = [f for f, on in (("--pipeline とリーグ", args.pipeline and args.league),
                                ("--league-open-sides learner",
                                 args.league_open_p and args.league_open_sides == "learner")) if on]
         if bad:
-            # 収集の速い経路は信号を読まない。序盤の強制は、学習する側の強制した手の駒得や手数が報酬に入る
-            # （リーグの局で相手の側だけを強制する --league-open-p は使える: 学習側の手は全部自分で選んでいる）
+            # 自己対局の序盤の強制（--open-p）は使える: 強制の手で動いた整形の量は報酬にしない（shaping.ShapeRun）。
+            # リーグの局で学習側を強制する形は試していないので止めたまま（相手の側だけの --league-open-p は使える）。
+            # --pipeline のリーグは、集める側のスレッドの env から学習側の色を持ち出していないので監視値を作れない
             raise SystemExit(f"報酬の整形・信号の監視は {' '.join(bad)} と一緒に使えない")
         if shape.active and not shape.zero_sum and not (args.league and args.league_frac == 1.0):
             print("注意: 整形が零和でない（重みが反対称でない・負けの長さ）のに自己対局の局がある。"
@@ -863,14 +863,17 @@ def main() -> None:
     pipe = None
     if args.pipeline:
         if (league is not None and args.league_device == "gpu") or args.guard or args.speed or args.nyugyoku \
-                or cfg.aux_truth > 0 or watch_signals:
-            raise SystemExit("--pipeline はボーナスなし・補助ヘッドなし・報酬の整形と局の信号の監視なしの設定で使う"
-                             "（リーグは --league-device rust だけ）")
+                or cfg.aux_truth > 0:
+            raise SystemExit("--pipeline はボーナスなし・補助ヘッドなしの設定で使う（リーグは --league-device rust だけ）")
         pipe = PipelinedCollector(
             lambda: (tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False, **obs_kw, **open_kw)
                      if n_self else None), device,
             seed=args.seed * 1_000_003 + 17 + learner.step_count, compact_legal=args.compact_legal,
-            fast=args.fast_collect, actor_extras=args.algo == "mmd")
+            fast=args.fast_collect, actor_extras=args.algo == "mmd", shaping=shape, watch_signals=watch_signals)
+
+        def pipe_shape_mult(step):
+            """step で使う batch の整形の倍率（--pipeline なしと同じく「その batch を使う step」で決める）"""
+            return shape.multiplier(step) if shape is not None else None
 
         def pipe_league(step):
             """step で使う batch のリーグの env を作る関数（env は集める側のスレッドの中で作る = VecEnv は unsendable）。
@@ -884,7 +887,9 @@ def main() -> None:
 
         # 序盤の強制の乱数列は「その batch を使う step」で決める（ループの前に頼む batch は今の step で使う）
         pipe_open_seed = open_seed(args.seed, learner.step_count) if open_kw else None
-        pipe.submit(learner.net, opening_seed=pipe_open_seed, league=pipe_league(learner.step_count))
+        pipe_mult = pipe_shape_mult(learner.step_count)
+        pipe.submit(learner.net, opening_seed=pipe_open_seed, league=pipe_league(learner.step_count),
+                    shape_mult=pipe_mult)
 
     # 学習には使わない追加の指数移動平均（--extra-ema）。現在のネットの写しを係数ごとに持つ
     extra_ema = {}
@@ -974,7 +979,13 @@ def main() -> None:
             # 再開したときも league.json の状態から同じ配分になる）
             league_finished = pipe.league_finished
             league_rec = league.record(league_finished) if league is not None and n_league else {}
-            pipe.submit(learner.net, opening_seed=pipe_open_seed, league=pipe_league(learner.step_count + args.reuse))
+            shape_mult = pipe_mult if pipe_mult is not None else 1.0  # 受け取った batch の倍率
+            pipe_mult = pipe_shape_mult(learner.step_count + args.reuse)
+            pipe.submit(learner.net, opening_seed=pipe_open_seed, league=pipe_league(learner.step_count + args.reuse),
+                        shape_mult=pipe_mult)
+            if watch_signals:
+                # 自己対局だけ（--pipeline のリーグと監視の併用は起動時に止めている）= 両方の側を数える
+                signals_rec = summarize_signals(batch.pop("shape_run"), batch["outcome"], np.full(args.batch, -1))
             league_env = None
             t1 = time.time()
         else:
