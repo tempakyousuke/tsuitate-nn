@@ -172,19 +172,27 @@ def keyed_actions(net, obs, mask, games, decs, salt, device=DEV, temp=1.0):
 
 
 @torch.no_grad()
-def play_vs(a_net, b: Member, games: int, seed: int, planes: int, per_game: bool = False, device=DEV, a_temp=1.0):
+def play_vs(a_net, b: Member, games: int, seed: int, planes: int, per_game: bool = False, device=DEV, a_temp=1.0,
+            open_kw=None, finished=None):
     """a_net（PyTorch）と b を games 局（偶数番の局で a が先手）。a から見た (勝, 負, 分)（per_game なら局番号ごとの
     結果 1 / 0 / −1 の配列）。
     手は `keyed_actions`（局ごとの共通乱数）で選ぶので、同じ (b, games, seed) で測った書き出しどうしは局ごとに対になる。
-    `a_temp` は a だけの温度（0 = greedy）。相手はいつも温度 1"""
+    `a_temp` は a だけの温度（0 = greedy）。相手はいつも温度 1。
+    `open_kw`（`openings.env_kwargs(book, p)`）を渡すと、**a の側だけ**序盤を定跡から指させる（序盤を強制して学習した
+    ネットは初期局面から自分で指したことが無いので、強制なしでは学習していない範囲を測ることになる）。ラインは
+    (seed, 局番号) で決まるので、同じ (b, games, seed) の測定どうしは同じラインの組になる。
+    `finished` にリストを渡すと、終局の記録（`VecEnv.pop_finished`）を足す"""
     salt = seed
+    open_kw = {**open_kw, "opening_sides": "learner"} if open_kw else {}
     dec = np.zeros(games, dtype=np.int64)  # 局ごとの手番の数（反則で指し直した手番も数える）
     if b.net is not None:
-        env = tsuitate_rl.VecEnv(games, seed=seed, auto_reset=False, **planes_kw(planes))
+        # 自己対局モードでは「偶数番の局で a が先手」を env に伝えて a の側を決める
+        env = tsuitate_rl.VecEnv(games, seed=seed, auto_reset=False, **planes_kw(planes), **open_kw,
+                                 **({"opening_index_learner": True} if open_kw else {}))
         a_color = np.arange(games) % 2
     else:
         # Rust の戦略が相手: 評価モード（偶数番の局で学習側が先手。相手の手番は env の中で進む）
-        env = tsuitate_rl.VecEnv(games, opponent=b.rust, seed=seed, auto_reset=False, **planes_kw(planes))
+        env = tsuitate_rl.VecEnv(games, opponent=b.rust, seed=seed, auto_reset=False, **planes_kw(planes), **open_kw)
         a_color = None
     env.reset()
     outcome = np.zeros(games, dtype=np.int64)  # 局番号ごとの a から見た結果（1 / 0 / −1）
@@ -209,6 +217,8 @@ def play_vs(a_net, b: Member, games: int, seed: int, planes: int, per_game: bool
         rew, done = env.step(actions)
         for i in np.flatnonzero(done):
             outcome[i] = int(np.sign(rew[i, learner[i]]))
+    if finished is not None:
+        finished.extend(env.pop_finished())
     if per_game:
         return outcome
     return int((outcome > 0).sum()), int((outcome < 0).sum()), int((outcome == 0).sum())

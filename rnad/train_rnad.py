@@ -380,6 +380,10 @@ def main() -> None:
     ap.add_argument("--panel-every", type=int, default=500, help="パネルで測る間隔（更新回数。0 なら最初と最後だけ）")
     ap.add_argument("--panel-games", type=int, default=256, help="パネルの相手1体あたりの局数（偶数）")
     ap.add_argument("--panel-which", default="target", help="測るネット（target / current をカンマ区切り）")
+    ap.add_argument("--panel-open-p", type=float, default=0.0,
+                    help="パネルで測られる側（学習するネット）だけ、この確率で序盤を --open-book の定跡から指させる"
+                         "（相手は強制しない）。--open-p 1 で学習したネットは初期局面から自分で指したことが無いので 1 にする。"
+                         "強制なしの記録とは比べられない（panel_eval.jsonl の行に open_p が付く）")
     ap.add_argument("--reseed", action="store_true",
                     help="再開時に checkpoint の乱数状態を使わず --seed で乱数を初めから作り直す（同じ checkpoint から "
                          "seed だけ変えた複製の対照を回すとき。付けないと checkpoint の乱数状態が戻り、同じ自己対局が再生される）")
@@ -926,6 +930,10 @@ def main() -> None:
         panel_members = [speedlab.Member(m, panel_planes, device) for m in panel["members"]]
         if args.panel_games % 2:
             raise SystemExit("--panel-games は偶数（先後を同数にするため）")
+        if not 0.0 <= args.panel_open_p <= 1.0 or (args.panel_open_p and not args.open_book):
+            raise SystemExit("--panel-open-p は 0〜1 で、--open-book が要る")
+        panel_open_kw = (openings.env_kwargs(openings.load_book(args.open_book, args.open_weight), args.panel_open_p,
+                                             openings.parse_len(args.open_len)) if args.panel_open_p else {})
 
     def panel_eval(step):
         """パネルの各相手と局ごとの結果を panel_eval.jsonl へ（speedlab.py eval と同じ形・同じ seed の決め方）"""
@@ -943,14 +951,22 @@ def main() -> None:
                                         "games": args.panel_games, "outcomes": o.tolist()}) + "\n")
                 f.flush()
                 elo, se = speedlab.fit_fixed(res, panel["ratings"])
-                print(f"[panel] step {step} {which}: Elo {elo:.0f}±{se:.0f}（"
+                tag = f"（測られる側の序盤を強制 p={args.panel_open_p:g}）" if args.panel_open_p else ""
+                print(f"[panel] step {step} {which}{tag}: Elo {elo:.0f}±{se:.0f}（"
                       + " ".join(f"{n} {w}-{l}-{d}" for n, w, l, d in res) + f"、{time.time() - t0:.0f}s）", flush=True)
 
     def crossed(step, every):
         """この反復（reuse 回の更新）で every の倍数をまたいだか（reuse=1 なら step % every == 0 と同じ）"""
         return every > 0 and step // every != (step - args.reuse) // every
 
-    if panel is not None and not (out / "panel_eval.jsonl").exists():
+    def panel_measured():
+        """今の測り方（序盤の強制の確率）の記録が既にあるか。測り方を変えて再開したら、変えた時点も起点として測る"""
+        path = out / "panel_eval.jsonl"
+        if not path.exists():
+            return False
+        return any(json.loads(x).get("open_p", 0.0) == args.panel_open_p for x in open(path) if x.strip())
+
+    if panel is not None and not panel_measured():
         panel_eval(learner.step_count)  # 起点（再開でも最初の1回は測る）
     if learner.step_count == 0 and args.eval_every:
         evaluate(0)
