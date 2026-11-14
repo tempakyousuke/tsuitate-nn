@@ -944,11 +944,12 @@ def main() -> None:
                 res = []
                 for m in panel_members:
                     o = speedlab.play_vs(nets[which], m, args.panel_games, speedlab.EVAL_SEED + speedlab.stable_seed(m.name),
-                                         panel_planes, per_game=True, device=device)
+                                         panel_planes, per_game=True, device=device, open_kw=panel_open_kw)
                     w, l, d = int((o > 0).sum()), int((o < 0).sum()), int((o == 0).sum())
                     res.append((m.name, w, l, d))
                     f.write(json.dumps({"step": step, "which": which, "opponent": m.name, "w": w, "l": l, "d": d,
-                                        "games": args.panel_games, "outcomes": o.tolist()}) + "\n")
+                                        "games": args.panel_games, "outcomes": o.tolist(),
+                                        **({"open_p": args.panel_open_p} if args.panel_open_p else {})}) + "\n")
                 f.flush()
                 elo, se = speedlab.fit_fixed(res, panel["ratings"])
                 tag = f"（測られる側の序盤を強制 p={args.panel_open_p:g}）" if args.panel_open_p else ""
