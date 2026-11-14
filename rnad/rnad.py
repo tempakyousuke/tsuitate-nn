@@ -1380,7 +1380,6 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
     }
 
 
-@torch.no_grad()
 def _start_shape_run(env, shaping, shape_mult):
     """収集の頭（env.reset の後）で整形・監視の状態を作る（`shaping=None` なら監視だけ）。
     env が強制した手の数（`forced_moves`）を出せるなら渡す = 強制の手で動いた Φ を報酬にしない（`ShapeRun`）"""
@@ -1399,6 +1398,7 @@ def _shape_step(shape_run, env, done, rew):
     return shape_run.step(env.signals(), done, rew, forced=forced)
 
 
+@torch.no_grad()
 def _collect_fast(env, net, device, max_steps, generator, rust, extras=False, shape_run=None):
     """`collect(..., compact_legal=True)`（自己対局・入玉ボーナスなし・truth なし）と**ビット単位で同じ batch** を返す。
 

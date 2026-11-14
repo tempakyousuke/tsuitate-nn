@@ -126,6 +126,7 @@ def check_collect(tmp):
             bad = [k for k in base if k != "shape_run" and not (
                 torch.equal(b[k], base[k]) if torch.is_tensor(base[k]) else np.array_equal(b[k], base[k]))]
             assert not bad and set(b) == set(base), (fast, wrap, bad)
+            assert not any(torch.is_tensor(v) and v.requires_grad for v in b.values()), "収集の batch に勾配が付いている"
             assert np.array_equal(b["shape_run"].total, r.total) and np.array_equal(b["shape_run"].sig, r.sig)
     # 整形なしの監視だけでも速い収集で回り、対局は同じ
     w = run("py", watch_signals=True)
