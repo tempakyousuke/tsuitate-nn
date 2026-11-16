@@ -928,6 +928,8 @@ def main() -> None:
         if panel["planes"] > panel_planes:
             raise SystemExit(f"パネルの planes {panel['planes']} が学習するネット {panel_planes} より多い")
         panel_members = [speedlab.Member(m, panel_planes, device) for m in panel["members"]]
+        if not any(m.name in panel["ratings"] for m in panel_members):
+            raise SystemExit("パネルにレートのある相手が1体も無い（Elo を当てられない）")
         if args.panel_games % 2:
             raise SystemExit("--panel-games は偶数（先後を同数にするため）")
         if not 0.0 <= args.panel_open_p <= 1.0 or (args.panel_open_p and not args.open_book):
@@ -951,8 +953,12 @@ def main() -> None:
                                         "games": args.panel_games, "outcomes": o.tolist(),
                                         **({"open_p": args.panel_open_p} if args.panel_open_p else {})}) + "\n")
                 f.flush()
-                elo, se = speedlab.fit_fixed(res, panel["ratings"])
+                # レートの無い相手（ratings.json にまだ載っていない新しい版）は勝敗だけを出し、Elo には入れない
+                # （speedlab.load_eval と同じ扱い）
+                rated = [r for r in res if r[0] in panel["ratings"]]
+                elo, se = speedlab.fit_fixed(rated, panel["ratings"])
                 tag = f"（測られる側の序盤を強制 p={args.panel_open_p:g}）" if args.panel_open_p else ""
+                tag += f"（Elo はレートのある {len(rated)}体から）" if len(rated) < len(res) else ""
                 print(f"[panel] step {step} {which}{tag}: Elo {elo:.0f}±{se:.0f}（"
                       + " ".join(f"{n} {w}-{l}-{d}" for n, w, l, d in res) + f"、{time.time() - t0:.0f}s）", flush=True)
 

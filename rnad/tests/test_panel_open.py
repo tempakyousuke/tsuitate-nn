@@ -71,6 +71,15 @@ def check_train(tmp):
     run_train(out, *common, "--panel-open-p", "1.0", steps=7)
     steps = [json.loads(x)["step"] for x in open(out / "panel_eval.jsonl")][16:]
     assert steps == [7] * 4, steps
+    # レートの無い相手は勝敗だけ出して Elo には入れない。1体もレートが無ければ止まる
+    panel2 = tmp / "panel2.json"
+    panel2.write_text(json.dumps({"planes": PLANES, "members": ["random", "heuristic"], "ratings": {"random": 0.0}}))
+    r = run_train(tmp / "unrated", "--panel", str(panel2), "--panel-games", "4", steps=1)
+    assert "Elo はレートのある 1体から" in r.stdout and "heuristic " in r.stdout, r.stdout
+    assert {json.loads(x)["opponent"] for x in open(tmp / "unrated" / "panel_eval.jsonl")} == {"random", "heuristic"}
+    panel2.write_text(json.dumps({"planes": PLANES, "members": ["random"], "ratings": {}}))
+    r = run_train(tmp / "norate", "--panel", str(panel2), "--panel-games", "4", steps=1, check=False)
+    assert r.returncode != 0 and "レートのある相手" in (r.stderr + r.stdout)
     r = run_train(tmp / "rej", "--panel", str(panel), "--panel-games", "4", "--panel-open-p", "1.0", steps=1, check=False)
     assert r.returncode != 0 and "--open-book" in (r.stderr + r.stdout)
     print("P2 train_rnad.py: --panel-open-p で行に open_p が付き、測り方を変えて再開した時点も測る")
