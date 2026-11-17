@@ -24,12 +24,19 @@ NUM_PLANES_V3 = 101
 # エンコーダ v4（tsuitate-bot の `rl::encode::NUM_PLANES_V4`）: v3 の後ろに1枚。組の扱いは v3 と同じで、v3 のネットは
 # v4 の観測の先頭を読む（v3 の実験の checkpoint をそのまま使える）
 NUM_PLANES_V4 = 102
+# エンコーダ v5（tsuitate-bot の `rl::encode::NUM_PLANES_V5`、2026-11-17）: v4 の後ろに、取った駒・取られた駒の
+# 一覧を4組 22枚。組の扱いは v3 と同じ
+NUM_PLANES_V5 = 124
 # 組を持てるネットのプレーン数
-EXTENDED_PLANES = (NUM_PLANES_V3, NUM_PLANES_V4)
+EXTENDED_PLANES = (NUM_PLANES_V3, NUM_PLANES_V4, NUM_PLANES_V5)
 EXTRA_PLANES = {
     "opp_hand": (91, 7),  # 案3: 相手の持ち駒の上界（駒種別）
     "opp_fouls": (98, 3),  # 案4: 相手の反則の時系列（直前の手番 / 王手を受けていた手番 / 受けていない手番）
     "king_fouls": (101, 1),  # v4: 自玉の移動で反則したマス（鮮度は反則した手数から）
+    "lost_fresh": (102, 7),  # v5: 取られた駒種ごとの、最後に取られた手数からの鮮度（全面）
+    "lost_roles": (109, 7),  # v5: 取られた駒種ごとのマス（回数。薄れない）
+    "cap_roles": (116, 7),  # v5: 取った駒種ごとのマス（回数。薄れない）
+    "pawn_files": (123, 1),  # v5: 相手の歩を取った筋（筋の全マスに回数。薄れない）
 }
 NUM_ACTION_KINDS = 139
 
@@ -43,14 +50,14 @@ def planes_for(extras) -> int:
 
 
 def normalize_extras(planes: int, extras) -> list:
-    """v3 / v4 のネットが使う組の名前（並べ替え済み）。v1・v2 のネットは組を持てない。
+    """v3 以降のネットが使う組の名前（並べ替え済み）。v1・v2 のネットは組を持てない。
     組はネットのプレーン数に収まっていること（v4 の組は v3 のネットには入らない）"""
     extras = sorted(set(extras or ()))
     unknown = set(extras) - set(EXTRA_PLANES)
     if unknown:
         raise ValueError(f"知らない入力プレーンの組: {sorted(unknown)}（{sorted(EXTRA_PLANES)} のどれか）")
     if extras and planes not in EXTENDED_PLANES:
-        raise ValueError(f"入力プレーンの組 {extras} は v3 / v4（{EXTENDED_PLANES}枚）のネットだけが持てる（planes {planes}）")
+        raise ValueError(f"入力プレーンの組 {extras} は v3 以降（{EXTENDED_PLANES}枚）のネットだけが持てる（planes {planes}）")
     over = [n for n in extras if sum(EXTRA_PLANES[n]) > planes]
     if over:
         raise ValueError(f"入力プレーンの組 {over} は {planes}枚のネットに入らない（{planes_for(over)}枚が要る）")
@@ -58,7 +65,7 @@ def normalize_extras(planes: int, extras) -> list:
 
 
 def unused_planes(planes: int, extras) -> list:
-    """ネットが使わない入力プレーンの番号（v3 / v4 で選ばなかった組）。v1・v2 は空"""
+    """ネットが使わない入力プレーンの番号（v3 以降で選ばなかった組）。v1・v2 は空"""
     if planes not in EXTENDED_PLANES:
         return []
     extras = normalize_extras(planes, extras)
@@ -88,7 +95,7 @@ class PolicyValueNet(nn.Module):
         if planes in EXTENDED_PLANES:
             self.config["extras"] = extras
         self.stem = nn.Conv2d(planes, channels, 3, padding=1, bias=False)
-        # 使わない入力プレーン（v3 で選ばなかった組）。入力を 0 にするので stem のその列には勾配が来ず、
+        # 使わない入力プレーン（v3 以降で選ばなかった組）。入力を 0 にするので stem のその列には勾配が来ず、
         # 0 で始めた列は 0 のまま（書き出した重みも 0）。state_dict には入れない（config から作り直せる）
         off = unused_planes(planes, extras)
         if off:
@@ -126,7 +133,7 @@ class PolicyValueNet(nn.Module):
 
     @classmethod
     def from_config(cls, config: dict) -> "PolicyValueNet":
-        """checkpoint の `config`（や重みファイルのヘッダ）からネットの形を作る（v3 の組の選び方も含む）"""
+        """checkpoint の `config`（や重みファイルのヘッダ）からネットの形を作る（v3 以降の組の選び方も含む）"""
         return cls(config["channels"], config["blocks"], config["planes"], config.get("extras", ()))
 
     def forward(self, x):

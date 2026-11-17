@@ -1,17 +1,19 @@
-"""エンコーダ v3 / v4 の入力プレーンの組（`model.EXTRA_PLANES`、`--opp-hand-planes` / `--opp-foul-planes` /
-`--king-foul-planes`）の検査。
+"""エンコーダ v3 以降の入力プレーンの組（`model.EXTRA_PLANES`、`--opp-hand-planes` / `--opp-foul-planes` /
+`--king-foul-planes` / v5 の `--lost-fresh-planes` / `--lost-role-planes` / `--cap-role-planes` / `--pawn-file-planes`）の検査。
 
     .venv/bin/python rnad/tests/test_extra_planes.py
 
 - 組の並びが tsuitate-bot の `rl::encode::EXTRA_PLANE_GROUPS` と同じ（tsuitate_rl が入っていれば照合する）
 - 使わない組は入力を読まない: 値を変えても出力が変わらず、stem のその列に勾配が来ず 0 のまま
-- v2 → v3 / v4 に広げた checkpoint（R-NaD・MMD）は、組の選び方によらず元と同じ関数。optimizer の状態も読める
-- v3 の checkpoint に組を後から足しても（v4 の組なら 102枚へ広げても）同じ関数で、足した列の 2次モーメントは入れ直される。
-  外す・何も変えない指定と、v4 の組を v3 のネットに入れる指定は止める
+- v2 → v3 / v4 / v5 に広げた checkpoint（R-NaD・MMD）は、組の選び方によらず元と同じ関数。optimizer の状態も読める
+- v3 の checkpoint に組を後から足しても（v4 の組なら 102枚、v5 の組なら 124枚へ広げても）同じ関数で、足した列の
+  2次モーメントは入れ直される。外す・何も変えない指定と、後の版の組を前の版のネットに入れる指定は止める
 - 書き出した重みは使わない組の列が 0 で、読み戻すと組の選び方も戻る
 - 学習のフラグ（train_rnad.with_extras）: 足りない組は足し（組が入る版まで広げ）、外すのと v1 からは止める
+- フラグの名前（`widen_planes.EXTRA_FLAGS`）は組の全部を1つずつ指す
 """
 
+import argparse
 import pathlib
 import sys
 import tempfile
@@ -24,9 +26,9 @@ from export_weights import read as read_weights  # noqa: E402
 from export_weights import write as write_weights  # noqa: E402
 from mmd import MMDLearner, make_config  # noqa: E402
 from model import (EXTRA_PLANES, NUM_PLANES, NUM_PLANES_DEDUCED, NUM_PLANES_V3, NUM_PLANES_V4,  # noqa: E402
-                   PolicyValueNet, planes_for, unused_planes)
+                   NUM_PLANES_V5, PolicyValueNet, planes_for, unused_planes)
 from rnad import RNaDConfig, RNaDLearner  # noqa: E402
-from widen_planes import widen_checkpoint  # noqa: E402
+from widen_planes import EXTRA_FLAGS, add_extra_flags, extras_from_args, widen_checkpoint  # noqa: E402
 
 DEV = torch.device("cpu")
 CFG = RNaDConfig(eta=0.2, beta=16.0, lr=2e-4, schedule_sizes=(200,), schedule_repeats=(1,))
@@ -36,7 +38,11 @@ CHOICES = [
     (NUM_PLANES_V3, ["opp_fouls", "opp_hand"]),
     (NUM_PLANES_V4, []), (NUM_PLANES_V4, ["king_fouls"]), (NUM_PLANES_V4, ["king_fouls", "opp_hand"]),
     (NUM_PLANES_V4, ["king_fouls", "opp_fouls", "opp_hand"]),
+    (NUM_PLANES_V5, []), (NUM_PLANES_V5, ["lost_fresh"]), (NUM_PLANES_V5, ["lost_roles"]), (NUM_PLANES_V5, ["cap_roles"]),
+    (NUM_PLANES_V5, ["pawn_files"]), (NUM_PLANES_V5, ["cap_roles", "king_fouls", "lost_roles", "opp_hand"]),
+    (NUM_PLANES_V5, sorted(EXTRA_PLANES)),
 ]
+V5_GROUPS = ["lost_fresh", "lost_roles", "cap_roles", "pawn_files"]
 
 
 def span(name):
@@ -71,18 +77,28 @@ def same(a, b, x_a, x_b, what):
 
 def check_layout():
     spans = sorted(EXTRA_PLANES.values())
-    assert spans[0][0] == NUM_PLANES_DEDUCED and sum(n for _, n in spans) == NUM_PLANES_V4 - NUM_PLANES_DEDUCED
+    assert spans[0][0] == NUM_PLANES_DEDUCED and sum(n for _, n in spans) == NUM_PLANES_V5 - NUM_PLANES_DEDUCED
     for (s, n), (t, _) in zip(spans, spans[1:]):
         assert s + n == t, "組は隙間なく並ぶ"
     assert planes_for([]) == NUM_PLANES_DEDUCED
     assert planes_for(["opp_hand"]) == planes_for(["opp_fouls", "opp_hand"]) == NUM_PLANES_V3
     assert planes_for(["king_fouls"]) == planes_for(["king_fouls", "opp_hand"]) == NUM_PLANES_V4
+    for name in V5_GROUPS:
+        assert planes_for([name]) == planes_for([name, "opp_hand"]) == NUM_PLANES_V5, name
+    # フラグは組の全部を1つずつ指し、フラグから組の名前が取れる
+    assert sorted(EXTRA_FLAGS.values()) == sorted(EXTRA_PLANES)
+    ap = argparse.ArgumentParser()
+    add_extra_flags(ap)
+    assert extras_from_args(ap.parse_args([])) == []
+    for flag, name in EXTRA_FLAGS.items():
+        assert extras_from_args(ap.parse_args(["--" + flag.replace("_", "-")])) == [name], flag
     try:
         import tsuitate_rl
     except ImportError:
         print("tsuitate_rl が無いので Rust 側との照合は飛ばす")
         return
     assert tsuitate_rl.NUM_PLANES_V3 == NUM_PLANES_V3 and tsuitate_rl.NUM_PLANES_V4 == NUM_PLANES_V4
+    assert tsuitate_rl.NUM_PLANES_V5 == NUM_PLANES_V5
     assert dict(tsuitate_rl.EXTRA_PLANE_GROUPS) == {k: tuple(v) for k, v in EXTRA_PLANES.items()}, \
         (tsuitate_rl.EXTRA_PLANE_GROUPS, EXTRA_PLANES)
 
@@ -111,8 +127,9 @@ def check_mask():
         assert (net.stem.weight[:, off] == 0).all(), what
         for name in extras:
             assert g[:, span(name)].abs().sum() > 0, f"{what}: 使う組 {name} に勾配が来ない"
-    # v1・v2 は組を持てない・v4 の組は v3 のネットに入らない・知らない組は止める
-    for bad in ((NUM_PLANES_DEDUCED, ["opp_hand"]), (NUM_PLANES_V3, ["king_fouls"]), (NUM_PLANES_V3, ["nope"])):
+    # v1・v2 は組を持てない・後の版の組は前の版のネットに入らない・知らない組は止める
+    for bad in ((NUM_PLANES_DEDUCED, ["opp_hand"]), (NUM_PLANES_V3, ["king_fouls"]), (NUM_PLANES_V3, ["nope"]),
+                (NUM_PLANES_V4, ["pawn_files"]), (NUM_PLANES_V3, ["lost_fresh"])):
         try:
             PolicyValueNet(8, 1, *bad)
         except ValueError:
@@ -159,10 +176,12 @@ def check_widen_mmd():
     # --init から始めたばかり（Adam の状態が空）の checkpoint も広げられる
     empty = MMDLearner(PolicyValueNet(8, 1, NUM_PLANES_DEDUCED), make_config(), DEV).state_dict()
     assert widen_checkpoint(empty, NUM_PLANES_V4, ["king_fouls"])["config"]["extras"] == ["king_fouls"]
+    assert widen_checkpoint(empty, NUM_PLANES_V5, ["pawn_files"])["config"]["extras"] == ["pawn_files"]
 
 
 def check_add_later():
-    """v3 で opp_hand だけ使って学習した後に、opp_fouls を足す（101枚のまま）・king_fouls を足す（102枚へ広げる）"""
+    """v3 で opp_hand だけ使って学習した後に、opp_fouls を足す（101枚のまま）・king_fouls を足す（102枚へ広げる）・
+    v5 の組を足す（124枚へ広げる）"""
     lr = rnad_learner(NUM_PLANES_V3, ["opp_hand"])
     for s in range(3):
         step(lr, NUM_PLANES_V3, seed=10 + s)
@@ -170,9 +189,12 @@ def check_add_later():
     fouls = span("opp_fouls")
     before = ck["opt"]["state"][0]["exp_avg_sq"][:, fouls]
     torch.manual_seed(4)
-    x = torch.rand(16, NUM_PLANES_V4, 9, 9) * 2
+    x = torch.rand(16, NUM_PLANES_V5, 9, 9) * 2
     for planes, extras, added in ((NUM_PLANES_V3, ["opp_hand", "opp_fouls"], fouls),
-                                  (NUM_PLANES_V4, ["opp_hand", "king_fouls"], span("king_fouls"))):
+                                  (NUM_PLANES_V4, ["opp_hand", "king_fouls"], span("king_fouls")),
+                                  (NUM_PLANES_V5, ["opp_hand", "lost_roles", "pawn_files"],
+                                   span("lost_roles") + span("pawn_files")),
+                                  (NUM_PLANES_V5, ["opp_hand", *V5_GROUPS], [i for n in V5_GROUPS for i in span(n)])):
         wide = widen_checkpoint(ck, planes, extras)
         assert wide["config"]["planes"] == planes and wide["config"]["extras"] == sorted(extras)
         other = RNaDLearner(PolicyValueNet.from_config(wide["config"]), CFG, DEV)
@@ -187,7 +209,8 @@ def check_add_later():
     after = widen_checkpoint(ck, NUM_PLANES_V3, ["opp_hand", "opp_fouls"])["opt"]["state"][0]["exp_avg_sq"][:, fouls]
     assert not torch.equal(before, after), "使っていなかった組の 2次モーメントを入れ直していない"
     for planes, bad in ((NUM_PLANES_V3, ["opp_fouls"]), (NUM_PLANES_V3, ["opp_hand"]),
-                        (NUM_PLANES_V3, ["opp_hand", "king_fouls"])):
+                        (NUM_PLANES_V3, ["opp_hand", "king_fouls"]), (NUM_PLANES_V4, ["opp_hand", "cap_roles"]),
+                        (NUM_PLANES_V5, ["cap_roles"])):
         try:
             widen_checkpoint(ck, planes, bad)
         except ValueError:
@@ -234,15 +257,24 @@ def check_with_extras():
     assert v4["config"]["planes"] == NUM_PLANES_V4 and v4["config"]["extras"] == ["king_fouls", "opp_fouls"]
     only_king = train_rnad.with_extras(ck, ["king_fouls"], "v2")
     assert only_king["config"]["planes"] == NUM_PLANES_V4 and only_king["config"]["extras"] == ["king_fouls"]
+    # v4 の checkpoint に v5 の組を足す（124枚へ広がる）・v2 から v5 の組だけ
+    v5 = train_rnad.with_extras(v4, ["opp_fouls", "king_fouls", "pawn_files", "lost_fresh"], "v4")
+    assert v5["config"]["planes"] == NUM_PLANES_V5
+    assert v5["config"]["extras"] == ["king_fouls", "lost_fresh", "opp_fouls", "pawn_files"]
+    assert train_rnad.with_extras(v5, ["opp_fouls", "king_fouls", "pawn_files", "lost_fresh"], "v5") is v5
+    only_cap = train_rnad.with_extras(ck, ["cap_roles"], "v2")
+    assert only_cap["config"]["planes"] == NUM_PLANES_V5 and only_cap["config"]["extras"] == ["cap_roles"]
     v1 = RNaDLearner(PolicyValueNet(8, 1, NUM_PLANES), CFG, DEV).state_dict()
-    for c, want in ((wide, []), (wide, ["opp_hand"]), (v4, ["opp_fouls"]), (v1, ["opp_hand"])):
+    for c, want in ((wide, []), (wide, ["opp_hand"]), (v4, ["opp_fouls"]), (v1, ["opp_hand"]),
+                    (v5, ["opp_fouls", "king_fouls", "pawn_files"]), (v1, ["lost_roles"])):
         try:
             train_rnad.with_extras(c, want, "x")
         except SystemExit:
             pass
         else:
             raise AssertionError(f"{c['config']} → {want} を受け付けた")
-    for extras, planes in ((["opp_hand"], NUM_PLANES_V3), (["king_fouls"], NUM_PLANES_V4)):
+    for extras, planes in ((["opp_hand"], NUM_PLANES_V3), (["king_fouls"], NUM_PLANES_V4),
+                           (["lost_fresh"], NUM_PLANES_V5), (sorted(EXTRA_PLANES), NUM_PLANES_V5)):
         net = train_rnad.load_net("none", 8, 1, extras=extras)
         assert net.config["planes"] == planes and net.config["extras"] == extras
 

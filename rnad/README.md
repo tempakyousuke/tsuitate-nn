@@ -42,7 +42,7 @@ ARENA_MATCH_SEED=20260927 cargo run --release --bin arena -- 100 "rl_policy:<pol
 | `model.py` | 方策・価値ネット（ResNet。方策 [139,9,9]、価値 tanh）。**層を変えたら tsuitate-bot の `src/rl/policy_net.rs` と `export_weights.py` も直す** |
 | `train_bc.py` | 記録を真似る教師あり学習。局単位で学習/検証を分ける |
 | `export_weights.py` | Rust 推論用の重み（`TSRLPV01` 形式、BatchNorm は畳み込みへ畳み込む）。`--tiny --test-vector` で tsuitate-bot のテスト用フィクスチャを作る |
-| `widen_planes.py` | checkpoint の入力プレーンを広げる（v1 → v2）・v3 / v4 の組を足す（`--opp-hand-planes` / `--opp-foul-planes` / `--king-foul-planes`）。足した列は 0 で、元と同じ関数のまま。R-NaD・MMD の checkpoint を読める（下の「入力プレーン」） |
+| `widen_planes.py` | checkpoint の入力プレーンを広げる（v1 → v2）・v3 以降の組を足す（`--opp-hand-planes` / `--opp-foul-planes` / `--king-foul-planes` / v5 の `--lost-fresh-planes` / `--lost-role-planes` / `--cap-role-planes` / `--pawn-file-planes`）。足した列は 0 で、元と同じ関数のまま。R-NaD・MMD の checkpoint を読める（下の「入力プレーン」） |
 | `fetch_records.py` | GitHub Actions の対局記録を取る |
 | `league.py` | リーグ学習の相手の選び方（負けやすい相手ほど多く当てる） |
 | `guard.py` | 防御特化（玉の周りの固め）の監視値の集計 |
@@ -96,23 +96,32 @@ ARENA_MATCH_SEED=20260927 cargo run --release --bin arena -- 100 "rl_policy:<pol
 | `--panel <panel.json>` | 学習ループの中で固定パネルを測り `panel_eval.jsonl` へ（`speedlab.py report` の入力と同じ形） |
 | `--planes` / `--threads` | `--init none` の入力のプレーン数 / torch のスレッド数 |
 
-## 入力プレーン（エンコーダ v3 / v4、tsuitate-bot の `docs/rl-deepnash-design.md`「エンコーダ v3」）
+## 入力プレーン（エンコーダ v3 / v4 / v5、tsuitate-bot の `docs/rl-deepnash-design.md`「エンコーダ v3」）
 
-v2（91枚）の後ろに観測と自分側だけで決まる事実を足した 101枚（v3）・102枚（v4）。**組ごとに別のフラグ**で使うかを選べるので、
-効果を組ごとに測れる（既定は付けない = v2 のまま）。プレーン数は選んだ組が入る最小の版になる:
+v2（91枚）の後ろに観測と自分側だけで決まる事実を足した 101枚（v3）・102枚（v4）・124枚（v5）。**組ごとに別のフラグ**で使うかを
+選べるので、効果を組ごとに測れる（既定は付けない = v2 のまま）。プレーン数は選んだ組が入る最小の版になる:
 
 | フラグ | 組 | 中身 |
 | --- | --- | --- |
 | `--opp-hand-planes` | `opp_hand`（7枚） | 相手の持ち駒の上界（駒種別。取られた自駒の数で抑える） |
 | `--opp-foul-planes` | `opp_fouls`（3枚） | 相手の反則の時系列（直前の手番 / 王手を受けていた手番 / 受けていない手番） |
 | `--king-foul-planes` | `king_fouls`（1枚、v4） | 自玉の移動で反則したマス（鮮度は反則した手数から。その後に玉がそこへ移動できたら消える） |
+| `--lost-fresh-planes` | `lost_fresh`（7枚、v5） | 取られた駒種ごとの、最後に取られた手数からの鮮度（全面。相手がその駒種をまだ持っていそうかの目安） |
+| `--lost-role-planes` | `lost_roles`（7枚、v5） | 取られた駒種ごとのマス（回数で、薄れない。v1 の取られたマスは駒種を持たない） |
+| `--cap-role-planes` | `cap_roles`（7枚、v5） | 取った駒種ごとのマス（回数で、薄れない。v1 の取った駒種のプレーンは1手ごとに薄れ、同じマスの2回目で上書きされる） |
+| `--pawn-file-planes` | `pawn_files`（1枚、v5） | 相手の歩を取った筋（筋の全マスに回数、薄れない。相手がその筋に歩を打てる = 歩が切れているかの勘定） |
 
-- `train_rnad.py` に付けると、v2 / v3 の checkpoint（`out/checkpoint.pt` の再開でも `--init` でも）を読み込み時に組が入る版へ広げる
-  （v3 の実験の checkpoint に `--king-foul-planes` を足せば 102枚になる）。
+ゼロから学習し直すときに全部入れるなら（`--init none`。124枚になる）:
+
+    --opp-hand-planes --opp-foul-planes --king-foul-planes \
+    --lost-fresh-planes --lost-role-planes --cap-role-planes --pawn-file-planes
+
+- `train_rnad.py` に付けると、v2 以降の checkpoint（`out/checkpoint.pt` の再開でも `--init` でも）を読み込み時に組が入る版へ広げる
+  （v3 の実験の checkpoint に `--king-foul-planes` を足せば 102枚、v5 の組を足せば 124枚になる）。
   足した列は 0 なので元と同じ関数から始まる（Adam の 2次モーメントは使っている列の平均で入れ直す）
 - 一度足した組は以後の再開でも同じフラグを付ける（付け忘れると止まる。組は外せない）。後から組を足すのはフラグを足すだけ
 - 使わない組はネットが入力を 0 にしてから読む（`config["extras"]`）ので、stem のその列は 0 のまま動かず、書き出した重みでも 0。
-  Rust 側は v3 / v4 の観測を全部書くだけで、組の選び方を知らなくてよい。錨・リーグ・パネルの v1〜v3 のネットは観測の先頭だけを読む
+  Rust 側は観測を全部書くだけで、組の選び方を知らなくてよい。錨・リーグ・パネルの前の版（v1〜v4）のネットは観測の先頭だけを読む
 - 同じことを学習の外で行うなら `widen_planes.py <元> <出力> --opp-hand-planes`（v3 の checkpoint に組を足すときも同じ）
 - 検査は `tests/test_extra_planes.py`（tsuitate_rl が入っていれば Rust 側の組の並びとも照合する）
 

@@ -179,17 +179,21 @@ def check_resume_cpu_league():
 
 
 def check_pool_mixed_planes():
-    """入力の版が違う相手（v1 86枚・v2 91枚・v3 101枚・v4 102枚〔組の選び方も違う〕）を1つの pool に積んでも、
-    相手ごとの推論と一致する。v3 / v4 の組のプレーンには 0 でない値を入れて確かめる（初期局面では全部 0 で、
+    """入力の版が違う相手（v1 86枚・v2 91枚・v3 101枚・v4 102枚・v5 124枚〔組の選び方も違う〕）を1つの pool に積んでも、
+    相手ごとの推論と一致する。v3 以降の組のプレーンには 0 でない値を入れて確かめる（初期局面では全部 0 で、
     組を読まなくなる間違いが見えない）"""
-    from model import NUM_PLANES_DEDUCED, NUM_PLANES_V3, NUM_PLANES_V4
+    from model import NUM_PLANES_DEDUCED, NUM_PLANES_V3, NUM_PLANES_V4, NUM_PLANES_V5
     from rnad import pad_planes
     for top, specs in [(NUM_PLANES_V3, [(86, ()), (NUM_PLANES_DEDUCED, ()), (NUM_PLANES_V3, ("opp_hand",)),
                                         (NUM_PLANES_V3, ("opp_hand", "opp_fouls"))]),
                        (NUM_PLANES_V4, [(NUM_PLANES_DEDUCED, ()), (NUM_PLANES_V3, ("opp_hand",)),
-                                        (NUM_PLANES_V4, ("king_fouls",)), (NUM_PLANES_V4, ("opp_hand", "king_fouls"))])]:
+                                        (NUM_PLANES_V4, ("king_fouls",)), (NUM_PLANES_V4, ("opp_hand", "king_fouls"))]),
+                       (NUM_PLANES_V5, [(NUM_PLANES_DEDUCED, ()), (NUM_PLANES_V4, ("opp_hand", "king_fouls")),
+                                        (NUM_PLANES_V5, ("lost_roles", "pawn_files")),
+                                        (NUM_PLANES_V5, ("opp_hand", "opp_fouls", "king_fouls", "lost_fresh",
+                                                         "lost_roles", "cap_roles", "pawn_files"))])]:
         _check_pool_mixed(top, specs, pad_planes)
-    print("OK: 入力の版が違う相手（86 / 91 / 101 / 102枚）を1つの pool に積んでも、相手ごとの推論と一致する")
+    print("OK: 入力の版が違う相手（86 / 91 / 101 / 102 / 124枚）を1つの pool に積んでも、相手ごとの推論と一致する")
 
 
 def _check_pool_mixed(top, specs, pad_planes):

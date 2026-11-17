@@ -949,7 +949,7 @@ def _gumbel_sample(logits, legal, generator):
 
 def pad_planes(net, planes: int):
     """入力を `planes` 枚に広げた、**同じ関数**のネット（足した stem の列は 0。観測の先頭が同じなので、広い観測を渡しても
-    元のネットと同じ出力になる）。v3 / v4 の「使わない組を 0 にしてから読む」マスクは外す（その列の重みはもともと 0 のまま
+    元のネットと同じ出力になる）。v3 以降の「使わない組を 0 にしてから読む」マスクは外す（その列の重みはもともと 0 のまま
     なので結果は同じ）。相手のネットをまとめて推論する `OpponentPool` が、入力の版の違う相手を1つに積むために使う"""
     from model import EXTENDED_PLANES, EXTRA_PLANES, inference_net
     cfg = net.config
@@ -1000,7 +1000,7 @@ class OpponentPool:
         from torch.func import functional_call, stack_module_state
         self.names = list(nets)
         self.index = {n: i for i, n in enumerate(self.names)}
-        # 入力の版（v1 = 86枚 / v2 = 91枚 / v3 = 101枚 / v4 = 102枚）が違う相手は、いちばん広い版にそろえてから積む
+        # 入力の版（v1 = 86枚 / v2 = 91枚 / v3 = 101枚 / v4 = 102枚 / v5 = 124枚）が違う相手は、いちばん広い版にそろえてから積む
         # （`pad_planes`。足した列は 0 なので同じ関数）。それまでは版が混ざると積めずに落ちていた
         planes = max(n.config["planes"] for n in nets.values())
         self.planes = planes
