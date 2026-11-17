@@ -173,7 +173,7 @@ def keyed_actions(net, obs, mask, games, decs, salt, device=DEV, temp=1.0):
 
 @torch.no_grad()
 def play_vs(a_net, b: Member, games: int, seed: int, planes: int, per_game: bool = False, device=DEV, a_temp=1.0,
-            open_kw=None, finished=None):
+            open_kw=None, finished=None, open_both=False):
     """a_net（PyTorch）と b を games 局（偶数番の局で a が先手）。a から見た (勝, 負, 分)（per_game なら局番号ごとの
     結果 1 / 0 / −1 の配列）。
     手は `keyed_actions`（局ごとの共通乱数）で選ぶので、同じ (b, games, seed) で測った書き出しどうしは局ごとに対になる。
@@ -181,14 +181,17 @@ def play_vs(a_net, b: Member, games: int, seed: int, planes: int, per_game: bool
     `open_kw`（`openings.env_kwargs(book, p)`）を渡すと、**a の側だけ**序盤を定跡から指させる（序盤を強制して学習した
     ネットは初期局面から自分で指したことが無いので、強制なしでは学習していない範囲を測ることになる）。ラインは
     (seed, 局番号) で決まるので、同じ (b, games, seed) の測定どうしは同じラインの組になる。
+    `open_both` なら **b の側も**定跡から指させる（b も序盤を強制して学習したネットのとき。b が PyTorch のネットのときだけ）。
     `finished` にリストを渡すと、終局の記録（`VecEnv.pop_finished`）を足す"""
     salt = seed
-    open_kw = {**open_kw, "opening_sides": "learner"} if open_kw else {}
+    if open_both and (not open_kw or b.net is None):
+        raise ValueError("open_both は open_kw を渡し、相手が PyTorch のネットのときだけ")
+    open_kw = {**open_kw, "opening_sides": "both" if open_both else "learner"} if open_kw else {}
     dec = np.zeros(games, dtype=np.int64)  # 局ごとの手番の数（反則で指し直した手番も数える）
     if b.net is not None:
         # 自己対局モードでは「偶数番の局で a が先手」を env に伝えて a の側を決める
         env = tsuitate_rl.VecEnv(games, seed=seed, auto_reset=False, **planes_kw(planes), **open_kw,
-                                 **({"opening_index_learner": True} if open_kw else {}))
+                                 **({"opening_index_learner": True} if open_kw and not open_both else {}))
         a_color = np.arange(games) % 2
     else:
         # Rust の戦略が相手: 評価モード（偶数番の局で学習側が先手。相手の手番は env の中で進む）
