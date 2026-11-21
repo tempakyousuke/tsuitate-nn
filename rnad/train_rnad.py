@@ -385,6 +385,10 @@ def main() -> None:
                          "（相手は強制しない。パネルの JSON の open_both に名前を並べた相手だけは相手の側も強制する = "
                          "相手も序盤を強制して学習したネットのとき）。--open-p 1 で学習したネットは初期局面から自分で指したことが無いので 1 にする。"
                          "強制なしの記録とは比べられない（panel_eval.jsonl の行に open_p が付く）")
+    ap.add_argument("--panel-open-book", default=None,
+                    help="パネルの JSON の open_opponent に名前を並べた相手に、相手の側だけ序盤を指させる定跡（省略すると --open-book）。"
+                         "学習するネットは強制なし・相手は序盤を 100% 強制して学習したネットのとき（相手は初期局面から自分で"
+                         "指したことが無い）。確率はいつも 1。--panel-open-p とは別に効く")
     ap.add_argument("--reseed", action="store_true",
                     help="再開時に checkpoint の乱数状態を使わず --seed で乱数を初めから作り直す（同じ checkpoint から "
                          "seed だけ変えた複製の対照を回すとき。付けないと checkpoint の乱数状態が戻り、同じ自己対局が再生される）")
@@ -942,6 +946,15 @@ def main() -> None:
         bad = sorted(panel_open_both - {m.name for m in panel_members if m.net is not None})
         if bad or (panel_open_both and not args.panel_open_p):
             raise SystemExit(f"パネルの open_both は --panel-open-p を付け、ネットの相手の名前を並べる（{' '.join(bad)}）")
+        # 相手の側だけ定跡から指させる相手（測られる側は強制なしで学習したネット、相手は序盤を強制して学習したネット）
+        panel_open_opp = set(panel.get("open_opponent", []))
+        panel_opp_book = args.panel_open_book or args.open_book
+        bad = sorted((panel_open_opp - {m.name for m in panel_members if m.net is not None}) | (panel_open_opp & panel_open_both))
+        if bad or (panel_open_opp and not panel_opp_book):
+            raise SystemExit("パネルの open_opponent は --panel-open-book（か --open-book）を付け、ネットの相手の名前を並べる"
+                             f"（open_both とは重ねない。{' '.join(bad)}）")
+        panel_opp_kw = (openings.env_kwargs(openings.load_book(panel_opp_book, args.open_weight), 1.0,
+                                            openings.parse_len(args.open_len)) if panel_open_opp else {})
 
     def panel_eval(step):
         """パネルの各相手と局ごとの結果を panel_eval.jsonl へ（speedlab.py eval と同じ形・同じ seed の決め方）"""
@@ -952,14 +965,16 @@ def main() -> None:
                 res = []
                 for m in panel_members:
                     o = speedlab.play_vs(nets[which], m, args.panel_games, speedlab.EVAL_SEED + speedlab.stable_seed(m.name),
-                                         panel_planes, per_game=True, device=device, open_kw=panel_open_kw,
-                                         open_both=m.name in panel_open_both)
+                                         panel_planes, per_game=True, device=device,
+                                         open_kw=panel_opp_kw if m.name in panel_open_opp else panel_open_kw,
+                                         open_both=m.name in panel_open_both, open_opponent=m.name in panel_open_opp)
                     w, l, d = int((o > 0).sum()), int((o < 0).sum()), int((o == 0).sum())
                     res.append((m.name, w, l, d))
                     f.write(json.dumps({"step": step, "which": which, "opponent": m.name, "w": w, "l": l, "d": d,
                                         "games": args.panel_games, "outcomes": o.tolist(),
                                         **({"open_p": args.panel_open_p} if args.panel_open_p else {}),
-                                        **({"open_both": True} if m.name in panel_open_both else {})}) + "\n")
+                                        **({"open_both": True} if m.name in panel_open_both else {}),
+                                        **({"open_opponent": True} if m.name in panel_open_opp else {})}) + "\n")
                 f.flush()
                 # レートの無い相手（ratings.json にまだ載っていない新しい版）は勝敗だけを出し、Elo には入れない
                 # （speedlab.load_eval と同じ扱い）
