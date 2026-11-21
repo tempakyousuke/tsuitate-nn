@@ -5,6 +5,7 @@
 - P1 `play_vs`: 相手が PyTorch のネットでも Rust の戦略でも、定跡から指すのは測られる側だけ。同じ seed なら同じラインの組。
   渡さなければ誰も強制されない
   `open_both` なら相手の側も定跡から指す（相手がネットのときだけ）
+  `open_opponent` なら相手の側だけ定跡から指す（相手がネットのときだけ）
 - P2 `train_rnad.py`: `--panel-open-p 1` で panel_eval.jsonl の行に open_p が付き、強制なしの記録がある run を
   測り方を変えて再開すると、その時点も測る
 """
@@ -62,6 +63,21 @@ def check_play_vs(tmp):
             pass
         else:
             raise AssertionError("open_both が通ってしまった")
+    # open_opponent: 相手（ネット）の側だけ定跡から指す。Rust の戦略の相手・open_kw なし・open_both と一緒では使えない
+    fin = []
+    S.play_vs(net, b, games, 77, PLANES, per_game=True, device="cpu", open_kw=kw, finished=fin, open_opponent=True)
+    assert len(fin) == games
+    for f in fin:
+        a = f["game_no"] % 2
+        assert f["forced_line"][a] is None and f["forced_moves"][a] == 0, f
+        assert f["forced_line"][1 - a] is not None and f["forced_moves"][1 - a] >= 1, f
+    for bad_b, bad_kw, both in ((S.Member("heuristic", PLANES, "cpu"), kw, False), (b, None, False), (b, kw, True)):
+        try:
+            S.play_vs(net, bad_b, games, 77, PLANES, device="cpu", open_kw=bad_kw, open_opponent=True, open_both=both)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("open_opponent が通ってしまった")
     print("P1 play_vs: 定跡から指すのは測られる側だけ（相手がネットでも Rust の戦略でも）。同じ seed なら同じラインの組")
 
 
@@ -110,6 +126,26 @@ def check_train(tmp):
                                   "ratings": {"random": 0.0, "heuristic": 100.0}, "open_both": ["heuristic"]}))
     r = run_train(tmp / "both_rust", *common3, "--panel-open-p", "1.0", steps=1, check=False)
     assert r.returncode != 0 and "open_both" in (r.stderr + r.stdout)
+    # open_opponent に並べた相手の行には open_opponent が付く（学習は強制なし、定跡は --panel-open-book）。
+    # 定跡なし・Rust の戦略の名前・open_both と重ねるのは止まる
+    panel4 = tmp / "panel4.json"
+    panel4.write_text(json.dumps({"planes": PLANES, "members": ["random", "heuristic"],
+                                  "ratings": {"random": 0.0, "heuristic": 100.0}, "open_opponent": ["random"]}))
+    common4 = ["--panel", str(panel4), "--panel-games", "4"]
+    run_train(tmp / "opp", *common4, "--panel-open-book", str(book), steps=1)
+    rows = [json.loads(x) for x in open(tmp / "opp" / "panel_eval.jsonl")]
+    assert rows and all(x.get("open_opponent", False) == (x["opponent"] == "random") for x in rows), rows
+    assert not any("open_p" in x or "open_both" in x for x in rows), rows
+    r = run_train(tmp / "opp_nobook", *common4, steps=1, check=False)
+    assert r.returncode != 0 and "open_opponent" in (r.stderr + r.stdout)
+    panel4.write_text(json.dumps({"planes": PLANES, "members": ["random", "heuristic"],
+                                  "ratings": {"random": 0.0, "heuristic": 100.0}, "open_opponent": ["heuristic"]}))
+    r = run_train(tmp / "opp_rust", *common4, "--panel-open-book", str(book), steps=1, check=False)
+    assert r.returncode != 0 and "open_opponent" in (r.stderr + r.stdout)
+    panel4.write_text(json.dumps({"planes": PLANES, "members": ["random", "heuristic"], "ratings": {"random": 0.0, "heuristic": 100.0},
+                                  "open_opponent": ["random"], "open_both": ["random"]}))
+    r = run_train(tmp / "opp_both", "--open-book", str(book), "--open-p", "1.0", *common4, "--panel-open-p", "1.0", steps=1, check=False)
+    assert r.returncode != 0 and "open_opponent" in (r.stderr + r.stdout)
     print("P2 train_rnad.py: --panel-open-p で行に open_p が付き、測り方を変えて再開した時点も測る")
 
 
