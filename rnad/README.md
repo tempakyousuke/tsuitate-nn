@@ -50,6 +50,7 @@ ARENA_MATCH_SEED=20260927 cargo run --release --bin arena -- 100 "rl_policy:<pol
 | `signal_report.py` | 学習ログの `signals` から、学習曲線（得点と主な信号を更新の窓ごとに）と、勝ち局と負け局を分ける信号の表（`--split`）を出す |
 | `ladder_eval.py` | ハンデの梯子（`<相手>@<ε>`）で run の書き出しを測り、ε50（得点が 0.5 になる ε）を出す。勝ちが出る前から同じ相手への近さを追う |
 | `speedlab.py` | 学習の速さの比較: 固定パネル（`panel`）で run の書き出しを測り（`eval`、局ごとに鍵を決めた共通乱数）、腕ごとの学習曲線と対照とのペア差をまとめる（`report`）。締まりの効果を除いて比べるには `eval --decode greedy\|temp:<T>`（記録名 `<which>@greedy` など）、途中から始めた run の起点の書き出しは `export-ck`、起点を何度で指すと締まった腕にそろうかは `temp-match`（`--seed` を変えると別の局になる。パネルの評価の乱数は学習中のパネルの記録と対にするため変えない） |
+| `input_ab.py` | 入力プレーンの A/B を小さい自己対局（32ch×3・1更新 64局・乱数初期化・序盤は定跡を 100% 強制）で比べる: `run` は 腕（入力の版 `v1`〜`v5` か `--arm 名前='引数'`）× seed を `--jobs` 本ずつ回し（途中で止めても続きから。`--time-limit` で止める・`--only 腕:seed,...` でその組だけ）、`status` は進み具合の表、`pending` はまだ届いていない本数、`depend` は書き出した重みが入力の組をどれだけ読んでいるか（組を 0 にしたときの方策の変化）。tsuitate-bot の `input-ab.yml` が CI で使う（対局と集計はあちらの `scripts/ci/input_ab.py`、読み方は `docs/rl-input-ab.md`）。テストは `tests/test_input_ab.py` |
 | `log_windows.py` | 学習ログ（log.jsonl）の見張りの値（エントロピー・π>0.999 の割合・手数・反則・磁石への KL など）を step の窓ごとに平均して並べる。MMD の中止の門の形の指標はこの 100更新の窓の平均で見る（中央値は締まりを小さく見せる） |
 | `openings.py` | 序盤の強制の定跡ブック（tsuitate-bot の `joseki.json` の形式）の読み込み・系統ごとの重み・env へ渡す引数・ログの監視値（`train_rnad.py --open-book`） |
 | `opening_eval.py` | 序盤の多様さ（`entropy`: 初期局面の方策・最初の k 手の並びのエントロピー）と、序盤を強制した対局（`robust`: 相手 / 自分 / 両者の序盤を定跡に強制したときの得点・接触の前の反則を系統ごとに） |
