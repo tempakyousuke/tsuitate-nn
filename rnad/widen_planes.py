@@ -44,7 +44,7 @@ EXTRA_FLAGS = {"opp_hand_planes": "opp_hand", "opp_foul_planes": "opp_fouls", "k
                "pawn_file_planes": "pawn_files",
                "king_tight_planes": "king_tight", "check_clock_planes": "check_clock",
                "checker_memo_planes": "checker_memo", "own_attack_planes": "own_attacks",
-               "king_line_planes": "king_lines", "move_log_planes": "move_log"}
+               "king_line_planes": "king_lines", "opp_count_planes": "opp_counts"}
 # エラーメッセージに出すフラグの一覧
 EXTRA_FLAG_NAMES = " / ".join("--" + f.replace("_", "-") for f in EXTRA_FLAGS)
 
@@ -78,10 +78,9 @@ def add_extra_flags(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--own-attack-planes", action="store_true",
                     help="v6: 自駒の利き（2枚。確実な利き = 隣接と桂の跳びの枚数 / 遮られうる利き = 飛び駒の 2マス目以降の枚数。"
                          "3枚で 1）を入力に使う")
-    ap.add_argument("--move-log-planes", action="store_true",
-                    help="v6: 直近の手の記録（30枚。自分と相手の直近 5手ずつを新しい順に、1手 6枚: 相手のその手が取ったマス・"
-                         "王手だったか・その手番の反則の数 / 自分のその手が駒を取ったか・王手だったか・その手番の反則の数）を"
-                         "入力に使う")
+    ap.add_argument("--opp-count-planes", action="store_true",
+                    help="v6: 相手の手数の合計（4枚、全面。王手をかけてきた手 ÷20・駒を取ってきた手 ÷30・王手をかけながら"
+                         "駒を取ってきた手 ÷10・指した手 ÷100。それぞれ上限 1）を入力に使う")
     ap.add_argument("--king-line-planes", action="store_true",
                     help="v6: 自玉の筋（2枚。8方向に最初の自駒の手前までのマス / その最初の自駒で、先に自駒でないマスが"
                          "続くもの = ピンされうる駒）を入力に使う")

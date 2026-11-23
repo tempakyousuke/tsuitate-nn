@@ -1000,7 +1000,7 @@ class OpponentPool:
         from torch.func import functional_call, stack_module_state
         self.names = list(nets)
         self.index = {n: i for i, n in enumerate(self.names)}
-        # 入力の版（v1 = 86枚 / v2 = 91枚 / v3 = 101枚 / v4 = 102枚 / v5 = 124枚 / v6 = 166枚）が違う相手は、いちばん広い版にそろえてから積む
+        # 入力の版（v1 = 86枚 / v2 = 91枚 / v3 = 101枚 / v4 = 102枚 / v5 = 124枚 / v6 = 140枚）が違う相手は、いちばん広い版にそろえてから積む
         # （`pad_planes`。足した列は 0 なので同じ関数）。それまでは版が混ざると積めずに落ちていた
         planes = max(n.config["planes"] for n in nets.values())
         self.planes = planes
