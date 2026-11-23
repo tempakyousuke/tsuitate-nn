@@ -69,7 +69,7 @@ def add_extra_flags(ap: argparse.ArgumentParser) -> None:
                     help="v5: 相手の歩を取った筋（1枚。筋の全マスに回数、薄れない = 相手がその筋に歩を打てる）を入力に使う")
     ap.add_argument("--king-tight-planes", action="store_true",
                     help="v6: 相手玉がいうるマスの締めた版（1枚。相手の駒取り・王手・動いていた駒の手では広げない）を入力に使う。"
-                         "元の候補（確定事実の 89番）は読まなくなる（締めた版の部分集合で、新しい情報が無いため）。"
+                         "元の候補（確定事実の 89番）は読まなくなる（締めた版を含む広い集合で、締めた版がある限り新しい情報が無いため）。"
                          "既存の checkpoint に足すと、89番の列の重みを締めた版の列へ移す")
     ap.add_argument("--check-clock-planes", action="store_true",
                     help="v6: 王手からの手数（6枚、全面。王手をかけた / 受けたことがあるか・最後の王手からの相手の手数・"
