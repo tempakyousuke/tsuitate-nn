@@ -38,7 +38,7 @@ V3 = "--opp-hand-planes --opp-foul-planes"
 V4 = f"{V3} --king-foul-planes"
 V5 = f"{V4} --lost-fresh-planes --lost-role-planes --cap-role-planes --pawn-file-planes"
 V6 = (f"{V5} --king-tight-planes --check-clock-planes --checker-memo-planes --own-attack-planes "
-      "--king-line-planes")
+      "--king-line-planes --move-log-planes")
 # 入力の版ごとの引数（v3 以降は組のフラグ。プレーン数は選んだ組が入る最小の版になる）
 ARMS = {"v1": "--planes 86", "v2": "--planes 91", "v3": f"--planes 91 {V3}", "v4": f"--planes 91 {V4}",
         "v5": f"--planes 91 {V5}", "v6": f"--planes 91 {V6}"}
