@@ -47,6 +47,15 @@ EXTRA_PLANES = {
     "own_attacks": (132, 2),  # v6: 自駒の利き（確実な利きの枚数 / 遮られうる利きの枚数）
     "king_lines": (134, 2),  # v6: 自玉の筋（最初の自駒の手前まで / ピンされうる自駒）
 }
+# **組を使うと読まなくなるプレーン**（2026-11-23）。`king_tight`（締めた相手玉の候補）は確定事実の 89番（相手玉が
+# いうるマス）の部分集合で、締めた版がある限り 89番は相手玉の位置について新しい情報を持たない。残すと、同じ値の
+# 手番で勾配を分け合い、既存のネットを広げたときは 89番に付いた重みが残って締めた版へ移りにくい。そこで
+# `king_tight` を使うネットは 89番を読まない（入力を 0 にする。`config["drop"]`）。**観測の並びは変えない**ので、
+# 89番を読むネット（v2〜v5 の相手・錨・パネル）は同じ観測をそのまま読める。`config["drop"]` を持たないネットは
+# これまでどおり全部読む（`pad_planes` が作る「入る組を全部読む」ネットも、drop は空）
+DROPPABLE_PLANES = {"king_wide": 89}
+# 組の名前 → その組を使うと読まなくなるプレーンの名前
+REPLACES = {"king_tight": "king_wide"}
 NUM_ACTION_KINDS = 139
 
 
@@ -73,13 +82,33 @@ def normalize_extras(planes: int, extras) -> list:
     return extras
 
 
-def unused_planes(planes: int, extras) -> list:
-    """ネットが使わない入力プレーンの番号（v3 以降で選ばなかった組）。v1・v2 は空"""
-    if planes not in EXTENDED_PLANES:
-        return []
-    extras = normalize_extras(planes, extras)
-    return [i for name, (s, n) in EXTRA_PLANES.items()
-            if name not in extras and s + n <= planes for i in range(s, s + n)]
+def default_drop(extras) -> list:
+    """組 `extras` を新しく使うネットが読まなくなるプレーンの名前（`REPLACES`）"""
+    return sorted({REPLACES[n] for n in extras or () if n in REPLACES})
+
+
+def normalize_drop(planes: int, drop) -> list:
+    """読まないプレーンの名前（並べ替え済み）"""
+    drop = sorted(set(drop or ()))
+    unknown = set(drop) - set(DROPPABLE_PLANES)
+    if unknown:
+        raise ValueError(f"知らない読まないプレーン: {sorted(unknown)}（{sorted(DROPPABLE_PLANES)} のどれか）")
+    over = [n for n in drop if DROPPABLE_PLANES[n] >= planes]
+    if over:
+        raise ValueError(f"読まないプレーン {over} は {planes}枚のネットに無い")
+    return drop
+
+
+def unused_planes(planes: int, extras, drop=None) -> list:
+    """ネットが使わない入力プレーンの番号（v3 以降で選ばなかった組と、`drop` のプレーン）。昇順。
+    `drop` を省くと、組から決まる既定（`default_drop`）= `PolicyValueNet(…, extras)` で作ったネットと同じ"""
+    drop = default_drop(extras) if drop is None else drop
+    off = {DROPPABLE_PLANES[n] for n in normalize_drop(planes, drop)}
+    if planes in EXTENDED_PLANES:
+        extras = normalize_extras(planes, extras)
+        off |= {i for name, (s, n) in EXTRA_PLANES.items()
+                if name not in extras and s + n <= planes for i in range(s, s + n)}
+    return sorted(off)
 
 
 class ResBlock(nn.Module):
@@ -97,16 +126,21 @@ class ResBlock(nn.Module):
 
 
 class PolicyValueNet(nn.Module):
-    def __init__(self, channels: int = 64, blocks: int = 6, planes: int = NUM_PLANES, extras=()):
+    def __init__(self, channels: int = 64, blocks: int = 6, planes: int = NUM_PLANES, extras=(), drop=None):
+        """`drop` = 読まないプレーンの名前（`DROPPABLE_PLANES`）。省くと組から決まる既定（`king_tight` を使うなら
+        元の相手玉の候補を読まない）。checkpoint・重みのヘッダから作るときは保存された値をそのまま使う（`from_config`）"""
         super().__init__()
         extras = normalize_extras(planes, extras)
+        drop = normalize_drop(planes, default_drop(extras) if drop is None else drop)
         self.config = {"planes": planes, "channels": channels, "blocks": blocks}
         if planes in EXTENDED_PLANES:
             self.config["extras"] = extras
+        if drop:  # 無いときはキーを足さない（これまでの checkpoint・重みのヘッダと同じ形のまま）
+            self.config["drop"] = drop
         self.stem = nn.Conv2d(planes, channels, 3, padding=1, bias=False)
-        # 使わない入力プレーン（v3 以降で選ばなかった組）。入力を 0 にするので stem のその列には勾配が来ず、
+        # 使わない入力プレーン（v3 以降で選ばなかった組と、読まないプレーン）。入力を 0 にするので stem のその列には勾配が来ず、
         # 0 で始めた列は 0 のまま（書き出した重みも 0）。state_dict には入れない（config から作り直せる）
-        off = unused_planes(planes, extras)
+        off = unused_planes(planes, extras, drop)
         if off:
             mask = torch.zeros(planes, dtype=torch.bool)
             mask[off] = True
@@ -143,7 +177,8 @@ class PolicyValueNet(nn.Module):
     @classmethod
     def from_config(cls, config: dict) -> "PolicyValueNet":
         """checkpoint の `config`（や重みファイルのヘッダ）からネットの形を作る（v3 以降の組の選び方も含む）"""
-        return cls(config["channels"], config["blocks"], config["planes"], config.get("extras", ()))
+        return cls(config["channels"], config["blocks"], config["planes"], config.get("extras", ()),
+                   drop=config.get("drop", ()))
 
     def forward(self, x):
         return self.heads(self.trunk(x))

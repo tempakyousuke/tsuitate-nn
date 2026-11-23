@@ -85,6 +85,10 @@ def with_extras(ck: dict, want: list, what, verbose: bool = True) -> dict:
     if verbose:
         print(f"{what} の入力プレーンを {cfg['planes']} → {planes}枚に（組 {have} → {sorted(want)}。"
               "足した列は 0 なので元と同じ関数から始まる）", flush=True)
+        moved = sorted(set(out["config"].get("drop", ())) - set(cfg.get("drop", ())))
+        if moved:
+            print(f"  ただし {moved} は読まなくなり、その列の重みは置き換える組の列へ移した"
+                  "（元の相手玉の候補の代わりに締めた候補を読むネットから始まる）", flush=True)
     return out
 
 

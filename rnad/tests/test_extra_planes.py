@@ -25,8 +25,8 @@ sys.path.insert(0, str(HERE.parent))
 from export_weights import read as read_weights  # noqa: E402
 from export_weights import write as write_weights  # noqa: E402
 from mmd import MMDLearner, make_config  # noqa: E402
-from model import (EXTRA_PLANES, NUM_PLANES, NUM_PLANES_DEDUCED, NUM_PLANES_V3, NUM_PLANES_V4,  # noqa: E402
-                   NUM_PLANES_V5, NUM_PLANES_V6, PolicyValueNet, planes_for, unused_planes)
+from model import (DROPPABLE_PLANES, EXTRA_PLANES, NUM_PLANES, NUM_PLANES_DEDUCED, NUM_PLANES_V3,  # noqa: E402
+                   NUM_PLANES_V4, NUM_PLANES_V5, NUM_PLANES_V6, PolicyValueNet, planes_for, unused_planes)
 from rnad import RNaDConfig, RNaDLearner  # noqa: E402
 from widen_planes import EXTRA_FLAGS, add_extra_flags, extras_from_args, widen_checkpoint  # noqa: E402
 
@@ -52,6 +52,18 @@ V5_GROUPS = ["lost_fresh", "lost_roles", "cap_roles", "pawn_files"]
 def span(name):
     s, n = EXTRA_PLANES[name]
     return list(range(s, s + n))
+
+
+KING_WIDE, KING_TIGHT = DROPPABLE_PLANES["king_wide"], EXTRA_PLANES["king_tight"][0]
+
+
+def as_before(x, old_planes, extras):
+    """広げる前のネットに渡す入力: 先頭 `old_planes` 枚。`king_tight` を足したネットは元の相手玉の候補（89番）の代わりに
+    締めた候補（124番）を読むので、比べる相手の 89番には 124番の値を入れる"""
+    xb = x[:, :old_planes].clone()
+    if "king_tight" in extras:
+        xb[:, KING_WIDE] = x[:, KING_TIGHT]
+    return xb
 
 
 def step(learner, planes, seed=0):
@@ -157,11 +169,14 @@ def check_widen_rnad():
         torch.manual_seed(1)
         x = torch.rand(16, planes, 9, 9) * 2
         for name in ("net", "target", "prev", "prev_"):
-            same(getattr(base, name), getattr(other, name), x[:, :NUM_PLANES_DEDUCED], x, f"{planes} {extras} {name}")
+            same(getattr(base, name), getattr(other, name), as_before(x, NUM_PLANES_DEDUCED, extras), x,
+                 f"{planes} {extras} {name}")
         st = other.opt.state_dict()["state"][0]
         assert st["exp_avg_sq"].shape[1] == planes
         assert (st["exp_avg_sq"][:, NUM_PLANES_DEDUCED:] > 0).all()
-        assert (st["exp_avg"][:, NUM_PLANES_DEDUCED:] == 0).all()
+        # 足した列の 1次モーメントは 0 から。締めた相手玉の候補だけは元の候補の列から移したもの
+        zero = [i for i in range(NUM_PLANES_DEDUCED, planes) if not ("king_tight" in extras and i == KING_TIGHT)]
+        assert (st["exp_avg"][:, zero] == 0).all()
         step(other, planes, seed=2)
 
 
@@ -177,7 +192,8 @@ def check_widen_mmd():
         torch.manual_seed(1)
         x = torch.rand(16, planes, 9, 9) * 2
         for name in ("net", "target", "magnet_net"):
-            same(getattr(base, name), getattr(other, name), x[:, :NUM_PLANES_DEDUCED], x, f"MMD {extras} {name}")
+            same(getattr(base, name), getattr(other, name), as_before(x, NUM_PLANES_DEDUCED, extras), x,
+                 f"MMD {extras} {name}")
         assert (other.opt.state_dict()["state"][0]["exp_avg_sq"][:, NUM_PLANES_DEDUCED:] > 0).all()
         step(other, planes, seed=2)
     # --init から始めたばかり（Adam の状態が空）の checkpoint も広げられる
@@ -242,9 +258,74 @@ def check_export():
         same(net, back, x, x, f"書き出し {planes} {extras}")
         # 読み戻したネットを、入力を消さないネット（Rust 側と同じ = 観測を全部読む）に移しても同じ
         every = [n for n, (s, k) in EXTRA_PLANES.items() if s + k <= planes]
-        raw = PolicyValueNet(8, 1, planes, every)
+        raw = PolicyValueNet(8, 1, planes, every, drop=())
         raw.load_state_dict(back.state_dict())
         same(back, raw, x, x, f"使わない組の列が 0 でない {planes} {extras}")
+
+
+def check_replace():
+    """締めた相手玉の候補（king_tight）は、元の候補（確定事実の 89番）の代わりに読む:
+    - 組を選んで作ったネットは 89番を読まない（config の drop。入力を変えても出力が同じ・列は 0・勾配が来ない）
+    - 組を選ばないネット・drop を空にしたネット（全部読む = pad_planes と Rust 側）は 89番を読む
+    - 既存の checkpoint に足すと、89番の列の重みと Adam の状態を 124番へ移す。広げた直後は「89番の代わりに 124番を
+      読む」ネットで、89番の値にはよらない。もう一度別の組を足しても移し直さない
+    - 書き出した重みは 89番の列が 0 で、ヘッダに drop が残る"""
+    from rnad import pad_planes
+    torch.manual_seed(7)
+    x = torch.rand(8, NUM_PLANES_V6, 9, 9)
+    y = x.clone()
+    y[:, KING_WIDE] = torch.rand(8, 9, 9) * 3
+    tight = rnad_learner(NUM_PLANES_V6, ["king_tight"]).net
+    assert tight.config["drop"] == ["king_wide"] and KING_WIDE in unused_planes(NUM_PLANES_V6, ["king_tight"])
+    assert (tight.stem.weight[:, KING_WIDE] == 0).all()
+    same(tight, tight, x, y, "king_tight のネットが 89番を読んだ")
+    plain = rnad_learner(NUM_PLANES_V6, ["check_clock"]).net
+    assert "drop" not in plain.config and KING_WIDE not in unused_planes(NUM_PLANES_V6, ["check_clock"])
+    assert (plain.stem.weight[:, KING_WIDE] != 0).any()
+    every = PolicyValueNet(8, 1, NUM_PLANES_V6, sorted(EXTRA_PLANES), drop=())
+    assert "drop" not in every.config and every.in_off is None
+    # 89番を読む v5 のネットを 136枚へ積み直しても（相手のネットをまとめて推論するとき）、89番を読んだまま
+    old = rnad_learner(NUM_PLANES_V5, ["opp_hand", "pawn_files"])
+    for s_ in range(3):
+        step(old, NUM_PLANES_V5, seed=30 + s_)
+    padded = pad_planes(old.net, NUM_PLANES_V6)
+    same(old.net, padded, y[:, :NUM_PLANES_V5], y, "積み直したネットが 89番を読まなくなった")
+    with torch.no_grad():
+        a, b = old.net.eval()(x[:, :NUM_PLANES_V5])[0], old.net(y[:, :NUM_PLANES_V5])[0]
+    assert not torch.allclose(a, b), "検査の入力で 89番が効いていない"
+    # 既存の checkpoint に足す
+    ck = old.state_dict()
+    wide = widen_checkpoint(ck, NUM_PLANES_V6, ["opp_hand", "pawn_files", "king_tight"])
+    assert wide["config"]["drop"] == ["king_wide"] and "drop" not in ck["config"]
+    other = RNaDLearner(PolicyValueNet.from_config(wide["config"]), CFG, DEV)
+    other.load_state_dict(wide)
+    for name in ("net", "target", "prev", "prev_"):
+        a, b = getattr(old, name), getattr(other, name)
+        same(a, b, as_before(x, NUM_PLANES_V5, ["king_tight"]), x, f"移し替え {name}")
+        same(b, b, x, y, f"移し替えた後も 89番を読んでいる {name}")
+        assert torch.equal(wide[name]["stem.weight"][:, KING_TIGHT], ck[name]["stem.weight"][:, KING_WIDE])
+        assert (wide[name]["stem.weight"][:, KING_WIDE] == 0).all()
+    st0, st1 = ck["opt"]["state"][0], wide["opt"]["state"][0]
+    assert torch.equal(st1["exp_avg"][:, KING_TIGHT], st0["exp_avg"][:, KING_WIDE])
+    assert torch.equal(st1["exp_avg_sq"][:, KING_TIGHT], st0["exp_avg_sq"][:, KING_WIDE])
+    assert (st1["exp_avg"][:, KING_WIDE] == 0).all()
+    step(other, NUM_PLANES_V6, seed=40)
+    assert (other.net.stem.weight[:, KING_WIDE] == 0).all(), "読まない列が動いた"
+    # もう一度別の組を足しても、移し直さない（124番は学習した重みのまま、drop も残る）
+    again = widen_checkpoint(other.state_dict(), NUM_PLANES_V6, ["opp_hand", "pawn_files", "king_tight", "king_lines"])
+    assert again["config"]["drop"] == ["king_wide"]
+    assert torch.equal(again["net"]["stem.weight"][:, KING_TIGHT], other.net.stem.weight[:, KING_TIGHT])
+    # v1・v2 の版が違うだけの checkpoint（89番を読んでいる 91枚）からも移す
+    v2 = rnad_learner()
+    w2 = widen_checkpoint(v2.state_dict(), NUM_PLANES_V6, ["king_tight"])
+    assert torch.equal(w2["net"]["stem.weight"][:, KING_TIGHT], v2.net.stem.weight[:, KING_WIDE])
+    # 書き出し
+    with tempfile.TemporaryDirectory() as d:
+        path = pathlib.Path(d) / "w.bin"
+        write_weights(other.net.eval(), path)
+        back = read_weights(path).eval()
+    assert back.config["drop"] == ["king_wide"] and (back.stem.weight[:, KING_WIDE] == 0).all()
+    same(other.net, back, y, y, "書き出し（king_tight）")
 
 
 def check_with_extras():
@@ -290,6 +371,7 @@ def check_with_extras():
 def main():
     check_layout()
     check_mask()
+    check_replace()
     check_widen_rnad()
     check_widen_mmd()
     check_add_later()
