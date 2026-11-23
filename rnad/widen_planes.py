@@ -41,7 +41,10 @@ NETS = ("net", "target", "prev", "prev_", "magnet_net", "state_dict")
 # 学習のフラグ名 → 組の名前（train_rnad.py と共有）
 EXTRA_FLAGS = {"opp_hand_planes": "opp_hand", "opp_foul_planes": "opp_fouls", "king_foul_planes": "king_fouls",
                "lost_fresh_planes": "lost_fresh", "lost_role_planes": "lost_roles", "cap_role_planes": "cap_roles",
-               "pawn_file_planes": "pawn_files"}
+               "pawn_file_planes": "pawn_files",
+               "king_tight_planes": "king_tight", "check_clock_planes": "check_clock",
+               "checker_memo_planes": "checker_memo", "own_attack_planes": "own_attacks",
+               "king_line_planes": "king_lines"}
 # エラーメッセージに出すフラグの一覧
 EXTRA_FLAG_NAMES = " / ".join("--" + f.replace("_", "-") for f in EXTRA_FLAGS)
 
@@ -63,6 +66,19 @@ def add_extra_flags(ap: argparse.ArgumentParser) -> None:
                     help="v5: 取った駒種ごとのマス（7枚。回数で、薄れない）を入力に使う")
     ap.add_argument("--pawn-file-planes", action="store_true",
                     help="v5: 相手の歩を取った筋（1枚。筋の全マスに回数、薄れない = 相手がその筋に歩を打てる）を入力に使う")
+    ap.add_argument("--king-tight-planes", action="store_true",
+                    help="v6: 相手玉がいうるマスの締めた版（1枚。相手の駒取り・王手・動いていた駒の手では広げない）を入力に使う")
+    ap.add_argument("--check-clock-planes", action="store_true",
+                    help="v6: 王手からの手数（6枚、全面。王手をかけた / 受けたことがあるか・最後の王手からの相手の手数・"
+                         "そのうち応手でも駒取りでも王手でもない手。手数は 12 で 1）を入力に使う")
+    ap.add_argument("--checker-memo-planes", action="store_true",
+                    help="v6: 取らずに逃げた王手駒がいたかもしれないマス（1枚。値は 鮮度 ÷ 王手の時点の候補数）を入力に使う")
+    ap.add_argument("--own-attack-planes", action="store_true",
+                    help="v6: 自駒の利き（2枚。確実な利き = 隣接と桂の跳びの枚数 / 遮られうる利き = 飛び駒の 2マス目以降の枚数。"
+                         "3枚で 1）を入力に使う")
+    ap.add_argument("--king-line-planes", action="store_true",
+                    help="v6: 自玉の筋（2枚。8方向に最初の自駒の手前までのマス / その最初の自駒で、先に自駒でないマスが"
+                         "続くもの = ピンされうる駒）を入力に使う")
 
 
 def extras_from_args(args) -> list:

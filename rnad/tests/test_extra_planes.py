@@ -26,12 +26,13 @@ from export_weights import read as read_weights  # noqa: E402
 from export_weights import write as write_weights  # noqa: E402
 from mmd import MMDLearner, make_config  # noqa: E402
 from model import (EXTRA_PLANES, NUM_PLANES, NUM_PLANES_DEDUCED, NUM_PLANES_V3, NUM_PLANES_V4,  # noqa: E402
-                   NUM_PLANES_V5, PolicyValueNet, planes_for, unused_planes)
+                   NUM_PLANES_V5, NUM_PLANES_V6, PolicyValueNet, planes_for, unused_planes)
 from rnad import RNaDConfig, RNaDLearner  # noqa: E402
 from widen_planes import EXTRA_FLAGS, add_extra_flags, extras_from_args, widen_checkpoint  # noqa: E402
 
 DEV = torch.device("cpu")
 CFG = RNaDConfig(eta=0.2, beta=16.0, lr=2e-4, schedule_sizes=(200,), schedule_repeats=(1,))
+V6_GROUPS = ["king_tight", "check_clock", "checker_memo", "own_attacks", "king_lines"]
 # (プレーン数, 使う組)
 CHOICES = [
     (NUM_PLANES_V3, []), (NUM_PLANES_V3, ["opp_hand"]), (NUM_PLANES_V3, ["opp_fouls"]),
@@ -40,7 +41,10 @@ CHOICES = [
     (NUM_PLANES_V4, ["king_fouls", "opp_fouls", "opp_hand"]),
     (NUM_PLANES_V5, []), (NUM_PLANES_V5, ["lost_fresh"]), (NUM_PLANES_V5, ["lost_roles"]), (NUM_PLANES_V5, ["cap_roles"]),
     (NUM_PLANES_V5, ["pawn_files"]), (NUM_PLANES_V5, ["cap_roles", "king_fouls", "lost_roles", "opp_hand"]),
-    (NUM_PLANES_V5, sorted(EXTRA_PLANES)),
+    (NUM_PLANES_V5, sorted(set(EXTRA_PLANES) - set(V6_GROUPS))),
+    (NUM_PLANES_V6, []), (NUM_PLANES_V6, ["king_tight"]), (NUM_PLANES_V6, ["check_clock", "own_attacks"]),
+    (NUM_PLANES_V6, ["checker_memo", "king_lines", "opp_hand", "pawn_files"]),
+    (NUM_PLANES_V6, sorted(EXTRA_PLANES)),
 ]
 V5_GROUPS = ["lost_fresh", "lost_roles", "cap_roles", "pawn_files"]
 
@@ -77,7 +81,7 @@ def same(a, b, x_a, x_b, what):
 
 def check_layout():
     spans = sorted(EXTRA_PLANES.values())
-    assert spans[0][0] == NUM_PLANES_DEDUCED and sum(n for _, n in spans) == NUM_PLANES_V5 - NUM_PLANES_DEDUCED
+    assert spans[0][0] == NUM_PLANES_DEDUCED and sum(n for _, n in spans) == NUM_PLANES_V6 - NUM_PLANES_DEDUCED
     for (s, n), (t, _) in zip(spans, spans[1:]):
         assert s + n == t, "組は隙間なく並ぶ"
     assert planes_for([]) == NUM_PLANES_DEDUCED
@@ -85,6 +89,9 @@ def check_layout():
     assert planes_for(["king_fouls"]) == planes_for(["king_fouls", "opp_hand"]) == NUM_PLANES_V4
     for name in V5_GROUPS:
         assert planes_for([name]) == planes_for([name, "opp_hand"]) == NUM_PLANES_V5, name
+    for name in V6_GROUPS:
+        assert planes_for([name]) == planes_for([name, "pawn_files"]) == NUM_PLANES_V6, name
+    assert sorted(V5_GROUPS + V6_GROUPS + ["opp_hand", "opp_fouls", "king_fouls"]) == sorted(EXTRA_PLANES)
     # フラグは組の全部を1つずつ指し、フラグから組の名前が取れる
     assert sorted(EXTRA_FLAGS.values()) == sorted(EXTRA_PLANES)
     ap = argparse.ArgumentParser()
@@ -98,7 +105,7 @@ def check_layout():
         print("tsuitate_rl が無いので Rust 側との照合は飛ばす")
         return
     assert tsuitate_rl.NUM_PLANES_V3 == NUM_PLANES_V3 and tsuitate_rl.NUM_PLANES_V4 == NUM_PLANES_V4
-    assert tsuitate_rl.NUM_PLANES_V5 == NUM_PLANES_V5
+    assert tsuitate_rl.NUM_PLANES_V5 == NUM_PLANES_V5 and tsuitate_rl.NUM_PLANES_V6 == NUM_PLANES_V6
     assert dict(tsuitate_rl.EXTRA_PLANE_GROUPS) == {k: tuple(v) for k, v in EXTRA_PLANES.items()}, \
         (tsuitate_rl.EXTRA_PLANE_GROUPS, EXTRA_PLANES)
 
@@ -274,7 +281,8 @@ def check_with_extras():
         else:
             raise AssertionError(f"{c['config']} → {want} を受け付けた")
     for extras, planes in ((["opp_hand"], NUM_PLANES_V3), (["king_fouls"], NUM_PLANES_V4),
-                           (["lost_fresh"], NUM_PLANES_V5), (sorted(EXTRA_PLANES), NUM_PLANES_V5)):
+                           (["lost_fresh"], NUM_PLANES_V5), (["king_tight"], NUM_PLANES_V6),
+                           (sorted(EXTRA_PLANES), NUM_PLANES_V6)):
         net = train_rnad.load_net("none", 8, 1, extras=extras)
         assert net.config["planes"] == planes and net.config["extras"] == extras
 

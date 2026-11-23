@@ -2,7 +2,7 @@
 
     .venv/bin/python rnad/tests/test_input_ab.py
 
-- ARMS: 版の名前の引数が、train_rnad.py の入力の組のフラグと 1 対 1（v5 は v4 に 4組、v4 は v3 に 1組を足したもの）
+- ARMS: 版の名前の引数が、train_rnad.py の入力の組のフラグと 1 対 1（v6 は v5 に 5組、v5 は v4 に 4組、v4 は v3 に 1組を足したもの）
 - parse_arms: 版の名前と `--arm 名前=引数`、重複・知らない名前・出力のディレクトリ名と紛れる名前は弾く
 - plan_queue: seed を外側に回す。`--only` はその組だけを同じ順で残し、無い組は弾く
 - pending: ログが `--steps` に届いていない run の数（ログが無い run も数える）。再開で同じ step が2回あれば後の行
@@ -46,8 +46,9 @@ def check_arms():
     assert flags["v3"] < flags["v4"] < flags["v5"]
     assert flags["v4"] - flags["v3"] == {"--king-foul-planes"}
     assert len(flags["v5"] - flags["v4"]) == 4
-    # v5 は今ある組の全部（組を足したら v6 の行を足すか、このテストを直す）
-    assert flags["v5"] == known, known - flags["v5"]
+    assert flags["v5"] < flags["v6"] and len(flags["v6"] - flags["v5"]) == 5
+    # v6 は今ある組の全部（組を足したら次の版の行を足すか、このテストを直す）
+    assert flags["v6"] == known, known - flags["v6"]
 
 
 def check_parse():

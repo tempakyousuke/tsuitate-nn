@@ -27,8 +27,12 @@ NUM_PLANES_V4 = 102
 # エンコーダ v5（tsuitate-bot の `rl::encode::NUM_PLANES_V5`、2026-11-17）: v4 の後ろに、取った駒・取られた駒の
 # 一覧を4組 22枚。組の扱いは v3 と同じ
 NUM_PLANES_V5 = 124
+# エンコーダ v6（tsuitate-bot の `rl::encode::NUM_PLANES_V6`、2026-11-23）: v5 の後ろに、安く作れる確定事実と集計を
+# 5組 12枚（締めた相手玉の候補・王手からの手数・逃げた王手駒の候補・自駒の利き・自玉の筋）。1組ずつ効きを確かめずに
+# まとめて足す（tsuitate-bot の docs/rl-deepnash-design.md の v6）。組の扱いは v3 と同じ
+NUM_PLANES_V6 = 136
 # 組を持てるネットのプレーン数
-EXTENDED_PLANES = (NUM_PLANES_V3, NUM_PLANES_V4, NUM_PLANES_V5)
+EXTENDED_PLANES = (NUM_PLANES_V3, NUM_PLANES_V4, NUM_PLANES_V5, NUM_PLANES_V6)
 EXTRA_PLANES = {
     "opp_hand": (91, 7),  # 案3: 相手の持ち駒の上界（駒種別）
     "opp_fouls": (98, 3),  # 案4: 相手の反則の時系列（直前の手番 / 王手を受けていた手番 / 受けていない手番）
@@ -37,6 +41,11 @@ EXTRA_PLANES = {
     "lost_roles": (109, 7),  # v5: 取られた駒種ごとのマス（回数。薄れない）
     "cap_roles": (116, 7),  # v5: 取った駒種ごとのマス（回数。薄れない）
     "pawn_files": (123, 1),  # v5: 相手の歩を取った筋（筋の全マスに回数。薄れない）
+    "king_tight": (124, 1),  # v6: 相手玉がいうるマス（締めた版。相手の駒取り・王手・動いていた駒で絞る）
+    "check_clock": (125, 6),  # v6: 王手からの手数（かけた / 受けた × あるか・相手の手数・そのうち自由な手。全面）
+    "checker_memo": (131, 1),  # v6: 取らずに逃げた王手駒がいたかもしれないマス（鮮度 ÷ 候補数）
+    "own_attacks": (132, 2),  # v6: 自駒の利き（確実な利きの枚数 / 遮られうる利きの枚数）
+    "king_lines": (134, 2),  # v6: 自玉の筋（最初の自駒の手前まで / ピンされうる自駒）
 }
 NUM_ACTION_KINDS = 139
 
