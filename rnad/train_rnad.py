@@ -518,12 +518,11 @@ def main() -> None:
             raise SystemExit(f"報酬の整形の設定: {e}") from e
         if args.shape_decay and not shape.active:
             raise SystemExit("--shape-decay は --shape か --lose-len と一緒に使う")
-        bad = [f for f, on in (("--pipeline とリーグ", args.pipeline and args.league),
-                               ("--league-open-sides learner",
-                                args.league_open_p and args.league_open_sides == "learner")) if on]
+        bad = [f for f, on in (("--pipeline とリーグ", args.pipeline and args.league),) if on]
         if bad:
-            # 自己対局の序盤の強制（--open-p）は使える: 強制の手で動いた整形の量は報酬にしない（shaping.ShapeRun）。
-            # リーグの局で学習側を強制する形は試していないので止めたまま（相手の側だけの --league-open-p は使える）。
+            # 序盤の強制は使える（自己対局の --open-p も、リーグの局の --league-open-p も、どちらの側でも）: 強制の手で
+            # 動いた整形の量は報酬にしない（shaping.ShapeRun が、強制の手が指された env.step の Φ の変化を基準へ繰り入れる。
+            # 学習側を強制する形は tests/test_shape_forced.py の F4）。
             # --pipeline のリーグは、集める側のスレッドの env から学習側の色を持ち出していないので監視値を作れない
             raise SystemExit(f"報酬の整形・信号の監視は {' '.join(bad)} と一緒に使えない")
         if shape.active and not shape.zero_sum and not (args.league and args.league_frac == 1.0):

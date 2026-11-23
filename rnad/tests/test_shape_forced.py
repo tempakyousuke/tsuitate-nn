@@ -6,6 +6,8 @@
 - F2 `collect`: 強制つきの自己対局で、速い収集（py / rust）が従来の収集と同じ batch（整形込みの報酬も）を返す。
   反対称な重みは零和のまま、1局の整形の合計は「終局の Φ − 繰り入れ後の基準」を切ったもの
 - F3 `train_rnad.py`: `--shape` ＋ `--open-p 1` ＋ `--pipeline` ＋ `--fast-collect` で回り、log に signals・shape_mult が残る
+- F4 リーグの局で**学習側**の序盤を強制する形（`--league-open-sides learner`）: 強制の手は学習の行にならず、その手で動いた
+  Φ は報酬にならない（相手をネットで指させる collect）。`train_rnad.py` は相手をネットで指させる形・Rust で指させる形とも回る
 """
 
 import json
@@ -164,10 +166,70 @@ def check_train(tmp):
           "log に signals・shape_mult・reward_scale が残る。速い収集のログは従来と同じ")
 
 
+def check_league_learner(tmp):
+    """リーグの局で学習側の序盤を強制する（相手 1体への離陸を、相手の苦手な定跡から始めて測る用。
+    tsuitate-bot の docs/rl-fixed-opponent.md 8.9節）"""
+    book_path = write_book(tmp)
+    book = openings.load_book(book_path)
+    n = 16
+    torch.manual_seed(3)
+    net, opp = small_net(), small_net()
+    games = [("opp", i % 2) for i in range(n)]
+    kw = openings.env_kwargs(book, 1.0, sides="learner")
+
+    def make():
+        return tsuitate_rl.VecEnv(n, seed=9, auto_reset=False, planes=NUM_PLANES_DEDUCED, opening_index_learner=True, **kw)
+
+    # 必ず動く信号（自分の受理手の数）で確かめる: 強制の手は数えず、方策が選んだ手だけが 0.01 ずつ載る
+    shm = Shaping.from_spec("moves=0.01", "plain", 5.0, names=NAMES)
+    env = make()
+    batch = collect(env, net, DEV, generator=torch.Generator().manual_seed(21), compact_legal=True,
+                    opponents=games, opp_nets={"opp": opp}, shaping=shm)
+    run = batch["shape_run"]
+    fin = sorted(env.pop_finished(), key=lambda f: f["game_no"])
+    valid, player = np.asarray(batch["valid"]), np.asarray(batch["player"])
+    reward = np.asarray(batch["reward"])
+    k = NAMES.index("moves")
+    late = 0
+    for i, f in enumerate(fin):
+        lc = i % 2
+        assert (player[valid[:, i], i] == lc).all(), "記録する行は学習側の手番だけ"
+        assert f["forced_line"][lc] is not None and f["forced_line"][1 - lc] is None, (i, f["forced_line"])
+        forced, moves = f["forced_moves"][lc], int(run.sig[i, lc, k])
+        assert forced >= 1 and moves >= forced
+        # 学習の行（方策が選んだ手・反則も 1行）＋ 強制した手 = 学習側の受理手 ＋ 反則
+        assert int(valid[:, i].sum()) + forced == moves + f["fouls"][lc], (i, valid[:, i].sum(), forced, moves, f["fouls"])
+        assert abs(run.total[i, lc] - 0.01 * (moves - forced)) < 1e-6, (i, run.total[i, lc], moves, forced)
+        late += forced > (1 if lc == 0 else 0)  # 収集の頭（reset）より後にも強制の手があった局
+        want = (0.0 if f["winner"] is None else (1.0 if f["winner"] == lc else -1.0)) + run.total[i, lc]
+        assert abs(reward[:, i, lc].sum() - want) < 1e-5, (i, reward[:, i, lc].sum(), want)
+    assert late >= n // 2, "方策の手番が始まる前に、相手の手番をはさんで強制の手が続く局が要る"
+
+    # train_rnad.py: 相手をネットで指させる形（離陸の実験の形）と Rust で指させる形
+    base = ["--seed", "5", "--open-book", str(book_path), "--league-open-p", "1.0", "--league-open-sides", "learner",
+            "--league-frac", "1", "--shape", "d_capture_value=0.02,king_attack=0.03,opp_fouls=0.05", "--shape-cap", "1.0"]
+    for name, extra in (("gpu", ["--league", "rl_v15", "--league-device", "gpu", "--mmd-magnet", "uniform"]),
+                        ("rust", ["--league", "heuristic"])):
+        out = tmp / f"learner_{name}"
+        run_train(out, *base, *extra, steps=2)
+        lines = [json.loads(x) for x in open(out / "log.jsonl") if x.strip()]
+        assert len(lines) == 2
+        for x in lines:
+            lo = x["league_opening"]
+            assert lo["forced_frac"] == 0.5 and lo["both_forced_frac"] == 0.0, (name, lo)
+            assert sum(sum(v) for v in lo["by_line"].values()) == 6, (name, lo["by_line"])
+            assert math.isfinite(x["loss_v"]) and "shaped_total" in x["signals"], name
+        cfg = json.loads((out / "config.json").read_text())["opening"]
+        assert cfg["league_p"] == 1.0 and cfg["league_sides"] == "learner"
+    print("F4 リーグの局で学習側の序盤を強制: 強制の手は学習の行にならず、その手で動いた Φ は報酬にならない"
+          "（方策が選んだ手だけに整形が付く）。train_rnad.py は --league-device gpu / rust とも回る")
+
+
 if __name__ == "__main__":
     torch.set_num_threads(2)
     check_shape_run()
     with tempfile.TemporaryDirectory() as d:
         check_collect(pathlib.Path(d))
         check_train(pathlib.Path(d))
+        check_league_learner(pathlib.Path(d))
     print("ok")

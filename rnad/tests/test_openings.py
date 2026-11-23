@@ -292,8 +292,6 @@ def check_league_train(tmp):
     for extra, msg in [
         (["--open-book", str(book), "--league-open-p", "1.0"], "--league"),
         (["--league-open-p", "1.0", "--league", "heuristic", "--league-frac", "1"], "--open-book"),
-        (["--open-book", str(book), "--league-open-p", "1.0", "--league-open-sides", "learner", "--league", "heuristic",
-          "--league-frac", "1", "--shape", "d_capture_value=0.02"], "--league-open-sides learner"),
     ]:
         r = run_train(tmp / "rej2", *extra, steps=1, check=False)
         assert r.returncode != 0 and msg in (r.stderr + r.stdout), (extra, r.stderr[-500:])
