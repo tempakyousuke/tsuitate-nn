@@ -32,7 +32,7 @@ from widen_planes import EXTRA_FLAGS, add_extra_flags, extras_from_args, widen_c
 
 DEV = torch.device("cpu")
 CFG = RNaDConfig(eta=0.2, beta=16.0, lr=2e-4, schedule_sizes=(200,), schedule_repeats=(1,))
-V6_GROUPS = ["king_tight", "check_clock", "checker_memo", "own_attacks", "king_lines", "opp_counts"]
+V6_GROUPS = ["king_tight", "check_clock", "checker_memo", "own_attacks", "king_lines", "opp_counts", "exposed"]
 # (プレーン数, 使う組)
 CHOICES = [
     (NUM_PLANES_V3, []), (NUM_PLANES_V3, ["opp_hand"]), (NUM_PLANES_V3, ["opp_fouls"]),
@@ -43,7 +43,7 @@ CHOICES = [
     (NUM_PLANES_V5, ["pawn_files"]), (NUM_PLANES_V5, ["cap_roles", "king_fouls", "lost_roles", "opp_hand"]),
     (NUM_PLANES_V5, sorted(set(EXTRA_PLANES) - set(V6_GROUPS))),
     (NUM_PLANES_V6, []), (NUM_PLANES_V6, ["king_tight"]), (NUM_PLANES_V6, ["check_clock", "own_attacks"]),
-    (NUM_PLANES_V6, ["checker_memo", "king_lines", "opp_hand", "pawn_files"]), (NUM_PLANES_V6, ["opp_counts"]),
+    (NUM_PLANES_V6, ["checker_memo", "king_lines", "opp_hand", "pawn_files"]), (NUM_PLANES_V6, ["opp_counts"]), (NUM_PLANES_V6, ["exposed"]),
     (NUM_PLANES_V6, sorted(EXTRA_PLANES)),
 ]
 V5_GROUPS = ["lost_fresh", "lost_roles", "cap_roles", "pawn_files"]

@@ -44,7 +44,8 @@ EXTRA_FLAGS = {"opp_hand_planes": "opp_hand", "opp_foul_planes": "opp_fouls", "k
                "pawn_file_planes": "pawn_files",
                "king_tight_planes": "king_tight", "check_clock_planes": "check_clock",
                "checker_memo_planes": "checker_memo", "own_attack_planes": "own_attacks",
-               "king_line_planes": "king_lines", "opp_count_planes": "opp_counts"}
+               "king_line_planes": "king_lines", "opp_count_planes": "opp_counts",
+               "exposed_planes": "exposed"}
 # エラーメッセージに出すフラグの一覧
 EXTRA_FLAG_NAMES = " / ".join("--" + f.replace("_", "-") for f in EXTRA_FLAGS)
 
@@ -81,6 +82,9 @@ def add_extra_flags(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--opp-count-planes", action="store_true",
                     help="v6: 相手の手数の合計（4枚、全面。王手をかけてきた手 ÷20・駒を取ってきた手 ÷30・王手をかけながら"
                          "駒を取ってきた手 ÷10・指した手 ÷100。それぞれ上限 1）を入力に使う")
+    ap.add_argument("--exposed-planes", action="store_true",
+                    help="v6: 相手に位置が伝わっている自駒（2枚。駒を取ったまま動いていない自駒 / 王手をかけた手で動かしたまま"
+                         "動いていない自駒。値はその手からの鮮度。相手は取られたマスと王手を審判から知らされる）を入力に使う")
     ap.add_argument("--king-line-planes", action="store_true",
                     help="v6: 自玉の筋（2枚。8方向に最初の自駒の手前までのマス / その最初の自駒で、先に自駒でないマスが"
                          "続くもの = ピンされうる駒）を入力に使う")
