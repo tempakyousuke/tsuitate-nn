@@ -27,8 +27,13 @@ NUM_PLANES_V4 = 102
 # エンコーダ v5（tsuitate-bot の `rl::encode::NUM_PLANES_V5`、2026-11-17）: v4 の後ろに、取った駒・取られた駒の
 # 一覧を4組 22枚。組の扱いは v3 と同じ
 NUM_PLANES_V5 = 124
+# エンコーダ v6（tsuitate-bot の `rl::encode::NUM_PLANES_V6`、2026-11-23）: v5 の後ろに、安く作れる確定事実と集計を
+# 7組 18枚（締めた相手玉の候補・王手からの手数・逃げた王手駒の候補・自駒の利き・自玉の筋・相手の手数の合計・
+# 相手に位置が伝わっている自駒）。1組ずつ効きを確かめずにまとめて足す（tsuitate-bot の docs/rl-deepnash-design.md の v6）。
+# 組の扱いは v3 と同じ
+NUM_PLANES_V6 = 142
 # 組を持てるネットのプレーン数
-EXTENDED_PLANES = (NUM_PLANES_V3, NUM_PLANES_V4, NUM_PLANES_V5)
+EXTENDED_PLANES = (NUM_PLANES_V3, NUM_PLANES_V4, NUM_PLANES_V5, NUM_PLANES_V6)
 EXTRA_PLANES = {
     "opp_hand": (91, 7),  # 案3: 相手の持ち駒の上界（駒種別）
     "opp_fouls": (98, 3),  # 案4: 相手の反則の時系列（直前の手番 / 王手を受けていた手番 / 受けていない手番）
@@ -37,7 +42,25 @@ EXTRA_PLANES = {
     "lost_roles": (109, 7),  # v5: 取られた駒種ごとのマス（回数。薄れない）
     "cap_roles": (116, 7),  # v5: 取った駒種ごとのマス（回数。薄れない）
     "pawn_files": (123, 1),  # v5: 相手の歩を取った筋（筋の全マスに回数。薄れない）
+    "king_tight": (124, 1),  # v6: 相手玉がいうるマス（締めた版。相手の駒取り・王手・動いていた駒で絞る）
+    "check_clock": (125, 6),  # v6: 王手からの手数（かけた / 受けた × あるか・相手の手数・そのうち自由な手。全面）
+    "checker_memo": (131, 1),  # v6: 取らずに逃げた王手駒がいたかもしれないマス（鮮度 ÷ 候補数）
+    "own_attacks": (132, 2),  # v6: 自駒の利き（確実な利きの枚数 / 遮られうる利きの枚数）
+    "king_lines": (134, 2),  # v6: 自玉の筋（最初の自駒の手前まで / ピンされうる自駒）
+    # v6: 相手の手数の合計（全面）。王手をかけてきた手（÷20）/ 駒を取ってきた手（÷30）/ 王手かつ駒取り（÷10）/ 指した手（÷100）
+    "opp_counts": (136, 4),
+    # v6: 相手に位置が伝わっている自駒（駒を取ったまま動いていない / 王手をかけた手で動かしたまま動いていない。値は鮮度）
+    "exposed": (140, 2),
 }
+# **組を使うと読まなくなるプレーン**（2026-11-23）。`king_tight`（締めた相手玉の候補）は確定事実の 89番（相手玉が
+# いうるマス）の部分集合で、締めた版がある限り 89番は相手玉の位置について新しい情報を持たない。残すと、同じ値の
+# 手番で勾配を分け合い、既存のネットを広げたときは 89番に付いた重みが残って締めた版へ移りにくい。そこで
+# `king_tight` を使うネットは 89番を読まない（入力を 0 にする。`config["drop"]`）。**観測の並びは変えない**ので、
+# 89番を読むネット（v2〜v5 の相手・錨・パネル）は同じ観測をそのまま読める。`config["drop"]` を持たないネットは
+# これまでどおり全部読む（`pad_planes` が作る「入る組を全部読む」ネットも、drop は空）
+DROPPABLE_PLANES = {"king_wide": 89}
+# 組の名前 → その組を使うと読まなくなるプレーンの名前
+REPLACES = {"king_tight": "king_wide"}
 NUM_ACTION_KINDS = 139
 
 
@@ -64,13 +87,33 @@ def normalize_extras(planes: int, extras) -> list:
     return extras
 
 
-def unused_planes(planes: int, extras) -> list:
-    """ネットが使わない入力プレーンの番号（v3 以降で選ばなかった組）。v1・v2 は空"""
-    if planes not in EXTENDED_PLANES:
-        return []
-    extras = normalize_extras(planes, extras)
-    return [i for name, (s, n) in EXTRA_PLANES.items()
-            if name not in extras and s + n <= planes for i in range(s, s + n)]
+def default_drop(extras) -> list:
+    """組 `extras` を新しく使うネットが読まなくなるプレーンの名前（`REPLACES`）"""
+    return sorted({REPLACES[n] for n in extras or () if n in REPLACES})
+
+
+def normalize_drop(planes: int, drop) -> list:
+    """読まないプレーンの名前（並べ替え済み）"""
+    drop = sorted(set(drop or ()))
+    unknown = set(drop) - set(DROPPABLE_PLANES)
+    if unknown:
+        raise ValueError(f"知らない読まないプレーン: {sorted(unknown)}（{sorted(DROPPABLE_PLANES)} のどれか）")
+    over = [n for n in drop if DROPPABLE_PLANES[n] >= planes]
+    if over:
+        raise ValueError(f"読まないプレーン {over} は {planes}枚のネットに無い")
+    return drop
+
+
+def unused_planes(planes: int, extras, drop=None) -> list:
+    """ネットが使わない入力プレーンの番号（v3 以降で選ばなかった組と、`drop` のプレーン）。昇順。
+    `drop` を省くと、組から決まる既定（`default_drop`）= `PolicyValueNet(…, extras)` で作ったネットと同じ"""
+    drop = default_drop(extras) if drop is None else drop
+    off = {DROPPABLE_PLANES[n] for n in normalize_drop(planes, drop)}
+    if planes in EXTENDED_PLANES:
+        extras = normalize_extras(planes, extras)
+        off |= {i for name, (s, n) in EXTRA_PLANES.items()
+                if name not in extras and s + n <= planes for i in range(s, s + n)}
+    return sorted(off)
 
 
 class ResBlock(nn.Module):
@@ -88,16 +131,21 @@ class ResBlock(nn.Module):
 
 
 class PolicyValueNet(nn.Module):
-    def __init__(self, channels: int = 64, blocks: int = 6, planes: int = NUM_PLANES, extras=()):
+    def __init__(self, channels: int = 64, blocks: int = 6, planes: int = NUM_PLANES, extras=(), drop=None):
+        """`drop` = 読まないプレーンの名前（`DROPPABLE_PLANES`）。省くと組から決まる既定（`king_tight` を使うなら
+        元の相手玉の候補を読まない）。checkpoint・重みのヘッダから作るときは保存された値をそのまま使う（`from_config`）"""
         super().__init__()
         extras = normalize_extras(planes, extras)
+        drop = normalize_drop(planes, default_drop(extras) if drop is None else drop)
         self.config = {"planes": planes, "channels": channels, "blocks": blocks}
         if planes in EXTENDED_PLANES:
             self.config["extras"] = extras
+        if drop:  # 無いときはキーを足さない（これまでの checkpoint・重みのヘッダと同じ形のまま）
+            self.config["drop"] = drop
         self.stem = nn.Conv2d(planes, channels, 3, padding=1, bias=False)
-        # 使わない入力プレーン（v3 以降で選ばなかった組）。入力を 0 にするので stem のその列には勾配が来ず、
+        # 使わない入力プレーン（v3 以降で選ばなかった組と、読まないプレーン）。入力を 0 にするので stem のその列には勾配が来ず、
         # 0 で始めた列は 0 のまま（書き出した重みも 0）。state_dict には入れない（config から作り直せる）
-        off = unused_planes(planes, extras)
+        off = unused_planes(planes, extras, drop)
         if off:
             mask = torch.zeros(planes, dtype=torch.bool)
             mask[off] = True
@@ -134,7 +182,8 @@ class PolicyValueNet(nn.Module):
     @classmethod
     def from_config(cls, config: dict) -> "PolicyValueNet":
         """checkpoint の `config`（や重みファイルのヘッダ）からネットの形を作る（v3 以降の組の選び方も含む）"""
-        return cls(config["channels"], config["blocks"], config["planes"], config.get("extras", ()))
+        return cls(config["channels"], config["blocks"], config["planes"], config.get("extras", ()),
+                   drop=config.get("drop", ()))
 
     def forward(self, x):
         return self.heads(self.trunk(x))

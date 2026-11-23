@@ -42,7 +42,7 @@ ARENA_MATCH_SEED=20260927 cargo run --release --bin arena -- 100 "rl_policy:<pol
 | `model.py` | 方策・価値ネット（ResNet。方策 [139,9,9]、価値 tanh）。**層を変えたら tsuitate-bot の `src/rl/policy_net.rs` と `export_weights.py` も直す** |
 | `train_bc.py` | 記録を真似る教師あり学習。局単位で学習/検証を分ける |
 | `export_weights.py` | Rust 推論用の重み（`TSRLPV01` 形式、BatchNorm は畳み込みへ畳み込む）。`--tiny --test-vector` で tsuitate-bot のテスト用フィクスチャを作る |
-| `widen_planes.py` | checkpoint の入力プレーンを広げる（v1 → v2）・v3 以降の組を足す（`--opp-hand-planes` / `--opp-foul-planes` / `--king-foul-planes` / v5 の `--lost-fresh-planes` / `--lost-role-planes` / `--cap-role-planes` / `--pawn-file-planes`）。足した列は 0 で、元と同じ関数のまま。R-NaD・MMD の checkpoint を読める（下の「入力プレーン」） |
+| `widen_planes.py` | checkpoint の入力プレーンを広げる（v1 → v2）・v3 以降の組を足す（`--opp-hand-planes` / `--opp-foul-planes` / `--king-foul-planes` / v5 の `--lost-fresh-planes` / `--lost-role-planes` / `--cap-role-planes` / `--pawn-file-planes` / v6 の `--king-tight-planes` / `--check-clock-planes` / `--checker-memo-planes` / `--own-attack-planes` / `--king-line-planes` / `--opp-count-planes` / `--exposed-planes`）。足した列は 0 で、元と同じ関数のまま。R-NaD・MMD の checkpoint を読める（下の「入力プレーン」） |
 | `fetch_records.py` | GitHub Actions の対局記録を取る |
 | `league.py` | リーグ学習の相手の選び方（負けやすい相手ほど多く当てる） |
 | `guard.py` | 防御特化（玉の周りの固め）の監視値の集計 |
@@ -50,6 +50,7 @@ ARENA_MATCH_SEED=20260927 cargo run --release --bin arena -- 100 "rl_policy:<pol
 | `signal_report.py` | 学習ログの `signals` から、学習曲線（得点と主な信号を更新の窓ごとに）と、勝ち局と負け局を分ける信号の表（`--split`）を出す |
 | `ladder_eval.py` | ハンデの梯子（`<相手>@<ε>`）で run の書き出しを測り、ε50（得点が 0.5 になる ε）を出す。勝ちが出る前から同じ相手への近さを追う |
 | `speedlab.py` | 学習の速さの比較: 固定パネル（`panel`）で run の書き出しを測り（`eval`、局ごとに鍵を決めた共通乱数）、腕ごとの学習曲線と対照とのペア差をまとめる（`report`）。締まりの効果を除いて比べるには `eval --decode greedy\|temp:<T>`（記録名 `<which>@greedy` など）、途中から始めた run の起点の書き出しは `export-ck`、起点を何度で指すと締まった腕にそろうかは `temp-match`（`--seed` を変えると別の局になる。パネルの評価の乱数は学習中のパネルの記録と対にするため変えない） |
+| `input_ab.py` | 入力プレーンの A/B を小さい自己対局（32ch×3・1更新 64局・乱数初期化・序盤は定跡を 100% 強制）で比べる: `run` は 腕（入力の版 `v1`〜`v6` か `--arm 名前='引数'`）× seed を `--jobs` 本ずつ回し（途中で止めても続きから。`--time-limit` で止める・`--only 腕:seed,...` でその組だけ）、`status` は進み具合の表、`pending` はまだ届いていない本数、`depend` は書き出した重みが入力の組をどれだけ読んでいるか（組を 0 にしたときの方策の変化）。tsuitate-bot の `input-ab.yml` が CI で使う（対局と集計はあちらの `scripts/ci/input_ab.py`、読み方は `docs/rl-input-ab.md`）。テストは `tests/test_input_ab.py` |
 | `log_windows.py` | 学習ログ（log.jsonl）の見張りの値（エントロピー・π>0.999 の割合・手数・反則・磁石への KL など）を step の窓ごとに平均して並べる。MMD の中止の門の形の指標はこの 100更新の窓の平均で見る（中央値は締まりを小さく見せる） |
 | `openings.py` | 序盤の強制の定跡ブック（tsuitate-bot の `joseki.json` の形式）の読み込み・系統ごとの重み・env へ渡す引数・ログの監視値（`train_rnad.py --open-book`） |
 | `opening_eval.py` | 序盤の多様さ（`entropy`: 初期局面の方策・最初の k 手の並びのエントロピー）と、序盤を強制した対局（`robust`: 相手 / 自分 / 両者の序盤を定跡に強制したときの得点・接触の前の反則を系統ごとに） |
@@ -96,9 +97,9 @@ ARENA_MATCH_SEED=20260927 cargo run --release --bin arena -- 100 "rl_policy:<pol
 | `--panel <panel.json>` | 学習ループの中で固定パネルを測り `panel_eval.jsonl` へ（`speedlab.py report` の入力と同じ形） |
 | `--planes` / `--threads` | `--init none` の入力のプレーン数 / torch のスレッド数 |
 
-## 入力プレーン（エンコーダ v3 / v4 / v5、tsuitate-bot の `docs/rl-deepnash-design.md`「エンコーダ v3」）
+## 入力プレーン（エンコーダ v3 / v4 / v5 / v6、tsuitate-bot の `docs/rl-deepnash-design.md`「エンコーダ v3」）
 
-v2（91枚）の後ろに観測と自分側だけで決まる事実を足した 101枚（v3）・102枚（v4）・124枚（v5）。**組ごとに別のフラグ**で使うかを
+v2（91枚）の後ろに観測と自分側だけで決まる事実を足した 101枚（v3）・102枚（v4）・124枚（v5）・142枚（v6）。**組ごとに別のフラグ**で使うかを
 選べるので、効果を組ごとに測れる（既定は付けない = v2 のまま）。プレーン数は選んだ組が入る最小の版になる:
 
 | フラグ | 組 | 中身 |
@@ -110,14 +111,40 @@ v2（91枚）の後ろに観測と自分側だけで決まる事実を足した 
 | `--lost-role-planes` | `lost_roles`（7枚、v5） | 取られた駒種ごとのマス（回数で、薄れない。v1 の取られたマスは駒種を持たない） |
 | `--cap-role-planes` | `cap_roles`（7枚、v5） | 取った駒種ごとのマス（回数で、薄れない。v1 の取った駒種のプレーンは1手ごとに薄れ、同じマスの2回目で上書きされる） |
 | `--pawn-file-planes` | `pawn_files`（1枚、v5） | 相手の歩を取った筋（筋の全マスに回数、薄れない。相手がその筋に歩を打てる = 歩が切れているかの勘定） |
+| `--king-tight-planes` | `king_tight`（1枚、v6） | 相手玉がいうるマスの締めた版（相手の駒取り・王手・動いていたと分かった駒の手では広げない）。**元の候補（v2 の 89番）は読まなくなる**（下） |
+| `--check-clock-planes` | `check_clock`（6枚、v6） | 王手からの手数（全面）: 王手をかけた / 受けたことがあるか・最後の王手からの相手の手数・そのうち応手でも駒取りでも王手でもない手（手数は 12 で 1） |
+| `--checker-memo-planes` | `checker_memo`（1枚、v6） | 取らずに逃げた王手駒がいたかもしれないマス（値は 鮮度 ÷ 王手の時点の候補数） |
+| `--own-attack-planes` | `own_attacks`（2枚、v6） | 自駒の利き（確実な利き = 隣接と桂の跳びの枚数 / 遮られうる利き = 飛び駒の 2マス目以降の枚数。3枚で 1） |
+| `--king-line-planes` | `king_lines`（2枚、v6） | 自玉の筋（8方向に最初の自駒の手前までのマス / その最初の自駒で、先に自駒でないマスが続くもの = ピンされうる駒） |
+| `--exposed-planes` | `exposed`（2枚、v6） | 相手に位置が伝わっている自駒: 駒を取ったまま動いていない自駒 / 王手をかけた手で動かしたまま動いていない自駒（値はその手からの鮮度）。相手は「自分の駒を取られたマス」と「王手を受けたこと」を審判から知らされる。v1 の取ったマスの鮮度は、取った駒がその後動いたかを持たない |
+| `--opp-count-planes` | `opp_counts`（4枚、v6） | 相手の手数の合計（全面）: 王手をかけてきた手（÷20）・駒を取ってきた手（÷30）・王手をかけながら駒を取ってきた手（÷10）・指した手（÷100）。指した手から王手と駒取りを引けば、行き先の手掛かりが無い手の数になる |
 
-ゼロから学習し直すときに全部入れるなら（`--init none`。124枚になる）:
+**締めた相手玉の候補は、元の候補の代わりに読む**（2026-11-23）: 元の候補（89番）は締めた版を含む広い集合で、締めた版が
+ある限り相手玉の位置について新しい情報を持たない。残すと、同じ値の手番で勾配を分け合い、既存のネットを広げたときは
+89番に付いた重みが残って締めた版へ移りにくい。そこで `--king-tight-planes` を付けたネットは 89番を読まない
+（`config["drop"] = ["king_wide"]`。入力を 0 にするので stem のその列は 0 のまま、書き出した重みでも 0）。
+
+- **観測の並びは変えない**（Rust 側は 89番も 124番も書く）。89番を読むネット（v2〜v5 の相手・錨・パネル）は同じ観測を
+  そのまま読める。`config["drop"]` の無いネット・`pad_planes` が作る「入る組を全部読む」ネットは 89番を読む
+- **既存の checkpoint に足すとき**（`widen_planes.py` / `train_rnad.py` の読み込み）は、89番の列の重みと Adam の状態を
+  124番へ移す。広げた直後は「元の候補の代わりに締めた候補を読む」ネットで、この組だけは元と同じ関数にならない。
+  既存のネットの 89番に締めた候補を流し込むだけなら強さは変わらなかった（学習なしの対局 2,000局で rl_scratch5_v2 51.1%±2.2、
+  rl_mmdhandex_v2 47.9%±2.2）ので、出発点としては中立
+- テスト: `tests/test_extra_planes.py` の `check_replace`
+
+**v6 は 1組ずつ効きを確かめずにまとめて足す**（2026-11-23。安く作れて真実と矛盾しない入力をまとめて入れ、版ごとに 1回だけ
+確かめる。定義と学習なしの検査の結果は tsuitate-bot の設計 doc の v6）。どの組が読まれたかは、学習後に
+`input_ab.py depend`（組を 0 にしたときの方策の変化）で見る。
+
+ゼロから学習し直すときに全部入れるなら（`--init none`。142枚になる。v5 までなら最後の 2行を外して 124枚）:
 
     --opp-hand-planes --opp-foul-planes --king-foul-planes \
-    --lost-fresh-planes --lost-role-planes --cap-role-planes --pawn-file-planes
+    --lost-fresh-planes --lost-role-planes --cap-role-planes --pawn-file-planes \
+    --king-tight-planes --check-clock-planes --checker-memo-planes --own-attack-planes --king-line-planes \
+    --opp-count-planes --exposed-planes
 
 - `train_rnad.py` に付けると、v2 以降の checkpoint（`out/checkpoint.pt` の再開でも `--init` でも）を読み込み時に組が入る版へ広げる
-  （v3 の実験の checkpoint に `--king-foul-planes` を足せば 102枚、v5 の組を足せば 124枚になる）。
+  （v3 の実験の checkpoint に `--king-foul-planes` を足せば 102枚、v5 の組を足せば 124枚、v6 の組を足せば 142枚になる）。
   足した列は 0 なので元と同じ関数から始まる（Adam の 2次モーメントは使っている列の平均で入れ直す）
 - 一度足した組は以後の再開でも同じフラグを付ける（付け忘れると止まる。組は外せない）。後から組を足すのはフラグを足すだけ
 - 使わない組はネットが入力を 0 にしてから読む（`config["extras"]`）ので、stem のその列は 0 のまま動かず、書き出した重みでも 0。

@@ -85,6 +85,10 @@ def with_extras(ck: dict, want: list, what, verbose: bool = True) -> dict:
     if verbose:
         print(f"{what} の入力プレーンを {cfg['planes']} → {planes}枚に（組 {have} → {sorted(want)}。"
               "足した列は 0 なので元と同じ関数から始まる）", flush=True)
+        moved = sorted(set(out["config"].get("drop", ())) - set(cfg.get("drop", ())))
+        if moved:
+            print(f"  ただし {moved} は読まなくなり、その列の重みは置き換える組の列へ移した"
+                  "（元の相手玉の候補の代わりに締めた候補を読むネットから始まる）", flush=True)
     return out
 
 
@@ -483,7 +487,7 @@ def main() -> None:
     ap.add_argument("--threads", type=int, default=0, help="torch のスレッド数（0 = 既定）")
     ap.add_argument("--planes", type=int, default=NUM_PLANES,
                     help="--init none のときの入力のプレーン数（86 = v1 / 91 = v2 確定事実つき。"
-                         "v3 = 101 / v4 = 102 / v5 = 124 は下の組のフラグで選ぶ）")
+                         "v3 = 101 / v4 = 102 / v5 = 124 / v6 = 142 は下の組のフラグで選ぶ）")
     # v3 以降の入力プレーン（tsuitate-bot の docs/rl-deepnash-design.md「エンコーダ v3」）。組ごとに別のフラグで足せる。
     # v2 以降の checkpoint から始める・再開するときは読み込み時に組が入る版へ広げる（足した列は 0 = 元と同じ関数から始まる）。
     # 一度足した組は、以後の再開でもフラグを付ける（外すと止める）

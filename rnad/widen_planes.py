@@ -33,15 +33,19 @@ import sys
 import torch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from model import (EXTENDED_PLANES, EXTRA_PLANES, NUM_PLANES_DEDUCED, normalize_extras, planes_for,  # noqa: E402
-                   unused_planes)
+from model import (DROPPABLE_PLANES, EXTENDED_PLANES, EXTRA_PLANES, NUM_PLANES_DEDUCED, REPLACES,  # noqa: E402
+                   default_drop, normalize_extras, planes_for, unused_planes)
 
 STEM = "stem.weight"
 NETS = ("net", "target", "prev", "prev_", "magnet_net", "state_dict")
 # 学習のフラグ名 → 組の名前（train_rnad.py と共有）
 EXTRA_FLAGS = {"opp_hand_planes": "opp_hand", "opp_foul_planes": "opp_fouls", "king_foul_planes": "king_fouls",
                "lost_fresh_planes": "lost_fresh", "lost_role_planes": "lost_roles", "cap_role_planes": "cap_roles",
-               "pawn_file_planes": "pawn_files"}
+               "pawn_file_planes": "pawn_files",
+               "king_tight_planes": "king_tight", "check_clock_planes": "check_clock",
+               "checker_memo_planes": "checker_memo", "own_attack_planes": "own_attacks",
+               "king_line_planes": "king_lines", "opp_count_planes": "opp_counts",
+               "exposed_planes": "exposed"}
 # エラーメッセージに出すフラグの一覧
 EXTRA_FLAG_NAMES = " / ".join("--" + f.replace("_", "-") for f in EXTRA_FLAGS)
 
@@ -63,6 +67,27 @@ def add_extra_flags(ap: argparse.ArgumentParser) -> None:
                     help="v5: 取った駒種ごとのマス（7枚。回数で、薄れない）を入力に使う")
     ap.add_argument("--pawn-file-planes", action="store_true",
                     help="v5: 相手の歩を取った筋（1枚。筋の全マスに回数、薄れない = 相手がその筋に歩を打てる）を入力に使う")
+    ap.add_argument("--king-tight-planes", action="store_true",
+                    help="v6: 相手玉がいうるマスの締めた版（1枚。相手の駒取り・王手・動いていた駒の手では広げない）を入力に使う。"
+                         "元の候補（確定事実の 89番）は読まなくなる（締めた版を含む広い集合で、締めた版がある限り新しい情報が無いため）。"
+                         "既存の checkpoint に足すと、89番の列の重みを締めた版の列へ移す")
+    ap.add_argument("--check-clock-planes", action="store_true",
+                    help="v6: 王手からの手数（6枚、全面。王手をかけた / 受けたことがあるか・最後の王手からの相手の手数・"
+                         "そのうち応手でも駒取りでも王手でもない手。手数は 12 で 1）を入力に使う")
+    ap.add_argument("--checker-memo-planes", action="store_true",
+                    help="v6: 取らずに逃げた王手駒がいたかもしれないマス（1枚。値は 鮮度 ÷ 王手の時点の候補数）を入力に使う")
+    ap.add_argument("--own-attack-planes", action="store_true",
+                    help="v6: 自駒の利き（2枚。確実な利き = 隣接と桂の跳びの枚数 / 遮られうる利き = 飛び駒の 2マス目以降の枚数。"
+                         "3枚で 1）を入力に使う")
+    ap.add_argument("--opp-count-planes", action="store_true",
+                    help="v6: 相手の手数の合計（4枚、全面。王手をかけてきた手 ÷20・駒を取ってきた手 ÷30・王手をかけながら"
+                         "駒を取ってきた手 ÷10・指した手 ÷100。それぞれ上限 1）を入力に使う")
+    ap.add_argument("--exposed-planes", action="store_true",
+                    help="v6: 相手に位置が伝わっている自駒（2枚。駒を取ったまま動いていない自駒 / 王手をかけた手で動かしたまま"
+                         "動いていない自駒。値はその手からの鮮度。相手は取られたマスと王手を審判から知らされる）を入力に使う")
+    ap.add_argument("--king-line-planes", action="store_true",
+                    help="v6: 自玉の筋（2枚。8方向に最初の自駒の手前までのマス / その最初の自駒で、先に自駒でないマスが"
+                         "続くもの = ピンされうる駒）を入力に使う")
 
 
 def extras_from_args(args) -> list:
@@ -79,7 +104,11 @@ def widen_weight(w: torch.Tensor, planes: int) -> torch.Tensor:
 
 def widen_checkpoint(ck: dict, planes: int = NUM_PLANES_DEDUCED, extras=None) -> dict:
     """`ck` の入力を `planes` 枚へ広げ、v3 以降なら使う組を `extras` にする（None = 今の組のまま）。
-    元と同じ関数のまま（足した列・新しく使う組の列は 0）。組を外す・狭める・何も変わらない指定は止める"""
+    元と同じ関数のまま（足した列・新しく使う組の列は 0）。組を外す・狭める・何も変わらない指定は止める。
+
+    **別のプレーンを置き換える組**（`model.REPLACES`。`king_tight` → 相手玉の候補の 89番）を足すときだけは同じ関数に
+    ならない: 元のプレーンの列の重み（と Adam の状態）を新しい組の列へ移し、元のプレーンは読まなくする
+    （`config["drop"]`）。広げた直後は「元のプレーンの代わりに新しいプレーンを読む」ネットになる"""
     cfg = ck["config"]
     old = cfg["planes"]
     old_extras = normalize_extras(old, cfg.get("extras", ()))
@@ -90,11 +119,17 @@ def widen_checkpoint(ck: dict, planes: int = NUM_PLANES_DEDUCED, extras=None) ->
         raise ValueError(f"入力プレーンの組は外せない（今 {old_extras} → 指定 {new_extras}）")
     if planes == old and new_extras == old_extras:
         raise ValueError(f"プレーン数 {old}・組 {old_extras} のままで、何も変わらない")
-    off_before = set(unused_planes(old, old_extras))
+    old_drop = sorted(cfg.get("drop", ()))
+    off_before = set(unused_planes(old, old_extras, old_drop))
     used_before = [i for i in range(old) if i not in off_before]
     # 新しく読み始める列: 広げた列と、新しく使う組のうち既にあった列
     added = [n for n in new_extras if n not in old_extras]
     fresh = list(range(old, planes)) + [i for n in added for i in range(*_span(n)) if i < old]
+    # 足す組が置き換えるプレーン: (読まなくなる列, 代わりに読む列)。元のネットが読んでいた列だけ重みを移す
+    new_drop = sorted(set(old_drop) | set(default_drop(added)))
+    moved = [(DROPPABLE_PLANES[REPLACES[n]], EXTRA_PLANES[n][0]) for n in added
+             if n in REPLACES and REPLACES[n] not in old_drop]
+    moved = [(o, n) for o, n in moved if o < old and o not in off_before]
 
     ck = dict(ck)
     nets = [n for n in NETS if n in ck]
@@ -104,6 +139,9 @@ def widen_checkpoint(ck: dict, planes: int = NUM_PLANES_DEDUCED, extras=None) ->
         sd = dict(ck[name])
         w = widen_weight(sd[STEM], planes) if planes > old else sd[STEM].clone()
         w[:, fresh] = 0
+        for o, n in moved:
+            w[:, n] = w[:, o]
+            w[:, o] = 0
         sd[STEM] = w
         ck[name] = sd
     # Adam の状態: param の順は net.parameters() = state_dict の重みの順（BatchNorm の running 統計を除く）。
@@ -122,13 +160,18 @@ def widen_checkpoint(ck: dict, planes: int = NUM_PLANES_DEDUCED, extras=None) ->
         # 勾配が来ていない出力チャネル（死んだ ReLU）は全体の平均で埋める
         fill = torch.where(mean > 0, mean, st["exp_avg_sq"][:, used_before].mean())
         sq[:, fresh] = fill.expand(-1, len(fresh), -1, -1)
+        for o, n in moved:  # 移した列は Adam の状態も一緒に移す（読まなくなった列には勾配が来ない）
+            avg[:, n], sq[:, n] = avg[:, o], sq[:, o]
+            avg[:, o] = 0
         st["exp_avg"], st["exp_avg_sq"] = avg, sq
         opt["state"][0] = st
         ck["opt"] = opt
-    config = {k: v for k, v in cfg.items() if k != "extras"}
+    config = {k: v for k, v in cfg.items() if k not in ("extras", "drop")}
     config["planes"] = planes
     if planes in EXTENDED_PLANES:
         config["extras"] = new_extras
+    if new_drop:
+        config["drop"] = new_drop
     ck["config"] = config
     return ck
 
