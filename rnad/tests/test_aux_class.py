@@ -9,7 +9,8 @@ tsuitate_rl（VecEnv.move_classes がある版）が要る。
 - aux_class>0 の update は同じ batch で繰り返すと補助損失が下がる。ネットの形と書き出しの state_dict は変わらない
 - state_dict は補助ヘッドと optimizer を持ち回り、3更新→保存→読み込み→3更新が6更新を続けたものと一致する
 - checkpoint に無い設定（aux_class）は既定値として比べる（古い checkpoint の再開で差にならない）
-- train_rnad.py: --algo mmd --aux-class で回り、ログに loss_aux が出る。R-NaD・--fast-collect・--pipeline とは起動時に止まる
+- 収集の速い経路（fast="py" / "rust"）でも同じ区分が付き、batch は従来の経路とビット単位で同じ
+- train_rnad.py: --algo mmd --aux-class で回り、ログに loss_aux が出る。--fast-collect・--pipeline とも回る。R-NaD とは起動時に止まる
 """
 
 import copy
@@ -38,10 +39,22 @@ def net():
     return PolicyValueNet(16, 1, 91).eval()
 
 
-def batch(move_class, seed=7):
+def batch(move_class, seed=7, fast=""):
     gen = torch.Generator().manual_seed(seed)
     env = tsuitate_rl.VecEnv(8, seed=seed, auto_reset=False, planes=91)
-    return collect(env, net(), DEV, generator=gen, compact_legal=True, actor_extras=True, move_class=move_class)
+    return collect(env, net(), DEV, generator=gen, compact_legal=True, actor_extras=True, move_class=move_class,
+                   fast=fast)
+
+
+def check_fast(ref):
+    paths = ["py"] + (["rust"] if hasattr(tsuitate_rl.VecEnv, "observe_alive_f16_csr") else [])
+    for fast in paths:
+        b = batch(True, fast=fast)
+        for k, v in ref.items():
+            if torch.is_tensor(v):
+                assert same(v, b[k]), f"fast={fast} で {k} が従来の経路と違う"
+        assert set(b) == set(ref), (set(b) ^ set(ref))
+    print(f"T1b 収集の速い経路（{' / '.join(paths)}）: 区分を含む batch が従来の経路とビット単位で同じ")
 
 
 def same(a, b):
@@ -161,18 +174,21 @@ def check_train(tmp):
     # 再開も通る
     r = run_train(tmp / "ok", "--aux-class", "0.5", "--steps", "4")
     assert r.returncode == 0, r.stderr[-1500:]
-    for extra, msg in [(["--fast-collect", "py"], "--fast-collect"), (["--pipeline"], "--pipeline")]:
-        r = run_train(tmp / "rej", "--aux-class", "0.5", *extra)
-        assert r.returncode != 0 and msg in (r.stderr + r.stdout), (extra, r.stderr[-500:])
+    for i, extra in enumerate([["--fast-collect", "py"], ["--pipeline"], ["--pipeline", "--fast-collect", "py"]]):
+        r = run_train(tmp / f"fast{i}", "--aux-class", "0.5", *extra)
+        assert r.returncode == 0, (extra, r.stderr[-1500:])
+        recs = [json.loads(line) for line in open(tmp / f"fast{i}" / "log.jsonl") if line.strip()]
+        assert recs and all("loss_aux" in json.dumps(rec) for rec in recs), extra
     r = run_train(tmp / "rej2", "--aux-class", "0.5", algo="rnad")
     assert r.returncode != 0 and "--algo mmd のときだけ" in r.stderr, r.stderr[-500:]
     print("T5 train_rnad.py: --algo mmd --aux-class で回り（再開も）、ログと checkpoint に補助ヘッドが残る。"
-          "R-NaD・--fast-collect・--pipeline とは止まる")
+          "--fast-collect・--pipeline（とその両方）でも回る。R-NaD とは止まる")
 
 
 if __name__ == "__main__":
     torch.set_num_threads(2)
     bt = check_collect()
+    check_fast(bt)
     check_off(bt)
     check_on(bt)
     check_resume()

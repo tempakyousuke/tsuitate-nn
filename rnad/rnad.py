@@ -1225,7 +1225,7 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
     if fast:
         if fast not in ("py", "rust"):
             raise ValueError(f"fast {fast!r}（'py' か 'rust'）")
-        if opponents is not None or nyugyoku_lambda != 0 or truth or move_class or not compact_legal:
+        if opponents is not None or nyugyoku_lambda != 0 or truth or not compact_legal:
             raise ValueError("collect(fast=...) は自己対局（opponents なし）・入玉ボーナスなし・truth なし・"
                              "compact_legal=True に限る")
         if fast == "rust" and not all(hasattr(e, "observe_alive_f16_csr") for e in getattr(env, "envs", [env])):
@@ -1236,7 +1236,7 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
             env.reset()  # 整形の基準（収集の頭の信号）は reset の後に読む
             shape_run = _start_shape_run(env, shaping, shape_mult)
         return _collect_fast(env, net, device, max_steps, generator, rust=fast == "rust", extras=actor_extras,
-                             shape_run=shape_run)
+                             shape_run=shape_run, move_class=move_class)
     env.reset()
     B = env.num_envs
     obs_l, legal_l, act_l, mu_l, t_l, b_l, truth_l = [], [], [], [], [], [], []
@@ -1412,7 +1412,7 @@ def _shape_step(shape_run, env, done, rew):
 
 
 @torch.no_grad()
-def _collect_fast(env, net, device, max_steps, generator, rust, extras=False, shape_run=None):
+def _collect_fast(env, net, device, max_steps, generator, rust, extras=False, shape_run=None, move_class=False):
     """`collect(..., compact_legal=True)`（自己対局・入玉ボーナスなし・truth なし）と**ビット単位で同じ batch** を返す。
 
     数式と乱数の消費の順は同じで、CPU の仕事だけを減らす（2026-10-24 の計測で、768局の収集の CPU 時間の半分が
@@ -1431,6 +1431,7 @@ def _collect_fast(env, net, device, max_steps, generator, rust, extras=False, sh
         env.reset()
     B = env.num_envs
     obs_l, cols_l, cnt_l, act_l, mu_l, t_l, b_l = [], [], [], [], [], [], []
+    mc_l = []  # move_class
     v_l, lp_l = [], []
     valid = torch.zeros(max_steps, B, dtype=torch.bool)
     player = torch.zeros(max_steps, B, dtype=torch.long)
@@ -1481,6 +1482,8 @@ def _collect_fast(env, net, device, max_steps, generator, rust, extras=False, sh
             lp_l.append(lsm[rows, cols_d].cpu())
         actions = np.full(B, -1, dtype=np.int64)
         actions[idx] = a.numpy()
+        if move_class:
+            mc_l.append(torch.from_numpy(env.move_classes(actions)[idx]))  # step の前（指す前の局面で区分を決める）
         rew, done = env.step(actions)
         outcome[done] = rew[done]
         if shape_run is not None:
@@ -1501,6 +1504,7 @@ def _collect_fast(env, net, device, max_steps, generator, rust, extras=False, sh
     return {
         **({"v_actor": torch.cat(v_l), "mu_logp": torch.cat(lp_l)} if extras else {}),
         **({"shape_run": shape_run} if shape_run is not None else {}),
+        **({"move_class": torch.cat(mc_l)} if move_class else {}),
         "legal_cols": torch.cat(cols_l), "legal_counts": torch.cat(cnt_l),
         "obs": torch.cat(obs_l), "action": torch.cat(act_l),
         "mu_a": torch.cat(mu_l), "t": torch.cat(t_l), "b": torch.cat(b_l),

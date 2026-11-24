@@ -504,7 +504,7 @@ def main() -> None:
 
     set_precision(args.precision)
     # 速くする選択肢（docs/rl-learning-speed.md「さらに速くする」）が使えない組み合わせを最初に止める
-    if args.fast_collect and (not args.compact_legal or args.aux_truth > 0 or args.aux_class > 0 or args.nyugyoku
+    if args.fast_collect and (not args.compact_legal or args.aux_truth > 0 or args.nyugyoku
                               or (args.league and args.league_device == "gpu")):
         raise SystemExit("--fast-collect は --compact-legal と一緒に使い、--league-device gpu・入玉ボーナス・"
                          "補助ヘッドとは使えない")
@@ -889,13 +889,14 @@ def main() -> None:
     pipe = None
     if args.pipeline:
         if (league is not None and args.league_device == "gpu") or args.guard or args.speed or args.nyugyoku \
-                or cfg.aux_truth > 0 or args.aux_class > 0:
+                or cfg.aux_truth > 0:
             raise SystemExit("--pipeline はボーナスなし・補助ヘッドなしの設定で使う（リーグは --league-device rust だけ）")
         pipe = PipelinedCollector(
             lambda: (tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False, **obs_kw, **open_kw)
                      if n_self else None), device,
             seed=args.seed * 1_000_003 + 17 + learner.step_count, compact_legal=args.compact_legal,
-            fast=args.fast_collect, actor_extras=args.algo == "mmd", shaping=shape, watch_signals=watch_signals)
+            fast=args.fast_collect, actor_extras=args.algo == "mmd", shaping=shape, watch_signals=watch_signals,
+            move_class=args.aux_class > 0)
 
         def pipe_shape_mult(step):
             """step で使う batch の整形の倍率（--pipeline なしと同じく「その batch を使う step」で決める）"""
