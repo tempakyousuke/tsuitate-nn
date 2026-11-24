@@ -104,6 +104,16 @@ def check_on(bt):
         pass
     else:
         raise AssertionError("move_class の無い batch で aux_class>0 の update が通った")
+    # 補助ヘッドの出力の数を超える区分（tsuitate-bot 側だけ区分を足したとき）は、gather の前に止まる
+    over = dict(bt)
+    over["move_class"] = bt["move_class"].clone()
+    over["move_class"][0] = NUM_MOVE_CLASSES
+    try:
+        L.update(over)
+    except ValueError as e:
+        assert "NUM_MOVE_CLASSES" in str(e), e
+    else:
+        raise AssertionError("範囲外の区分で aux_class>0 の update が通った")
     print(f"T3 aux_class=1: 同じ batch で25更新して補助損失 {losses[0]:.3f} → {losses[-1]:.3f}、ネットの形は不変")
 
 

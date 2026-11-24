@@ -37,7 +37,7 @@ from export_weights import write as write_weights
 from guard import apply_win_bonus as apply_guard_win_bonus
 from guard import summarize as summarize_guard
 from speed import summarize as summarize_speed
-from model import EXTENDED_PLANES, NUM_PLANES, NUM_PLANES_DEDUCED, PolicyValueNet, planes_for
+from model import EXTENDED_PLANES, NUM_MOVE_CLASSES, NUM_PLANES, NUM_PLANES_DEDUCED, PolicyValueNet, planes_for
 from widen_planes import EXTRA_FLAG_NAMES, add_extra_flags, extras_from_args, widen_checkpoint
 from league import League
 import openings
@@ -511,6 +511,14 @@ def main() -> None:
     if args.fast_collect == "rust" and not hasattr(tsuitate_rl.VecEnv, "observe_alive_f16_csr"):
         raise SystemExit("--fast-collect rust には VecEnv.observe_alive_f16_csr が要る（tsuitate-bot の rl-env を "
                          "maturin develop で作り直す）")
+    if args.aux_class > 0:
+        # 区分の数は tsuitate-bot の rl::move_class と補助ヘッドの出力の数（model.NUM_MOVE_CLASSES）の2か所にある
+        names = getattr(tsuitate_rl, "MOVE_CLASS_NAMES", None)
+        if names is None or not hasattr(tsuitate_rl.VecEnv, "move_classes"):
+            raise SystemExit("--aux-class には VecEnv.move_classes が要る（tsuitate-bot の rl-env を maturin develop で作り直す）")
+        if len(names) != NUM_MOVE_CLASSES:
+            raise SystemExit(f"手の区分の数が合わない: tsuitate_rl は {len(names)}、model.NUM_MOVE_CLASSES は "
+                             f"{NUM_MOVE_CLASSES}（補助ヘッドの出力の数を合わせる）")
     if args.device_batch and not (args.compact_legal and (args.packed or args.algo == "mmd")):
         raise SystemExit("--device-batch は --packed --compact-legal と一緒に使う（--algo mmd は --compact-legal だけ）")
     mcfg = check_algo_args(ap, args)

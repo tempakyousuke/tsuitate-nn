@@ -534,6 +534,13 @@ class MMDLearner:
             if "move_class" not in batch:
                 raise ValueError("aux_class > 0 には collect(..., move_class=True) の batch が要る")
             self._ensure_aux()
+            # 区分の数は tsuitate-bot 側（rl::move_class）と補助ヘッドの出力の数の2か所にある。食い違うと gather が
+            # 範囲外になる（CUDA では分かりにくいエラー）ので、ここで止める
+            n_out = self.aux.fc2.out_features
+            top = int(batch["move_class"].max()) if len(batch["move_class"]) else -1
+            if top >= n_out:
+                raise ValueError(f"move_class に {top} がある（補助ヘッドの出力は {n_out} 本）。tsuitate_rl の "
+                                 "MOVE_CLASS_NAMES と model.NUM_MOVE_CLASSES を合わせる")
             for g in self.aux_opt.param_groups:
                 g["lr"] = lr
 

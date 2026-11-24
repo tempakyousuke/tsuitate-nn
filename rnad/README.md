@@ -206,7 +206,10 @@ R-NaD の checkpoint から続ける（net ← 現在のネット、ターゲッ
   （価値の損失と同じ行・重み）。区分は tsuitate-bot の `rl::move_class`（玉を動かす・守りを固める・確定した駒を取りに行く・
   王手を狙う・逃げる・寄せの準備・当たりをかける・その他と、王手中の4区分）で、手番側の観測だけで決まる。報酬・方策の目的は
   変えず、頭は書き出さない（Rust の推論・凍結版は不変）。`--fast-collect`・`--pipeline` とは使えない。R-NaD には付けていない
-  （`tests/test_aux_class.py`）
+  （`tests/test_aux_class.py`）。**回している run に途中から付ける**と、checkpoint に無い `aux_class` は 0 として比べるので
+  設定の食い違いで止まる。続きとして回すなら `--override-config` を付ける（補助ヘッドはその時点で新しく作る）。A/B なら
+  `--init` で新しい run（別の `--out`）を始めれば要らない。区分の数（12）は tsuitate-bot と `model.NUM_MOVE_CLASSES` の2か所に
+  あり、合わないと起動時に止まる
 - `--league`（相手を固定した局）は使える（2026-11-10 から。`--mmd-lambda-unit turn` / `--mmd-gae-lambda-unit turn` とは使えない）。
   報酬を足すなら `--shape` / `--lose-len`（上の「相手を固定してゼロから学習する」）
 - 止める組み合わせ: `--fused`・`--reuse` > 1・`--lr-sched`・`--tail-avg`・ボーナス（`--nyugyoku` / `--guard` /
