@@ -201,6 +201,12 @@ R-NaD の checkpoint から続ける（net ← 現在のネット、ターゲッ
 
 - `--compact-legal` が要る。`--fast-collect`・`--pipeline`・`--device-batch`（`--packed` は無くてよい）・`--lr-warmup`・
   `--reset-adam`・`--reseed`・`--panel`・`--extra-ema`・`--export-current` は使える
+- `--aux-class W`: **手の区分ごとの期待値を予測する補助ヘッド**（2026-11-24）。幹の上に価値の頭と同じ形で出力12本の頭
+  （`model.ClassValueHead`）を付け、指した手の区分の出力を価値の目標（TD(λ)）へ合わせる二乗誤差 × W を損失に足す
+  （価値の損失と同じ行・重み）。区分は tsuitate-bot の `rl::move_class`（玉を動かす・守りを固める・確定した駒を取りに行く・
+  王手を狙う・逃げる・寄せの準備・当たりをかける・その他と、王手中の4区分）で、手番側の観測だけで決まる。報酬・方策の目的は
+  変えず、頭は書き出さない（Rust の推論・凍結版は不変）。`--fast-collect`・`--pipeline` とは使えない。R-NaD には付けていない
+  （`tests/test_aux_class.py`）
 - `--league`（相手を固定した局）は使える（2026-11-10 から。`--mmd-lambda-unit turn` / `--mmd-gae-lambda-unit turn` とは使えない）。
   報酬を足すなら `--shape` / `--lose-len`（上の「相手を固定してゼロから学習する」）
 - 止める組み合わせ: `--fused`・`--reuse` > 1・`--lr-sched`・`--tail-avg`・ボーナス（`--nyugyoku` / `--guard` /

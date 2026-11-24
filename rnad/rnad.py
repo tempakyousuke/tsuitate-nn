@@ -65,7 +65,7 @@ def set_precision(mode: str) -> None:
 
 
 def forward_aux(net, aux, x: torch.Tensor):
-    """`forward` と同じだが、幹の出力を補助ヘッドにも通す: (ロジット, 価値, 補助のロジット [B, 81, 15])"""
+    """`forward` と同じだが、幹の出力を補助ヘッドにも通す: (ロジット, 価値, 補助ヘッドの出力)"""
     if _AMP_DTYPE is None:
         f = net.trunk(x)
         logits, v = net.heads(f)
@@ -1116,6 +1116,9 @@ class MultiEnv:
     def truth(self):
         return np.concatenate([e.truth() for e in self.envs])
 
+    def move_classes(self, actions):
+        return np.concatenate([e.move_classes(np.ascontiguousarray(x)) for e, x in zip(self.envs, self._split(actions))])
+
     def signals(self):
         return np.concatenate([e.signals() for e in self.envs])
 
@@ -1146,7 +1149,7 @@ class MultiEnv:
 
 def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode="enter",
             nyugyoku_zero_sum=True, opponents=None, opp_nets=None, nyugyoku_win_only=False, truth=False,
-            generator=None, compact_legal=False, fast="", actor_extras=False, shaping=None, shape_mult=1.0,
+            generator=None, move_class=False, compact_legal=False, fast="", actor_extras=False, shaping=None, shape_mult=1.0,
             watch_signals=False, noise_rng=None):
     """`env`（auto_reset=False の VecEnv）の全局を1局ずつ最後まで自己対局し、学習用に並べる。
 
@@ -1190,6 +1193,10 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
     `truth=True` なら記録する各手番の**真実の盤面のラベル**（`VecEnv.truth()`、[N, 81] int8）を
     `truth` に入れて返す（補助ヘッド用。乱数は消費しない）
 
+    `move_class=True` なら記録する各手番の**指した手の区分**（`VecEnv.move_classes`、tsuitate-bot の `rl::move_class`。
+    [N] int8、`tsuitate_rl.MOVE_CLASS_NAMES` の添字）を `move_class` に入れて返す（区分ごとの期待値の補助ヘッド用。
+    乱数は消費しない）
+
     `compact_legal=True` なら合法手のマスクを密な [N, 11259] の bool でなく、**合法手の添字**（行ごとに昇順でつなげた
     `legal_cols` int16 と行ごとの個数 `legal_counts`）で持つ（768局で約 0.79GB → 約 11MB。`--pipeline` で batch が
     2つ同時にあるときのメモリ対策。`RNaDLearner.update` はどちらの形でも同じ結果になる）
@@ -1218,7 +1225,7 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
     if fast:
         if fast not in ("py", "rust"):
             raise ValueError(f"fast {fast!r}（'py' か 'rust'）")
-        if opponents is not None or nyugyoku_lambda != 0 or truth or not compact_legal:
+        if opponents is not None or nyugyoku_lambda != 0 or truth or move_class or not compact_legal:
             raise ValueError("collect(fast=...) は自己対局（opponents なし）・入玉ボーナスなし・truth なし・"
                              "compact_legal=True に限る")
         if fast == "rust" and not all(hasattr(e, "observe_alive_f16_csr") for e in getattr(env, "envs", [env])):
@@ -1234,6 +1241,7 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
     B = env.num_envs
     obs_l, legal_l, act_l, mu_l, t_l, b_l, truth_l = [], [], [], [], [], [], []
     v_l, lp_l = [], []  # actor_extras
+    mc_l = []  # move_class
     valid = torch.zeros(max_steps, B, dtype=torch.bool)
     player = torch.zeros(max_steps, B, dtype=torch.long)
     reward = torch.zeros(max_steps, B, 2)
@@ -1324,6 +1332,7 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
                     a_noise = env.random_legal_actions(u)
                     sel = a_noise >= 0
                     actions[sel] = a_noise[sel]
+        mc = env.move_classes(actions) if move_class else None  # step の前（指す前の局面で区分を決める）
         rew, done = env.step(actions)
         outcome[done] = rew[done]
         if shape_run is not None:
@@ -1357,6 +1366,8 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
         b_l.append(torch.from_numpy(idx))
         if truth:
             truth_l.append(torch.from_numpy(tr[idx]))
+        if move_class:
+            mc_l.append(torch.from_numpy(mc[idx]))
     else:
         raise RuntimeError(f"{max_steps} 手で終わらない局がある")
     for t0, b, p, bonus in pending:
@@ -1366,6 +1377,8 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
                 reward[t0, b, 1 - p] -= bonus
     T = t + 1
     extra = {"truth": torch.cat(truth_l)} if truth else {}
+    if move_class:
+        extra["move_class"] = torch.cat(mc_l)
     if actor_extras:
         extra.update(v_actor=torch.cat(v_l), mu_logp=torch.cat(lp_l))
     if shape_run is not None:

@@ -179,6 +179,8 @@ def check_algo_args(ap, args):
     if args.algo == "rnad":
         if mmd_given or args.mmd_preset != "tsuitate" or args.init_which != "target" or args.init_step:
             raise SystemExit("--mmd-* / --init-which / --init-step は --algo mmd のときだけ使う")
+        if args.aux_class > 0:
+            raise SystemExit("--aux-class は --algo mmd のときだけ使う（R-NaD の学習器には付けていない）")
         return None
     if not args.compact_legal:
         raise SystemExit("--algo mmd は --compact-legal と一緒に使う（収集方策の対数確率を合法手の添字の並びで持つ）")
@@ -205,7 +207,7 @@ def check_algo_args(ap, args):
             temp_t_off=args.mmd_temp_t_off, lr=_floats4(args.mmd_lr, "mmd-lr"), lr_t_off=args.mmd_lr_t_off,
             t_scale=args.mmd_t_scale, steps=args.mmd_steps, chunk=args.mmd_chunk, epochs=args.mmd_epochs,
             max_grad_norm=args.mmd_max_grad_norm, adam_b1=args.mmd_adam_b1, value_warmup=args.mmd_value_warmup,
-            adv_norm=args.mmd_adv_norm,
+            adv_norm=args.mmd_adv_norm, aux_class=(args.aux_class if args.aux_class > 0 else None),
             target_avg=args.target_avg)
     except ValueError as e:
         raise SystemExit(f"MMD の設定: {e}") from e
@@ -262,6 +264,9 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--aux-truth", type=float, default=0.0,
                     help="真実の盤面を予測する補助ヘッドの損失の重み（0 = 使わない。報酬・方策の目的は変えない）")
+    ap.add_argument("--aux-class", type=float, default=0.0,
+                    help="（--algo mmd）手の区分ごとの期待値を予測する補助ヘッドの損失の重み（0 = 使わない。報酬・方策の"
+                         "目的は変えない。区分は tsuitate-bot の rl::move_class。--fast-collect / --pipeline とは使えない）")
     ap.add_argument("--override-config", action="store_true",
                     help="再開時に checkpoint と違う設定（学習率・β など）を使うことを許す。"
                          "指定しないと設定の食い違いは停止する")
@@ -499,7 +504,7 @@ def main() -> None:
 
     set_precision(args.precision)
     # 速くする選択肢（docs/rl-learning-speed.md「さらに速くする」）が使えない組み合わせを最初に止める
-    if args.fast_collect and (not args.compact_legal or args.aux_truth > 0 or args.nyugyoku
+    if args.fast_collect and (not args.compact_legal or args.aux_truth > 0 or args.aux_class > 0 or args.nyugyoku
                               or (args.league and args.league_device == "gpu")):
         raise SystemExit("--fast-collect は --compact-legal と一緒に使い、--league-device gpu・入玉ボーナス・"
                          "補助ヘッドとは使えない")
@@ -876,7 +881,7 @@ def main() -> None:
     pipe = None
     if args.pipeline:
         if (league is not None and args.league_device == "gpu") or args.guard or args.speed or args.nyugyoku \
-                or cfg.aux_truth > 0:
+                or cfg.aux_truth > 0 or args.aux_class > 0:
             raise SystemExit("--pipeline はボーナスなし・補助ヘッドなしの設定で使う（リーグは --league-device rust だけ）")
         pipe = PipelinedCollector(
             lambda: (tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False, **obs_kw, **open_kw)
@@ -1074,7 +1079,8 @@ def main() -> None:
                             nyugyoku_win_only=args.nyugyoku_cond == "win",
                             opponents=(None if league_games is None else [None] * n_self + league_games),
                             opp_nets=(opp_nets if league_games is not None else None),
-                            truth=cfg.aux_truth > 0, compact_legal=args.compact_legal, fast=args.fast_collect,
+                            truth=cfg.aux_truth > 0, move_class=args.aux_class > 0,
+                            compact_legal=args.compact_legal, fast=args.fast_collect,
                             actor_extras=args.algo == "mmd", shaping=shape, shape_mult=shape_mult,
                             watch_signals=watch_signals,
                             # ハンデの雑音の乱数（--league-device gpu。相手の配分の乱数 rng の続きから引く = 更新ごとに決まる）
