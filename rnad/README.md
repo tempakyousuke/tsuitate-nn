@@ -152,6 +152,19 @@ v2（91枚）の後ろに観測と自分側だけで決まる事実を足した 
 - 同じことを学習の外で行うなら `widen_planes.py <元> <出力> --opp-hand-planes`（v3 の checkpoint に組を足すときも同じ）
 - 検査は `tests/test_extra_planes.py`（tsuitate_rl が入っていれば Rust 側の組の並びとも照合する）
 
+**実験用の入力: 序盤の時計**（`--exp-opp-clock`。2026-11-24）: 「初手からの相手の手数 ÷ 12（上限 1）」の 1枚だけを足す。
+`check_clock` の組は王手がまだ無いあいだ初手から数えるので、その間は細かい時計としても働く。離陸の実験でこの組が効いたのが
+王手の情報のせいか時計のせいかを分ける腕に使う（tsuitate-bot の `docs/rl-fixed-opponent.md` 8.8節）。
+
+- **エンコーダ（Rust）は変えない**。観測の 139番（`opp_counts` の 4枚目 = 相手の指した手 ÷ 100）から、ネットの入口
+  （`PolicyValueNet.trunk`）で作って 139番の位置に入れる。`opp_counts` の残りの 3枚は読まない。入力は v6 の 142枚になり、
+  `--opp-count-planes` とは一緒に使えない
+- **Rust の推論には無い変換**なので、このネットは Rust では指せない。書き出す重みは magic を `TSRLPY01` にして、Rust 側
+  （アリーナ・凍結版）が読まないようにしてある（`export_weights.MAGIC_PY`。Python の `read` は読む）。相手の束
+  （`pad_planes`）に積む・`widen_planes.py` で広げる・`--init` で既存の重みから始める・再開でフラグを付け外しする、は止まる
+- 本線・凍結版には使わない。効くと分かったら、エンコーダに正式なプレーンとして足す
+- 検査は `tests/test_exp_opp_clock.py`（作る値・読む列・書き出し・止める指定・実際の観測で `check_clock` の手数と一致すること）
+
 学習ログには `lr`（実際の学習率）と、方策の固まり方の見張り `pi_top_mean` / `pi_top_gt_0999` / `entropy_mean` が出る。
 
 ## MMD 学習器（Ataraxos 型、`--algo mmd`）

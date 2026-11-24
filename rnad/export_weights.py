@@ -4,6 +4,7 @@
 
 形式（リトルエンディアン）:
     b"TSRLPV01" | u32 ヘッダ長 | ヘッダ JSON（planes/channels/blocks と tensors の名前・形）| f32 の並び
+Rust の推論に無い入力の変換を持つネット（実験用）は magic を b"TSRLPY01" にして書く（Rust は読まない。`MAGIC_PY`）。
 BatchNorm は直前の畳み込みへ畳み込んで書く（Rust 側は畳み込み＋バイアスだけを持つ）。
 
 `--test-vector <path>` を付けると、検証用の入力と PyTorch の出力（eval モード）を JSON で書く。
@@ -23,6 +24,15 @@ import torch
 from model import PolicyValueNet, inference_net
 
 MAGIC = b"TSRLPV01"
+# **Python だけで読める重み**。Rust の推論（`src/rl/policy_net.rs`）に無い入力の変換を持つネット（実験用の序盤の時計 =
+# `model.EXP_OPP_CLOCK_PLANE`）はこの magic で書く。中身の形式は同じ。Rust 側（凍結版の固定コピー・古いバイナリも）は
+# magic 不一致で読まないので、変換を落としたまま黙って指すことがない。`read` はどちらも読む
+MAGIC_PY = b"TSRLPY01"
+
+
+def python_only(config: dict) -> bool:
+    """Rust の推論では再現できないネットか（`MAGIC_PY` で書く）"""
+    return bool(config.get("exp_opp_clock"))
 
 
 def fold(conv: torch.nn.Conv2d, bn: torch.nn.BatchNorm2d):
@@ -62,7 +72,7 @@ def write(net: PolicyValueNet, path: pathlib.Path) -> None:
     header = {**net.config, "tensors": [{"name": n, "shape": list(t.shape)} for n, t in ts]}
     hb = json.dumps(header).encode()
     with open(path, "wb") as f:
-        f.write(MAGIC)
+        f.write(MAGIC_PY if python_only(net.config) else MAGIC)
         f.write(struct.pack("<I", len(hb)))
         f.write(hb)
         for _, t in ts:
@@ -92,10 +102,12 @@ def read(path) -> PolicyValueNet:
     （平均 0・分散 1−eps・係数 1）にして畳み込み後のバイアスだけを持たせる。eval モードで
     書き出し元と同じ出力になる（リーグの相手を GPU で指させるために使う。学習には使わない）"""
     data = pathlib.Path(path).read_bytes()
-    if data[:8] != MAGIC:
+    if data[:8] not in (MAGIC, MAGIC_PY):
         raise ValueError(f"{path} は方策ネットの重みではない（magic 不一致）")
     hlen = struct.unpack("<I", data[8:12])[0]
     header = json.loads(data[12:12 + hlen])
+    if python_only(header) != (data[:8] == MAGIC_PY):
+        raise ValueError(f"{path} の magic とヘッダが合わない（Python 専用の重みは {MAGIC_PY!r}）")
     off = 12 + hlen
     ts = {}
     for t in header["tensors"]:

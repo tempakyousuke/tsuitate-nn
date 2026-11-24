@@ -62,6 +62,15 @@ DROPPABLE_PLANES = {"king_wide": 89}
 # 組の名前 → その組を使うと読まなくなるプレーンの名前
 REPLACES = {"king_tight": "king_wide"}
 NUM_ACTION_KINDS = 139
+# **実験用の入力: 序盤の時計**（2026-11-24。tsuitate-bot の docs/rl-fixed-opponent.md 8.8節）。「初手からの相手の手数 ÷ 12
+# （上限 1）」の 1枚。`check_clock` の組が離陸を早くしたのは王手の情報のせいか、王手が無い間の細かい時計（この組は王手が
+# まだ無ければ初手から数える）のせいかを分ける腕に使う。エンコーダ（Rust）にプレーンを足さず、観測の 139番（`opp_counts` の
+# 4枚目 = 相手の指した手 ÷ 100）からネットの入口で作って 139番の位置に入れる（`opp_counts` の残りの 3枚は読まない）。
+# **Rust の推論には無い変換**なので、このネットの重みは Rust では指せない（`export_weights.write` が Python 専用の magic で
+# 書く）。相手の束（`pad_planes`）にも積めず、`widen_planes.py` でも広げられない。本線・凍結版には使わない
+EXP_OPP_CLOCK_PLANE = 139
+EXP_OPP_CLOCK_SRC = 100.0  # 139番の値 × これ = 相手の指した手の数（観測は fp16 に丸まっているので四捨五入で戻す）
+EXP_OPP_CLOCK_DIV = 12.0  # `check_clock` の手数と同じ刻み・同じ上限
 
 
 def planes_for(extras) -> int:
@@ -131,9 +140,11 @@ class ResBlock(nn.Module):
 
 
 class PolicyValueNet(nn.Module):
-    def __init__(self, channels: int = 64, blocks: int = 6, planes: int = NUM_PLANES, extras=(), drop=None):
+    def __init__(self, channels: int = 64, blocks: int = 6, planes: int = NUM_PLANES, extras=(), drop=None,
+                 exp_opp_clock: bool = False):
         """`drop` = 読まないプレーンの名前（`DROPPABLE_PLANES`）。省くと組から決まる既定（`king_tight` を使うなら
-        元の相手玉の候補を読まない）。checkpoint・重みのヘッダから作るときは保存された値をそのまま使う（`from_config`）"""
+        元の相手玉の候補を読まない）。checkpoint・重みのヘッダから作るときは保存された値をそのまま使う（`from_config`）。
+        `exp_opp_clock` = 実験用の序盤の時計（`EXP_OPP_CLOCK_PLANE`）を入口で作って読む"""
         super().__init__()
         extras = normalize_extras(planes, extras)
         drop = normalize_drop(planes, default_drop(extras) if drop is None else drop)
@@ -142,10 +153,21 @@ class PolicyValueNet(nn.Module):
             self.config["extras"] = extras
         if drop:  # 無いときはキーを足さない（これまでの checkpoint・重みのヘッダと同じ形のまま）
             self.config["drop"] = drop
+        self.exp_opp_clock = bool(exp_opp_clock)
+        if self.exp_opp_clock:
+            if planes not in EXTENDED_PLANES or planes <= EXP_OPP_CLOCK_PLANE:
+                raise ValueError(f"実験用の序盤の時計は観測の {EXP_OPP_CLOCK_PLANE}番から作るので、v6（{NUM_PLANES_V6}枚）"
+                                 f"以降のネットだけが持てる（planes {planes}）")
+            if "opp_counts" in extras:
+                raise ValueError(f"実験用の序盤の時計は opp_counts の組と一緒に使えない（{EXP_OPP_CLOCK_PLANE}番を作り替える）")
+            self.config["exp_opp_clock"] = True
         self.stem = nn.Conv2d(planes, channels, 3, padding=1, bias=False)
         # 使わない入力プレーン（v3 以降で選ばなかった組と、読まないプレーン）。入力を 0 にするので stem のその列には勾配が来ず、
         # 0 で始めた列は 0 のまま（書き出した重みも 0）。state_dict には入れない（config から作り直せる）
         off = unused_planes(planes, extras, drop)
+        if self.exp_opp_clock:  # 139番だけは読む（`opp_counts` を選んでいないので、残りの 3枚は off のまま）
+            off = [i for i in off if i != EXP_OPP_CLOCK_PLANE]
+            assert off, "opp_counts の残りの 3枚が off にあるはず"
         if off:
             mask = torch.zeros(planes, dtype=torch.bool)
             mask[off] = True
@@ -172,8 +194,14 @@ class PolicyValueNet(nn.Module):
         planes = self.config["planes"]
         if x.shape[1] > planes:
             x = x[:, :planes]
+        clock = None
+        if self.exp_opp_clock:
+            moves = torch.round(x[:, EXP_OPP_CLOCK_PLANE] * EXP_OPP_CLOCK_SRC)
+            clock = (moves / EXP_OPP_CLOCK_DIV).clamp(max=1.0)
         if self.in_off is not None:
             x = x.masked_fill(self.in_off, 0)
+        if clock is not None:
+            x[:, EXP_OPP_CLOCK_PLANE] = clock  # 上の masked_fill が作った写しへ書く（in_off は必ずある）
         x = torch.relu(self.stem_bn(self.stem(x)))
         for b in self.blocks:
             x = b(x)
@@ -183,7 +211,7 @@ class PolicyValueNet(nn.Module):
     def from_config(cls, config: dict) -> "PolicyValueNet":
         """checkpoint の `config`（や重みファイルのヘッダ）からネットの形を作る（v3 以降の組の選び方も含む）"""
         return cls(config["channels"], config["blocks"], config["planes"], config.get("extras", ()),
-                   drop=config.get("drop", ()))
+                   drop=config.get("drop", ()), exp_opp_clock=config.get("exp_opp_clock", False))
 
     def forward(self, x):
         return self.heads(self.trunk(x))

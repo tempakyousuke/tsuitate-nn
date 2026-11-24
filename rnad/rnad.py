@@ -953,6 +953,8 @@ def pad_planes(net, planes: int):
     なので結果は同じ）。相手のネットをまとめて推論する `OpponentPool` が、入力の版の違う相手を1つに積むために使う"""
     from model import EXTENDED_PLANES, EXTRA_PLANES, inference_net
     cfg = net.config
+    if cfg.get("exp_opp_clock"):
+        raise ValueError("実験用の入力（序盤の時計）を持つネットは相手の束に積めない（入口の変換が落ちる）")
     if cfg["planes"] > planes:
         raise ValueError(f"入力 {cfg['planes']}枚のネットを {planes}枚へは狭められない")
     if cfg["planes"] == planes and getattr(net, "in_off", None) is None:

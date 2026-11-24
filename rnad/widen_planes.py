@@ -110,6 +110,9 @@ def widen_checkpoint(ck: dict, planes: int = NUM_PLANES_DEDUCED, extras=None) ->
     ならない: 元のプレーンの列の重み（と Adam の状態）を新しい組の列へ移し、元のプレーンは読まなくする
     （`config["drop"]`）。広げた直後は「元のプレーンの代わりに新しいプレーンを読む」ネットになる"""
     cfg = ck["config"]
+    if cfg.get("exp_opp_clock"):
+        raise ValueError("実験用の入力（序盤の時計）を持つ checkpoint は広げられない（139番を作り替えているので、"
+                         "opp_counts の組と両立しない）")
     old = cfg["planes"]
     old_extras = normalize_extras(old, cfg.get("extras", ()))
     new_extras = old_extras if extras is None else normalize_extras(planes, extras)

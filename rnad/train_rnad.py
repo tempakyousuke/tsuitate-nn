@@ -37,7 +37,7 @@ from export_weights import write as write_weights
 from guard import apply_win_bonus as apply_guard_win_bonus
 from guard import summarize as summarize_guard
 from speed import summarize as summarize_speed
-from model import EXTENDED_PLANES, NUM_PLANES, NUM_PLANES_DEDUCED, PolicyValueNet, planes_for
+from model import EXTENDED_PLANES, NUM_PLANES, NUM_PLANES_DEDUCED, NUM_PLANES_V6, PolicyValueNet, planes_for
 from widen_planes import EXTRA_FLAG_NAMES, add_extra_flags, extras_from_args, widen_checkpoint
 from league import League
 import openings
@@ -93,7 +93,7 @@ def with_extras(ck: dict, want: list, what, verbose: bool = True) -> dict:
 
 
 def load_net(path: str, channels: int, blocks: int, which: str = "target", planes: int = NUM_PLANES,
-             extras=None) -> PolicyValueNet:
+             extras=None, exp_opp_clock: bool = False) -> PolicyValueNet:
     """模倣学習（train_bc.py）の checkpoint か、R-NaD（train_rnad.py）の checkpoint から読む。
     R-NaD の checkpoint は `which`（既定はターゲットネット = 書き出す重みと同じ）を読む。
     `none` は乱数初期化（入力のプレーン数は `planes`。v3 以降の組 `extras` があればその組が入る最小の版）。
@@ -101,7 +101,11 @@ def load_net(path: str, channels: int, blocks: int, which: str = "target", plane
     if path == "none":
         if extras:
             planes = planes_for(extras)
-        return PolicyValueNet(channels, blocks, planes, extras or ())
+        if exp_opp_clock:  # 実験用の序盤の時計は v6 の観測の 139番から作る
+            planes = max(planes, NUM_PLANES_V6)
+        return PolicyValueNet(channels, blocks, planes, extras or (), exp_opp_clock=exp_opp_clock)
+    if exp_opp_clock:
+        raise SystemExit("実験用の序盤の時計（--exp-opp-clock）は乱数初期化からだけ使える")
     ck = torch.load(path, map_location="cpu")
     if extras is not None:
         ck = with_extras(ck, extras, path)
@@ -492,11 +496,18 @@ def main() -> None:
     # v2 以降の checkpoint から始める・再開するときは読み込み時に組が入る版へ広げる（足した列は 0 = 元と同じ関数から始まる）。
     # 一度足した組は、以後の再開でもフラグを付ける（外すと止める）
     add_extra_flags(ap)
+    ap.add_argument("--exp-opp-clock", action="store_true",
+                    help="実験用: 序盤の時計（初手からの相手の手数 ÷ 12・上限 1 の 1枚）を入力に使う。観測の 139番"
+                         "（相手の指した手 ÷ 100）からネットの入口で作る（model.EXP_OPP_CLOCK_PLANE。入力は v6 の 142枚に"
+                         "なり、--opp-count-planes とは使えない）。--init none からだけ。Rust の推論に無い変換なので、"
+                         "書き出す重みは Python 専用（Rust では指せない）。本線には使わない")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--precision", choices=PRECISIONS, default="default",
                     help="ネットの計算精度（rnad.set_precision。default でも畳み込みは TF32 = tf32 と速さは同じ）")
     args = ap.parse_args()
 
+    if args.exp_opp_clock and args.init != "none":
+        raise SystemExit("--exp-opp-clock は乱数初期化（--init none）からだけ使える（既存の重みには変換の列が無い）")
     set_precision(args.precision)
     # 速くする選択肢（docs/rl-learning-speed.md「さらに速くする」）が使えない組み合わせを最初に止める
     if args.fast_collect and (not args.compact_legal or args.aux_truth > 0 or args.nyugyoku
@@ -640,6 +651,9 @@ def main() -> None:
                          "別の学習器として黙って再開しない")
     extras = extras_from_args(args)
     if ck is not None and "config" in ck:
+        if bool(ck["config"].get("exp_opp_clock")) != args.exp_opp_clock:
+            raise SystemExit(f"{ck_path} は --exp-opp-clock {'あり' if ck['config'].get('exp_opp_clock') else 'なし'}の"
+                             "checkpoint。再開では同じ指定にする（入口の変換を黙って付け外ししない）")
         ck = with_extras(ck, extras, ck_path)
     if ck is not None and "config" in ck:
         # 再開: ネットの形は checkpoint から（--init には依存しない）
@@ -648,7 +662,8 @@ def main() -> None:
             print("checkpoint から再開するので --init / --init-which / --init-step は使わない", flush=True)
     else:
         init_net = load_net(args.init, args.channels, args.blocks, planes=args.planes,
-                            which=("net" if args.init_which in ("net", "both") else "target"), extras=extras)
+                            which=("net" if args.init_which in ("net", "both") else "target"), extras=extras,
+                            exp_opp_clock=args.exp_opp_clock)
     if args.algo == "mmd":
         learner = MMDLearner(init_net, mcfg, device, seed=args.seed, device_batch=args.device_batch,
                              stale_actor=args.pipeline)
