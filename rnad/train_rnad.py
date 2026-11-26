@@ -37,7 +37,7 @@ from export_weights import write as write_weights
 from guard import apply_win_bonus as apply_guard_win_bonus
 from guard import summarize as summarize_guard
 from speed import summarize as summarize_speed
-from model import EXTENDED_PLANES, NUM_PLANES, NUM_PLANES_DEDUCED, PolicyValueNet, planes_for
+from model import EXTENDED_PLANES, NUM_MOVE_CLASSES, NUM_PLANES, NUM_PLANES_DEDUCED, PolicyValueNet, planes_for
 from widen_planes import EXTRA_FLAG_NAMES, add_extra_flags, extras_from_args, widen_checkpoint
 from league import League
 import openings
@@ -179,6 +179,8 @@ def check_algo_args(ap, args):
     if args.algo == "rnad":
         if mmd_given or args.mmd_preset != "tsuitate" or args.init_which != "target" or args.init_step:
             raise SystemExit("--mmd-* / --init-which / --init-step は --algo mmd のときだけ使う")
+        if args.aux_class > 0:
+            raise SystemExit("--aux-class は --algo mmd のときだけ使う（R-NaD の学習器には付けていない）")
         return None
     if not args.compact_legal:
         raise SystemExit("--algo mmd は --compact-legal と一緒に使う（収集方策の対数確率を合法手の添字の並びで持つ）")
@@ -205,7 +207,7 @@ def check_algo_args(ap, args):
             temp_t_off=args.mmd_temp_t_off, lr=_floats4(args.mmd_lr, "mmd-lr"), lr_t_off=args.mmd_lr_t_off,
             t_scale=args.mmd_t_scale, steps=args.mmd_steps, chunk=args.mmd_chunk, epochs=args.mmd_epochs,
             max_grad_norm=args.mmd_max_grad_norm, adam_b1=args.mmd_adam_b1, value_warmup=args.mmd_value_warmup,
-            adv_norm=args.mmd_adv_norm,
+            adv_norm=args.mmd_adv_norm, aux_class=(args.aux_class if args.aux_class > 0 else None),
             target_avg=args.target_avg)
     except ValueError as e:
         raise SystemExit(f"MMD の設定: {e}") from e
@@ -262,6 +264,9 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--aux-truth", type=float, default=0.0,
                     help="真実の盤面を予測する補助ヘッドの損失の重み（0 = 使わない。報酬・方策の目的は変えない）")
+    ap.add_argument("--aux-class", type=float, default=0.0,
+                    help="（--algo mmd）手の区分ごとの期待値を予測する補助ヘッドの損失の重み（0 = 使わない。報酬・方策の"
+                         "目的は変えない。区分は tsuitate-bot の rl::move_class。--fast-collect / --pipeline とは使えない）")
     ap.add_argument("--override-config", action="store_true",
                     help="再開時に checkpoint と違う設定（学習率・β など）を使うことを許す。"
                          "指定しないと設定の食い違いは停止する")
@@ -506,6 +511,14 @@ def main() -> None:
     if args.fast_collect == "rust" and not hasattr(tsuitate_rl.VecEnv, "observe_alive_f16_csr"):
         raise SystemExit("--fast-collect rust には VecEnv.observe_alive_f16_csr が要る（tsuitate-bot の rl-env を "
                          "maturin develop で作り直す）")
+    if args.aux_class > 0:
+        # 区分の数は tsuitate-bot の rl::move_class と補助ヘッドの出力の数（model.NUM_MOVE_CLASSES）の2か所にある
+        names = getattr(tsuitate_rl, "MOVE_CLASS_NAMES", None)
+        if names is None or not hasattr(tsuitate_rl.VecEnv, "move_classes"):
+            raise SystemExit("--aux-class には VecEnv.move_classes が要る（tsuitate-bot の rl-env を maturin develop で作り直す）")
+        if len(names) != NUM_MOVE_CLASSES:
+            raise SystemExit(f"手の区分の数が合わない: tsuitate_rl は {len(names)}、model.NUM_MOVE_CLASSES は "
+                             f"{NUM_MOVE_CLASSES}（補助ヘッドの出力の数を合わせる）")
     if args.device_batch and not (args.compact_legal and (args.packed or args.algo == "mmd")):
         raise SystemExit("--device-batch は --packed --compact-legal と一緒に使う（--algo mmd は --compact-legal だけ）")
     mcfg = check_algo_args(ap, args)
@@ -882,7 +895,8 @@ def main() -> None:
             lambda: (tsuitate_rl.VecEnv(n_self, seed=args.seed, auto_reset=False, **obs_kw, **open_kw)
                      if n_self else None), device,
             seed=args.seed * 1_000_003 + 17 + learner.step_count, compact_legal=args.compact_legal,
-            fast=args.fast_collect, actor_extras=args.algo == "mmd", shaping=shape, watch_signals=watch_signals)
+            fast=args.fast_collect, actor_extras=args.algo == "mmd", shaping=shape, watch_signals=watch_signals,
+            move_class=args.aux_class > 0)
 
         def pipe_shape_mult(step):
             """step で使う batch の整形の倍率（--pipeline なしと同じく「その batch を使う step」で決める）"""
@@ -1074,7 +1088,8 @@ def main() -> None:
                             nyugyoku_win_only=args.nyugyoku_cond == "win",
                             opponents=(None if league_games is None else [None] * n_self + league_games),
                             opp_nets=(opp_nets if league_games is not None else None),
-                            truth=cfg.aux_truth > 0, compact_legal=args.compact_legal, fast=args.fast_collect,
+                            truth=cfg.aux_truth > 0, move_class=args.aux_class > 0,
+                            compact_legal=args.compact_legal, fast=args.fast_collect,
                             actor_extras=args.algo == "mmd", shaping=shape, shape_mult=shape_mult,
                             watch_signals=watch_signals,
                             # ハンデの雑音の乱数（--league-device gpu。相手の配分の乱数 rng の続きから引く = 更新ごとに決まる）

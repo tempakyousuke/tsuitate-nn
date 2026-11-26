@@ -229,6 +229,30 @@ class TruthHead(nn.Module):
         return self.conv(x).flatten(2).transpose(1, 2) + self.sq_bias  # [B, 81, 15]
 
 
+NUM_MOVE_CLASSES = 12
+
+
+class ClassValueHead(nn.Module):
+    """**手の区分ごとの期待値を予測する補助ヘッド**（2026-11-24。`--aux-class`）。
+
+    幹の出力から、手の区分（tsuitate-bot の `rl::move_class`。玉を動かす・守りを固める・確定した駒を取りに行く・
+    王手を狙う・逃げる・寄せの準備・当たりをかける・その他の平時8区分と、王手中の4区分）ごとに「その区分の手を
+    指したときの価値」を出す（価値の頭と同じ形で、出力が12本）。学習は指した手の区分の出力だけを価値の目標へ
+    合わせる。補助損失にだけ使い、**ネットの書き出しには入らない**（`TruthHead` と同じく `PolicyValueNet` の外に持つ）
+    """
+
+    def __init__(self, channels: int = 64):
+        super().__init__()
+        self.conv = nn.Conv2d(channels, 4, 1, bias=False)
+        self.bn = nn.BatchNorm2d(4)
+        self.fc1 = nn.Linear(4 * 81, 128)
+        self.fc2 = nn.Linear(128, NUM_MOVE_CLASSES)
+
+    def forward(self, x):
+        h = torch.relu(self.bn(self.conv(x))).flatten(1)
+        return torch.tanh(self.fc2(torch.relu(self.fc1(h))))  # [B, 12]
+
+
 def masked_logits(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """マスク外を -inf 相当にする（softmax・argmax・交差エントロピーの前に通す）"""
     return logits.masked_fill(~mask, -1e9)
