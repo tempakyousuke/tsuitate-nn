@@ -26,12 +26,13 @@ from export_weights import read as read_weights  # noqa: E402
 from export_weights import write as write_weights  # noqa: E402
 from mmd import MMDLearner, make_config  # noqa: E402
 from model import (DROPPABLE_PLANES, EXTRA_PLANES, NUM_PLANES, NUM_PLANES_DEDUCED, NUM_PLANES_V3,  # noqa: E402
-                   NUM_PLANES_V4, NUM_PLANES_V5, NUM_PLANES_V6, PolicyValueNet, planes_for, unused_planes)
+                   NUM_PLANES_V4, NUM_PLANES_V5, NUM_PLANES_V6, NUM_PLANES_V7, PolicyValueNet, planes_for, unused_planes)
 from rnad import RNaDConfig, RNaDLearner  # noqa: E402
 from widen_planes import EXTRA_FLAGS, add_extra_flags, extras_from_args, widen_checkpoint  # noqa: E402
 
 DEV = torch.device("cpu")
 CFG = RNaDConfig(eta=0.2, beta=16.0, lr=2e-4, schedule_sizes=(200,), schedule_repeats=(1,))
+V7_GROUPS = ["ray_hits"]
 V6_GROUPS = ["king_tight", "check_clock", "checker_memo", "own_attacks", "king_lines", "opp_counts", "exposed"]
 # (プレーン数, 使う組)
 CHOICES = [
@@ -41,10 +42,12 @@ CHOICES = [
     (NUM_PLANES_V4, ["king_fouls", "opp_fouls", "opp_hand"]),
     (NUM_PLANES_V5, []), (NUM_PLANES_V5, ["lost_fresh"]), (NUM_PLANES_V5, ["lost_roles"]), (NUM_PLANES_V5, ["cap_roles"]),
     (NUM_PLANES_V5, ["pawn_files"]), (NUM_PLANES_V5, ["cap_roles", "king_fouls", "lost_roles", "opp_hand"]),
-    (NUM_PLANES_V5, sorted(set(EXTRA_PLANES) - set(V6_GROUPS))),
+    (NUM_PLANES_V5, sorted(set(EXTRA_PLANES) - set(V6_GROUPS) - set(V7_GROUPS))),
     (NUM_PLANES_V6, []), (NUM_PLANES_V6, ["king_tight"]), (NUM_PLANES_V6, ["check_clock", "own_attacks"]),
     (NUM_PLANES_V6, ["checker_memo", "king_lines", "opp_hand", "pawn_files"]), (NUM_PLANES_V6, ["opp_counts"]), (NUM_PLANES_V6, ["exposed"]),
-    (NUM_PLANES_V6, sorted(EXTRA_PLANES)),
+    (NUM_PLANES_V6, sorted(set(EXTRA_PLANES) - set(V7_GROUPS))),
+    (NUM_PLANES_V7, []), (NUM_PLANES_V7, ["ray_hits"]), (NUM_PLANES_V7, ["king_tight", "ray_hits"]),
+    (NUM_PLANES_V7, sorted(EXTRA_PLANES)),
 ]
 V5_GROUPS = ["lost_fresh", "lost_roles", "cap_roles", "pawn_files"]
 
@@ -93,7 +96,7 @@ def same(a, b, x_a, x_b, what):
 
 def check_layout():
     spans = sorted(EXTRA_PLANES.values())
-    assert spans[0][0] == NUM_PLANES_DEDUCED and sum(n for _, n in spans) == NUM_PLANES_V6 - NUM_PLANES_DEDUCED
+    assert spans[0][0] == NUM_PLANES_DEDUCED and sum(n for _, n in spans) == NUM_PLANES_V7 - NUM_PLANES_DEDUCED
     for (s, n), (t, _) in zip(spans, spans[1:]):
         assert s + n == t, "組は隙間なく並ぶ"
     assert planes_for([]) == NUM_PLANES_DEDUCED
@@ -103,7 +106,9 @@ def check_layout():
         assert planes_for([name]) == planes_for([name, "opp_hand"]) == NUM_PLANES_V5, name
     for name in V6_GROUPS:
         assert planes_for([name]) == planes_for([name, "pawn_files"]) == NUM_PLANES_V6, name
-    assert sorted(V5_GROUPS + V6_GROUPS + ["opp_hand", "opp_fouls", "king_fouls"]) == sorted(EXTRA_PLANES)
+    for name in V7_GROUPS:
+        assert planes_for([name]) == planes_for([name, "exposed"]) == NUM_PLANES_V7, name
+    assert sorted(V5_GROUPS + V6_GROUPS + V7_GROUPS + ["opp_hand", "opp_fouls", "king_fouls"]) == sorted(EXTRA_PLANES)
     # フラグは組の全部を1つずつ指し、フラグから組の名前が取れる
     assert sorted(EXTRA_FLAGS.values()) == sorted(EXTRA_PLANES)
     ap = argparse.ArgumentParser()
@@ -118,6 +123,7 @@ def check_layout():
         return
     assert tsuitate_rl.NUM_PLANES_V3 == NUM_PLANES_V3 and tsuitate_rl.NUM_PLANES_V4 == NUM_PLANES_V4
     assert tsuitate_rl.NUM_PLANES_V5 == NUM_PLANES_V5 and tsuitate_rl.NUM_PLANES_V6 == NUM_PLANES_V6
+    assert tsuitate_rl.NUM_PLANES_V7 == NUM_PLANES_V7
     assert dict(tsuitate_rl.EXTRA_PLANE_GROUPS) == {k: tuple(v) for k, v in EXTRA_PLANES.items()}, \
         (tsuitate_rl.EXTRA_PLANE_GROUPS, EXTRA_PLANES)
 
@@ -282,7 +288,7 @@ def check_replace():
     plain = rnad_learner(NUM_PLANES_V6, ["check_clock"]).net
     assert "drop" not in plain.config and KING_WIDE not in unused_planes(NUM_PLANES_V6, ["check_clock"])
     assert (plain.stem.weight[:, KING_WIDE] != 0).any()
-    every = PolicyValueNet(8, 1, NUM_PLANES_V6, sorted(EXTRA_PLANES), drop=())
+    every = PolicyValueNet(8, 1, NUM_PLANES_V7, sorted(EXTRA_PLANES), drop=())
     assert "drop" not in every.config and every.in_off is None
     # 89番を読む v5 のネットを 136枚へ積み直しても（相手のネットをまとめて推論するとき）、89番を読んだまま
     old = rnad_learner(NUM_PLANES_V5, ["opp_hand", "pawn_files"])
@@ -363,7 +369,7 @@ def check_with_extras():
             raise AssertionError(f"{c['config']} → {want} を受け付けた")
     for extras, planes in ((["opp_hand"], NUM_PLANES_V3), (["king_fouls"], NUM_PLANES_V4),
                            (["lost_fresh"], NUM_PLANES_V5), (["king_tight"], NUM_PLANES_V6),
-                           (sorted(EXTRA_PLANES), NUM_PLANES_V6)):
+                           (["ray_hits"], NUM_PLANES_V7), (sorted(EXTRA_PLANES), NUM_PLANES_V7)):
         net = train_rnad.load_net("none", 8, 1, extras=extras)
         assert net.config["planes"] == planes and net.config["extras"] == extras
 

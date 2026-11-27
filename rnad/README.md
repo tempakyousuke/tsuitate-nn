@@ -42,7 +42,7 @@ ARENA_MATCH_SEED=20260927 cargo run --release --bin arena -- 100 "rl_policy:<pol
 | `model.py` | 方策・価値ネット（ResNet。方策 [139,9,9]、価値 tanh）。**層を変えたら tsuitate-bot の `src/rl/policy_net.rs` と `export_weights.py` も直す** |
 | `train_bc.py` | 記録を真似る教師あり学習。局単位で学習/検証を分ける |
 | `export_weights.py` | Rust 推論用の重み（`TSRLPV01` 形式、BatchNorm は畳み込みへ畳み込む）。`--tiny --test-vector` で tsuitate-bot のテスト用フィクスチャを作る |
-| `widen_planes.py` | checkpoint の入力プレーンを広げる（v1 → v2）・v3 以降の組を足す（`--opp-hand-planes` / `--opp-foul-planes` / `--king-foul-planes` / v5 の `--lost-fresh-planes` / `--lost-role-planes` / `--cap-role-planes` / `--pawn-file-planes` / v6 の `--king-tight-planes` / `--check-clock-planes` / `--checker-memo-planes` / `--own-attack-planes` / `--king-line-planes` / `--opp-count-planes` / `--exposed-planes`）。足した列は 0 で、元と同じ関数のまま。R-NaD・MMD の checkpoint を読める（下の「入力プレーン」） |
+| `widen_planes.py` | checkpoint の入力プレーンを広げる（v1 → v2）・v3 以降の組を足す（`--opp-hand-planes` / `--opp-foul-planes` / `--king-foul-planes` / v5 の `--lost-fresh-planes` / `--lost-role-planes` / `--cap-role-planes` / `--pawn-file-planes` / v6 の `--king-tight-planes` / `--check-clock-planes` / `--checker-memo-planes` / `--own-attack-planes` / `--king-line-planes` / `--opp-count-planes` / `--exposed-planes` / v7 の `--ray-hit-planes`）。足した列は 0 で、元と同じ関数のまま。R-NaD・MMD の checkpoint を読める（下の「入力プレーン」） |
 | `fetch_records.py` | GitHub Actions の対局記録を取る |
 | `league.py` | リーグ学習の相手の選び方（負けやすい相手ほど多く当てる） |
 | `guard.py` | 防御特化（玉の周りの固め）の監視値の集計 |
@@ -50,7 +50,7 @@ ARENA_MATCH_SEED=20260927 cargo run --release --bin arena -- 100 "rl_policy:<pol
 | `signal_report.py` | 学習ログの `signals` から、学習曲線（得点と主な信号を更新の窓ごとに）と、勝ち局と負け局を分ける信号の表（`--split`）を出す |
 | `ladder_eval.py` | ハンデの梯子（`<相手>@<ε>`）で run の書き出しを測り、ε50（得点が 0.5 になる ε）を出す。勝ちが出る前から同じ相手への近さを追う |
 | `speedlab.py` | 学習の速さの比較: 固定パネル（`panel`）で run の書き出しを測り（`eval`、局ごとに鍵を決めた共通乱数）、腕ごとの学習曲線と対照とのペア差をまとめる（`report`）。締まりの効果を除いて比べるには `eval --decode greedy\|temp:<T>`（記録名 `<which>@greedy` など）、途中から始めた run の起点の書き出しは `export-ck`、起点を何度で指すと締まった腕にそろうかは `temp-match`（`--seed` を変えると別の局になる。パネルの評価の乱数は学習中のパネルの記録と対にするため変えない） |
-| `input_ab.py` | 入力プレーンの A/B を小さい自己対局（32ch×3・1更新 64局・乱数初期化・序盤は定跡を 100% 強制）で比べる: `run` は 腕（入力の版 `v1`〜`v6` か `--arm 名前='引数'`）× seed を `--jobs` 本ずつ回し（途中で止めても続きから。`--time-limit` で止める・`--only 腕:seed,...` でその組だけ）、`status` は進み具合の表、`pending` はまだ届いていない本数、`depend` は書き出した重みが入力の組をどれだけ読んでいるか（組を 0 にしたときの方策の変化）。tsuitate-bot の `input-ab.yml` が CI で使う（対局と集計はあちらの `scripts/ci/input_ab.py`、読み方は `docs/rl-input-ab.md`）。テストは `tests/test_input_ab.py` |
+| `input_ab.py` | 入力プレーンの A/B を小さい自己対局（32ch×3・1更新 64局・乱数初期化・序盤は定跡を 100% 強制）で比べる: `run` は 腕（入力の版 `v1`〜`v7` か `--arm 名前='引数'`）× seed を `--jobs` 本ずつ回し（途中で止めても続きから。`--time-limit` で止める・`--only 腕:seed,...` でその組だけ）、`status` は進み具合の表、`pending` はまだ届いていない本数、`depend` は書き出した重みが入力の組をどれだけ読んでいるか（組を 0 にしたときの方策の変化）。tsuitate-bot の `input-ab.yml` が CI で使う（対局と集計はあちらの `scripts/ci/input_ab.py`、読み方は `docs/rl-input-ab.md`）。テストは `tests/test_input_ab.py` |
 | `log_windows.py` | 学習ログ（log.jsonl）の見張りの値（エントロピー・π>0.999 の割合・手数・反則・磁石への KL など）を step の窓ごとに平均して並べる。MMD の中止の門の形の指標はこの 100更新の窓の平均で見る（中央値は締まりを小さく見せる） |
 | `openings.py` | 序盤の強制の定跡ブック（tsuitate-bot の `joseki.json` の形式）の読み込み・系統ごとの重み・env へ渡す引数・ログの監視値（`train_rnad.py --open-book`） |
 | `opening_eval.py` | 序盤の多様さ（`entropy`: 初期局面の方策・最初の k 手の並びのエントロピー）と、序盤を強制した対局（`robust`: 相手 / 自分 / 両者の序盤を定跡に強制したときの得点・接触の前の反則を系統ごとに） |
@@ -97,9 +97,9 @@ ARENA_MATCH_SEED=20260927 cargo run --release --bin arena -- 100 "rl_policy:<pol
 | `--panel <panel.json>` | 学習ループの中で固定パネルを測り `panel_eval.jsonl` へ（`speedlab.py report` の入力と同じ形） |
 | `--planes` / `--threads` | `--init none` の入力のプレーン数 / torch のスレッド数 |
 
-## 入力プレーン（エンコーダ v3 / v4 / v5 / v6、tsuitate-bot の `docs/rl-deepnash-design.md`「エンコーダ v3」）
+## 入力プレーン（エンコーダ v3 / v4 / v5 / v6 / v7、tsuitate-bot の `docs/rl-deepnash-design.md`「エンコーダ v3」）
 
-v2（91枚）の後ろに観測と自分側だけで決まる事実を足した 101枚（v3）・102枚（v4）・124枚（v5）・142枚（v6）。**組ごとに別のフラグ**で使うかを
+v2（91枚）の後ろに観測と自分側だけで決まる事実を足した 101枚（v3）・102枚（v4）・124枚（v5）・142枚（v6）・150枚（v7）。**組ごとに別のフラグ**で使うかを
 選べるので、効果を組ごとに測れる（既定は付けない = v2 のまま）。プレーン数は選んだ組が入る最小の版になる:
 
 | フラグ | 組 | 中身 |
@@ -117,6 +117,7 @@ v2（91枚）の後ろに観測と自分側だけで決まる事実を足した 
 | `--own-attack-planes` | `own_attacks`（2枚、v6） | 自駒の利き（確実な利き = 隣接と桂の跳びの枚数 / 遮られうる利き = 飛び駒の 2マス目以降の枚数。3枚で 1） |
 | `--king-line-planes` | `king_lines`（2枚、v6） | 自玉の筋（8方向に最初の自駒の手前までのマス / その最初の自駒で、先に自駒でないマスが続くもの = ピンされうる駒） |
 | `--exposed-planes` | `exposed`（2枚、v6） | 相手に位置が伝わっている自駒: 駒を取ったまま動いていない自駒 / 王手をかけた手で動かしたまま動いていない自駒（値はその手からの鮮度）。相手は「自分の駒を取られたマス」と「王手を受けたこと」を審判から知らされる。v1 の取ったマスの鮮度は、取った駒がその後動いたかを持たない |
+| `--ray-hit-planes` | `ray_hits`（8枚、v7） | 飛び駒の線の先の確定駒: 正規化した8方向ごと（行動の方向と同じ並び）に、自分の飛・角・香・竜・馬のマスへ、自駒の手前まで辿って最初に当たる「相手の駒がいると確定したマス」（v2 の 86番と同じ集合）までの距離を (9 − 距離) / 8 で。方策の行動は移動元のマスに付くので、取る先の情報を幹で運ばなくても遠い取りが読める（幹の実効受容野は飛車 6〜7マス・角 4〜5マスまでだった。tsuitate-bot の設計 doc の v7） |
 | `--opp-count-planes` | `opp_counts`（4枚、v6） | 相手の手数の合計（全面）: 王手をかけてきた手（÷20）・駒を取ってきた手（÷30）・王手をかけながら駒を取ってきた手（÷10）・指した手（÷100）。指した手から王手と駒取りを引けば、行き先の手掛かりが無い手の数になる |
 
 **締めた相手玉の候補は、元の候補の代わりに読む**（2026-11-23）: 元の候補（89番）は締めた版を含む広い集合で、締めた版が

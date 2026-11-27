@@ -16,7 +16,7 @@ tsuitate-bot の `.github/workflows/input-ab.yml` が使う（対局での比較
 tsuitate-bot の arena で総当たりにして比べる。**この大きさで入力の差が出るかどうか自体が未検証**なので、まず答えの
 分かっている組（v4 と v5。本番の大きさでは v5 が強い）で、差が再現するかを見るのに使う。
 
-- 腕の名前 `v1`〜`v6` は入力の版（下の `ARMS`）。`--arm 名前='引数'` で好きな組み合わせを足せる
+- 腕の名前 `v1`〜`v7` は入力の版（下の `ARMS`）。`--arm 名前='引数'` で好きな組み合わせを足せる
 - 出力は `<root>/<腕>_s<seed>/`（train_rnad.py の出力そのまま。`current_<更新>.bin` が比べる重み）
 - `--time-limit` 秒を過ぎたら回している run を止めて終わる（CI のジョブの上限の手前で止め、続きは次のジョブで回す）
 """
@@ -39,9 +39,10 @@ V4 = f"{V3} --king-foul-planes"
 V5 = f"{V4} --lost-fresh-planes --lost-role-planes --cap-role-planes --pawn-file-planes"
 V6 = (f"{V5} --king-tight-planes --check-clock-planes --checker-memo-planes --own-attack-planes "
       "--king-line-planes --opp-count-planes --exposed-planes")
+V7 = f"{V6} --ray-hit-planes"
 # 入力の版ごとの引数（v3 以降は組のフラグ。プレーン数は選んだ組が入る最小の版になる）
 ARMS = {"v1": "--planes 86", "v2": "--planes 91", "v3": f"--planes 91 {V3}", "v4": f"--planes 91 {V4}",
-        "v5": f"--planes 91 {V5}", "v6": f"--planes 91 {V6}"}
+        "v5": f"--planes 91 {V5}", "v6": f"--planes 91 {V6}", "v7": f"--planes 91 {V7}"}
 
 # 縮めた学習の設定。型は scratch の系列（tsuitate-bot の docs/frozen-versions.md の rl_scratch_v1 / rl_scratch5_v1）、
 # 大きさと MMD の歩数は相手を固定した小さい学習（takeoff.py の COMMON）と同じ。整形は最後まで切らない（短いので）
@@ -252,7 +253,7 @@ def cmd_depend(args):
 
     torch.set_num_threads(args.threads)
     dev = torch.device("cpu")
-    planes = tsuitate_rl.NUM_PLANES_V6  # いちばん広い版で観測を書き、ネットは自分の枚数ぶんだけ読む
+    planes = tsuitate_rl.NUM_PLANES_V7  # いちばん広い版で観測を書き、ネットは自分の枚数ぶんだけ読む
     extra_groups = dict(tsuitate_rl.EXTRA_PLANE_GROUPS)
     root = pathlib.Path(args.root)
     step = args.step if args.step is not None else common_step(root)
