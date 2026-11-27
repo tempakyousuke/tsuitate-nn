@@ -443,8 +443,10 @@ ABS_BANDS = (0.0, 0.3, 0.6, 1.0001)
 REMAIN_BANDS = (0, 10, 40, 80, 10_000)
 
 
-# _chunk_loss の stats の長さ（0〜11 は従来の項目、12 以降は玉の逃げ場の手数帯別の [分子, 分母] × 帯の数）
-_NSTATS = 12 + 2 * len(ESCAPE_PLY_BANDS)
+# _chunk_loss の stats の長さ（0〜10 は帯に分けない項目、11 以降は玉の逃げ場の手数帯別の
+# [正解率の分子, 「動ける」の割合の分子, 分母] × 帯の数。3つとも同じ行・同じ重み = 数えるマスのある価値の行の wv）
+_ESC0 = 11
+_NSTATS = _ESC0 + 3 * len(ESCAPE_PLY_BANDS)
 
 
 def escape_ply_band(ply: torch.Tensor) -> torch.Tensor:
@@ -453,17 +455,11 @@ def escape_ply_band(ply: torch.Tensor) -> torch.Tensor:
 
 
 def escape_band_stats(batch) -> dict:
-    """batch の玉の逃げ場のラベルから、手数帯ごとの数えるマスの数と「動ける」の割合（ネットを通さない）"""
-    lab = batch["king_escape"].long()
+    """batch の玉の逃げ場のラベルから、手数帯ごとの数えるマスの数（batch の全行。ネットを通さない）。
+    「動ける」の割合は正解率と同じ行・同じ重みで比べるので、ここでなく `_chunk_loss` で数える"""
+    lab = batch["king_escape"]
     band = escape_ply_band(batch["escape_ply"])
-    out = {}
-    for k, lo in enumerate(ESCAPE_PLY_BANDS):
-        cells = lab[band == k]
-        n_ok = int((cells >= 0).sum())
-        out[f"escape_cells_p{lo}"] = n_ok
-        if n_ok:
-            out[f"escape_pos_p{lo}"] = int((cells == 1).sum()) / n_ok
-    return out
+    return {f"escape_cells_p{lo}": int((lab[band == k] >= 0).sum()) for k, lo in enumerate(ESCAPE_PLY_BANDS)}
 
 
 class MMDLearner:
@@ -696,13 +692,18 @@ class MMDLearner:
             if use_esc:
                 # 重みを掛ける前の値（価値の行の重みつき二値交差エントロピー）と、数えるマスの正解率（行ごとの平均の重みつき平均）
                 out["loss_escape"] = float(ss[:, 10].mean())
-                out["acc_escape"] = float(ss[:, 11].mean())
-                # 手数帯別の正解率（全ミニバッチの和の比）と、同じ帯の数えるマスのうち「動ける」の割合（全部「動ける」と
-                # 答えたときの正解率 = 比べる基準。ネットを通さずラベルから出す）
+                # 正解率と「動ける」の割合（全部「動ける」と答えたときの正解率 = 比べる基準）は、どちらも
+                # 「行ごとの数えるマスの平均」を、数えるマスのある価値の行の wv で重みづけた平均（全ミニバッチの和の比）。
+                # 同じ行・同じ重みなので差をそのまま読める。数えるマスの無い行は分母にも入れない
+                bs = ss[:, _ESC0:].sum(0).reshape(len(ESCAPE_PLY_BANDS), 3)
+                den_all = float(bs[:, 2].sum())
+                out["acc_escape"] = float(bs[:, 0].sum()) / den_all if den_all > 0 else 0.0
+                out["escape_pos"] = float(bs[:, 1].sum()) / den_all if den_all > 0 else 0.0
                 for k, lo in enumerate(ESCAPE_PLY_BANDS):
-                    den = float(ss[:, 13 + 2 * k].sum())
+                    den = float(bs[k, 2])
                     if den > 0:  # その帯の行が無ければ書かない
-                        out[f"acc_escape_p{lo}"] = float(ss[:, 12 + 2 * k].sum()) / den
+                        out[f"acc_escape_p{lo}"] = float(bs[k, 0]) / den
+                        out[f"escape_pos_p{lo}"] = float(bs[k, 1]) / den
                 out.update(escape_band_stats(batch))
             rd_sum, rd_cnt = (float(x) for x in ratio_dev_first)
             out["ratio_dev_first"] = rd_sum / rd_cnt if rd_cnt else 0.0
@@ -769,7 +770,7 @@ class MMDLearner:
 
     def _chunk_loss(self, st, rows, m_pol, m_val, temp, value_only, first):
         """1チャンクの損失（ミニバッチの m で割った和）と、ログ用の和 [pol, kl, mag, lv, vf_change, |r − 1| > clip の行の数,
-        方策の行の数, 最初の歩の |π_θ/μ − 1| の和, その数, 補助ヘッドの損失, 玉の逃げ場の損失, その正解率]"""
+        方策の行の数, 最初の歩の |π_θ/μ − 1| の和, その数, 補助ヘッドの損失, 玉の逃げ場の損失, 以降は玉の逃げ場の手数帯別の和（`_NSTATS`）]"""
         cfg = self.cfg
         dev = self.device
         obs, pmask, apos, idx, pos = st.view(rows)
@@ -822,15 +823,18 @@ class MMDLearner:
             stats[10] = le.detach()
             with torch.no_grad():
                 ok = lab >= 0
-                hit = (((esc > 0) == (lab > 0)) & ok).sum(1) / ok.sum(1).clamp(min=1)
-                stats[11] = (wv * hit).sum() / m_val
-                # 手数帯別: [正解率の分子（wv × 行の正解率）, 分母（数えるマスのある行の wv）] を帯ごとに足す
+                n_ok = ok.sum(1).clamp(min=1)
+                hit = (((esc > 0) == (lab > 0)) & ok).sum(1) / n_ok
+                free = (lab > 0).sum(1) / n_ok
+                # 手数帯別: [正解率の分子（wv × 行の正解率）, 「動ける」の割合の分子（wv × 行の割合）,
+                # 分母（数えるマスのある行の wv）] を帯ごとに足す
                 band = st.kband[r]
                 w_ok = wv * (ok.sum(1) > 0)
                 for k in range(len(ESCAPE_PLY_BANDS)):
                     on = band == k
-                    stats[12 + 2 * k] = (w_ok * hit * on).sum()
-                    stats[13 + 2 * k] = (w_ok * on).sum()
+                    stats[_ESC0 + 3 * k] = (w_ok * hit * on).sum()
+                    stats[_ESC0 + 3 * k + 1] = (w_ok * free * on).sum()
+                    stats[_ESC0 + 3 * k + 2] = (w_ok * on).sum()
         with torch.no_grad():
             on = w > 0
             stats[0], stats[1], stats[2], stats[3] = pol.detach(), kl.detach(), mag.detach(), lv.detach()

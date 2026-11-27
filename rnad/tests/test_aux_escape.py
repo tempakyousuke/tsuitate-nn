@@ -133,7 +133,16 @@ def check_on(bt):
     assert sum(lg[f"escape_cells_p{lo}"] for lo in ESCAPE_PLY_BANDS) == int((bt["king_escape"] >= 0).sum())
     bands = [lo for lo in ESCAPE_PLY_BANDS if lg[f"escape_cells_p{lo}"]]
     assert bands and all(0.0 <= lg[f"acc_escape_p{lo}"] <= 1.0 and 0.0 <= lg[f"escape_pos_p{lo}"] <= 1.0 for lo in bands)
-    band_txt = " ".join(f"p{lo}: {lg[f'acc_escape_p{lo}']:.3f}/{lg[f'escape_pos_p{lo}']:.3f}" for lo in bands)
+    # 「動ける」の割合は正解率と同じ行・同じ重み: filter="none"（全行が重み 1）なら、数えるマスのある行の
+    # 「行ごとの動けるの割合」の平均に一致する（マスをプールした割合ではない）
+    ke = bt["king_escape"]
+    okc = ke >= 0
+    has = okc.sum(1) > 0
+    want = float(((ke == 1).sum(1)[has] / okc.sum(1)[has]).mean())
+    assert abs(lg["escape_pos"] - want) < 1e-5, (lg["escape_pos"], want)
+    assert min(lg[f"acc_escape_p{lo}"] for lo in bands) - 1e-6 <= lg["acc_escape"] <= max(
+        lg[f"acc_escape_p{lo}"] for lo in bands) + 1e-6
+    band_txt =" ".join(f"p{lo}: {lg[f'acc_escape_p{lo}']:.3f}/{lg[f'escape_pos_p{lo}']:.3f}" for lo in bands)
     assert set(L.net.state_dict()) == keys  # 補助ヘッドはネットの外（書き出しに入らない）
     sd = L.state_dict()
     assert "aux_esc" in sd and "aux_esc_opt" in sd

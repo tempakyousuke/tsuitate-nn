@@ -216,7 +216,7 @@ R-NaD の checkpoint から続ける（net ← 現在のネット、ターゲッ
   同じ行・重み）。盤外と自駒のマスはラベル −1 で数えない（自駒は観測から分かるので、実質は相手の利きの推定）。ラベルは
   tsuitate-bot の `VecEnv.king_escape`（`EnvGame::king_escape_into`）。**W を省くと 0.1**（`train_rnad.AUX_ESCAPE_DEFAULT`。
   相手の駒が見えないぶん答えが観測から決まらない場面が多いので小さめ。A/B で確かめる前提）。ログに `loss_escape`
-  （重みを掛ける前）と `acc_escape`（数えるマスの正解率）、手数帯別（受理手の数で 0〜29 / 30〜59 / 60〜89 / 90〜。`mmd.ESCAPE_PLY_BANDS`）の正解率 `acc_escape_p<下限>` と、同じ帯の数えるマスのうち「動ける」の割合 `escape_pos_p<下限>`（全部「動ける」と答えたときの正解率 = 比べる基準）・数えるマスの数 `escape_cells_p<下限>` が出る（終盤ほど相手の駒が見えず当てにくいので、帯ごとに基準との差を見る）。報酬・方策の目的は変えず、頭は書き出さない。
+  （重みを掛ける前）と `acc_escape`（数えるマスの正解率）・`escape_pos`（数えるマスのうち「動ける」の割合 = 全部「動ける」と答えたときの正解率。比べる基準）、手数帯別（受理手の数で 0〜29 / 30〜59 / 60〜89 / 90〜。`mmd.ESCAPE_PLY_BANDS`）の `acc_escape_p<下限>` / `escape_pos_p<下限>`、数えるマスの数 `escape_cells_p<下限>`（batch の全行）が出る（終盤ほど相手の駒が見えず当てにくいので、帯ごとに基準との差を見る）。正解率と基準は**同じ行・同じ重み**（行ごとの数えるマスの平均を、数えるマスのある価値の行の重みで平均）なので差をそのまま読める。「動ける」が半分を切る帯では基準は 1 − `escape_pos_p<下限>`。報酬・方策の目的は変えず、頭は書き出さない。
   `--aux-class` と一緒にも使え（幹は1回だけ通す）、`--fast-collect`・`--pipeline` とも使える。R-NaD には付けていない
   （`tests/test_aux_escape.py`）。途中から付けるときの `--override-config` は `--aux-class` と同じ
 - `--league`（相手を固定した局）は使える（2026-11-10 から。`--mmd-lambda-unit turn` / `--mmd-gae-lambda-unit turn` とは使えない）。
