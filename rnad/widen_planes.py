@@ -45,7 +45,7 @@ EXTRA_FLAGS = {"opp_hand_planes": "opp_hand", "opp_foul_planes": "opp_fouls", "k
                "king_tight_planes": "king_tight", "check_clock_planes": "check_clock",
                "checker_memo_planes": "checker_memo", "own_attack_planes": "own_attacks",
                "king_line_planes": "king_lines", "opp_count_planes": "opp_counts",
-               "exposed_planes": "exposed"}
+               "exposed_planes": "exposed", "ray_hit_planes": "ray_hits"}
 # エラーメッセージに出すフラグの一覧
 EXTRA_FLAG_NAMES = " / ".join("--" + f.replace("_", "-") for f in EXTRA_FLAGS)
 
@@ -85,6 +85,10 @@ def add_extra_flags(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--exposed-planes", action="store_true",
                     help="v6: 相手に位置が伝わっている自駒（2枚。駒を取ったまま動いていない自駒 / 王手をかけた手で動かしたまま"
                          "動いていない自駒。値はその手からの鮮度。相手は取られたマスと王手を審判から知らされる）を入力に使う")
+    ap.add_argument("--ray-hit-planes", action="store_true",
+                    help="v7: 飛び駒の線の先の確定駒（8枚。正規化した8方向ごとに、自分の飛・角・香・竜・馬のマスへ、自駒の手前"
+                         "まで辿って最初に当たる相手の駒が確定したマスまでの距離を (9−距離)/8 で。行動の添字の移動元に答えを"
+                         "置くので、幹の受容野が届かない遠い取りも読める）を入力に使う")
     ap.add_argument("--king-line-planes", action="store_true",
                     help="v6: 自玉の筋（2枚。8方向に最初の自駒の手前までのマス / その最初の自駒で、先に自駒でないマスが"
                          "続くもの = ピンされうる駒）を入力に使う")
