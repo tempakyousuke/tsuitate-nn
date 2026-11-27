@@ -181,6 +181,27 @@ def check_resume():
         assert same(x, y), f"再開すると aux_esc.{k} が違う"
     for (k, x), (_, y) in zip(a.net.state_dict().items(), c.net.state_dict().items()):
         assert same(x, y), f"再開すると net.{k} が違う"
+    # 設定の上書き（--override-config）: Adam の β₁ を変えると、checkpoint から読んだ補助ヘッドの optimizer にも入る
+    buf.seek(0)
+    both_cfg = make_config("tsuitate", chunk=64, steps=2, aux_escape=0.5, aux_class=0.5)
+    d = learner(both_cfg)
+    d.update(dict(batch(True, seed=30, move_class=True)))
+    new = make_config("tsuitate", chunk=64, steps=2, aux_escape=0.5, aux_class=0.5, adam_b1=0.5)
+    e = MMDLearner(PolicyValueNet(16, 1, 91), new, DEV, seed=99)
+    sd = d.state_dict()
+    e.load_state_dict(sd)
+    assert e.aux_esc_opt.param_groups[0]["betas"][0] == 0.9  # 読んだ直後は checkpoint の値
+    e.apply_cfg(new, old=sd["cfg"])
+    for name, opt in (("net", e.opt), ("aux", e.aux_opt), ("aux_esc", e.aux_esc_opt)):
+        assert all(g["betas"][0] == 0.5 for g in opt.param_groups), name
+    # escape_ply の無い batch は更新を始める前に止まる（学習の状態を動かさない）
+    step0 = e.step_count
+    try:
+        e.update({k: v for k, v in batch(True, seed=30, move_class=True).items() if k != "escape_ply"})
+    except ValueError:
+        assert e.step_count == step0
+    else:
+        raise AssertionError("escape_ply の無い batch で aux_escape>0 の update が通った")
     old = dict(MMDConfig().__dict__)
     del old["aux_escape"]
     assert cfg_diff(old, MMDConfig()) == {}

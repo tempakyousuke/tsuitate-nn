@@ -584,8 +584,9 @@ class MMDLearner:
                 g["lr"] = lr
         use_esc = cfg.aux_escape > 0 and not value_only
         if cfg.aux_escape > 0:
-            if "king_escape" not in batch:
-                raise ValueError("aux_escape > 0 には collect(..., king_escape=True) の batch が要る")
+            if "king_escape" not in batch or "escape_ply" not in batch:  # 更新を始める前に止める
+                raise ValueError("aux_escape > 0 には collect(..., king_escape=True) の batch が要る"
+                                 "（king_escape と escape_ply）")
             self._ensure_aux_esc()
             for g in self.aux_esc_opt.param_groups:
                 g["lr"] = lr
@@ -947,8 +948,12 @@ class MMDLearner:
             self.filt_hist = []
         self.parsed = parsed
         self.cfg = cfg
-        for g in self.opt.param_groups:
-            g["betas"] = (cfg.adam_b1, g["betas"][1])
+        # 補助ヘッドの optimizer も同じ β₁ にする（checkpoint から読んだものは古い β₁ を持っている。
+        # まだ作っていないものは作るときに self.cfg から取る）
+        for opt in (self.opt, self.aux_opt, self.aux_esc_opt):
+            if opt is not None:
+                for g in opt.param_groups:
+                    g["betas"] = (cfg.adam_b1, g["betas"][1])
 
 
 def _sched(spec, t):
