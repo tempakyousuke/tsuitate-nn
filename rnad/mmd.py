@@ -447,8 +447,12 @@ class MMDLearner:
 
     algo = "mmd"
 
-    def __init__(self, net, cfg: MMDConfig, device, seed=0, device_batch=False, stale_actor=False):
+    def __init__(self, net, cfg: MMDConfig, device, seed=0, device_batch=False, stale_actor=False, compile="off"):
         self.cfg = cfg
+        # compile = 更新の中のネットの順伝播（と逆伝播）を torch.compile する（`rnad.compiled`）。stale_actor と同じく
+        # 計算の持ち方の指定なので設定には入れない
+        R.compiled(forward, compile, cfg.chunk)  # mode の検査
+        self.compile = compile
         self.parsed = parse_config(cfg)
         self.device = device
         self.device_batch = device_batch
@@ -473,6 +477,9 @@ class MMDLearner:
         # 補助ヘッドは使うときだけ作る（使わない run の checkpoint・乱数の消費は従来と同じ）
         self.aux = None
         self.aux_opt = None
+
+    def _fwd(self, fn):
+        return R.compiled(fn, self.compile, self.cfg.chunk)
 
     def _ensure_aux(self):
         if self.aux is None:
@@ -688,9 +695,9 @@ class MMDLearner:
                 obs, pmask, apos, idx, pos = st.view(rows)
                 cnt = st.counts[rows.to(dev)]
                 if need_prox:
-                    lp_now = legal_log_policy(forward(self.net, obs)[0].gather(1, idx), pmask)
+                    lp_now = legal_log_policy(self._fwd(forward)(self.net, obs)[0].gather(1, idx), pmask)
                     st.prox[pos] = lp_now[pmask]
-                lp_m = (legal_log_policy(forward(mag_net, obs)[0].gather(1, idx), pmask)
+                lp_m = (legal_log_policy(self._fwd(forward)(mag_net, obs)[0].gather(1, idx), pmask)
                         if mag_net is not None else None)
                 st.lrho[pos] = magnet_log_probs(mag_kind, lp_m, pmask, cnt)[pmask]
         if need_prox:
@@ -712,16 +719,16 @@ class MMDLearner:
         wv, g, v_old = st.wv[r], st.g[r], st.v_old[r]
         stats = torch.zeros(10, device=dev)
         if value_only:
-            v = _value_forward(self.net, obs)
+            v = self._fwd(_value_forward)(self.net, obs)
             lv = (wv * (v - g) ** 2).sum() / m_val
             stats[3] = lv.detach()
             stats[4] = ((wv * (v.detach() - v_old) ** 2).sum() / m_val)
             return cfg.vf * lv, stats
         use_aux = self.aux is not None and cfg.aux_class > 0
         if use_aux:
-            logits, v, q = R.forward_aux(self.net, self.aux, obs)
+            logits, v, q = self._fwd(R.forward_aux)(self.net, self.aux, obs)
         else:
-            logits, v = forward(self.net, obs)
+            logits, v = self._fwd(forward)(self.net, obs)
         lp = legal_log_policy(logits.gather(1, idx), pmask)
         p = lp.exp() * pmask
         zero = torch.zeros_like(lp)
@@ -779,7 +786,7 @@ class MMDLearner:
             act = batch["action"][rr].to(dev)
             idx, pmask, _, _ = _pack_csr(cols, cnt.to(dev), act, int(cnt.max()), len(pos))
             obs = batch["obs"][rr].to(dev, torch.float32)
-            lp = legal_log_policy(forward(self.net, obs)[0].gather(1, idx), pmask)
+            lp = legal_log_policy(self._fwd(forward)(self.net, obs)[0].gather(1, idx), pmask)
             mu = torch.zeros_like(lp)
             mu[pmask] = batch["mu_logp"][pos].to(dev).float()
             tot += float(((lp.exp() * pmask) * (lp - mu)).sum())

@@ -47,7 +47,7 @@ from mmd import PRESETS as MMD_PRESETS
 from mmd import LAMBDA_UNITS as MMD_LAMBDA_UNITS
 from mmd import MMDLearner
 from mmd import make_config as make_mmd_config
-from rnad import (PRECISIONS, MultiEnv, OpponentPool, PipelinedCollector, RNaDConfig, RNaDLearner, cfg_diff,
+from rnad import (COMPILE_MODES, PRECISIONS, MultiEnv, OpponentPool, PipelinedCollector, RNaDConfig, RNaDLearner, cfg_diff,
                   collect, play_match, set_precision, split_noise)
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -500,6 +500,9 @@ def main() -> None:
     ap.add_argument("--device", default="auto")
     ap.add_argument("--precision", choices=PRECISIONS, default="default",
                     help="ネットの計算精度（rnad.set_precision。default でも畳み込みは TF32 = tf32 と速さは同じ）")
+    ap.add_argument("--compile", choices=COMPILE_MODES, default="off",
+                    help="更新（学習の順伝播・逆伝播）のネットを torch.compile する（rnad.compiled。自己対局の推論はそのまま）。"
+                         "最初の数更新は作るぶん遅い。checkpoint には残らないので、再開のたびに付ける")
     args = ap.parse_args()
 
     set_precision(args.precision)
@@ -665,12 +668,12 @@ def main() -> None:
                             which=("net" if args.init_which in ("net", "both") else "target"), extras=extras)
     if args.algo == "mmd":
         learner = MMDLearner(init_net, mcfg, device, seed=args.seed, device_batch=args.device_batch,
-                             stale_actor=args.pipeline)
+                             stale_actor=args.pipeline, compile=args.compile)
         if ck is None and args.init != "none":
             start_mmd_from_init(learner, args)
     else:
         learner = RNaDLearner(init_net, cfg, device, packed=args.packed, device_batch=args.device_batch,
-                              fused=args.fused)
+                              fused=args.fused, compile=args.compile)
     # 観測のプレーン数は学習するネットの形で決まる（v2 = 確定事実のプレーンつきの checkpoint は
     # widen_planes.py で作る）。錨・リーグの相手が v1 のネットでも、v2 の観測の先頭が v1 なので読める
     # （PolicyValueNet.trunk が切る）。v1 のときは引数を渡さない（planes の無い古い tsuitate_rl でも動くように）

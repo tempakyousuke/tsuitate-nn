@@ -97,6 +97,59 @@ def forward(net, x: torch.Tensor):
     return logits.float(), v.float()
 
 
+# ---------------------------------------------------------------- torch.compile（更新側だけ）
+
+COMPILE_MODES = ("off", "default", "max-autotune-no-cudagraphs")
+_COMPILED = {}
+
+
+def compile_rows(n: int, chunk: int) -> int:
+    """`compiled` が行の数 n を切り上げる先: チャンク（`chunk` 行）の 1/4 の倍数（16 以上）。
+    形はチャンクの 1/4・2/4・3/4・1 の4つにそろい、切り上げの無駄は1回あたり最大でチャンクの 1/4"""
+    q = max(16, -(-chunk // 4))
+    return max(q, -(-n // q) * q)
+
+
+def compiled(fn, mode: str, chunk: int):
+    """学習器の順伝播の関数 `fn(*nets, x)`（`forward` / `forward_aux` / `mmd._value_forward`）を `torch.compile` したもの。
+    mode が off なら `fn` のまま。`torch.compile` は関数ごと・mode ごとにプロセスで1つだけ作る（学習器を deepcopy しても共有）。
+
+    **更新側だけ**に使う（`RNaDLearner` / `MMDLearner` の `compile`）。自己対局の `collect` は素の `forward` のまま
+    （終局で生きている局が減るたびに batch の形が変わる）。
+
+    更新側も最後のチャンク・MMD のミニバッチの端で行の数が変わる。形を動的にすると畳み込みの行の数の範囲（16 以上 4096 以下
+    など）で版が分かれて作り直しが続くので、**行の数を `compile_rows`（チャンクの 1/4 の倍数）に 0 で切り上げて形を
+    固定**し、出力を元の行の数に切って返す。BN は eval（行ごとの計算）なので切り上げた行は他の行の値を変えず、出力を
+    切るので勾配にも入らない（逆伝播でその行に来る勾配は 0）。
+    版は「形（4つ）× {現在のネットの勾配なし / 勾配を持たないネット（ターゲット・正則化方策・磁石）/ 勾配つき}」の
+    12 個ずつ（× bf16 か）を、それぞれ最初に通ったときに1回だけ作る（最初の数更新が遅い）。
+    ネットは引数で渡すので、同じ構造のネットどうしは同じ版を使う（パラメータは入力）。
+
+    CUDA graphs（mode reduce-overhead）は使わない: チャンクごとに逆伝播して勾配を足す更新に向かない"""
+    if mode == "off":
+        return fn
+    if mode not in COMPILE_MODES:
+        raise ValueError(f"compile {mode}（{COMPILE_MODES} のどれか）")
+    key = (fn, mode)
+    cfn = _COMPILED.get(key)
+    if cfn is None:
+        torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 64)
+        cfn = _COMPILED[key] = torch.compile(fn, mode=None if mode == "default" else mode, dynamic=False)
+
+    def run(*args):
+        x = args[-1]
+        n = x.shape[0]
+        m = compile_rows(n, chunk)
+        if m != n:
+            x = torch.cat([x, x.new_zeros((m - n,) + tuple(x.shape[1:]))])
+        out = cfn(*args[:-1], x)
+        if m == n:
+            return out
+        return out[:n] if torch.is_tensor(out) else tuple(o[:n] for o in out)
+
+    return run
+
+
 # ---------------------------------------------------------------- 方策の基本演算
 
 NUM_ACTIONS = 139 * 81  # tsuitate-bot の rl::action（種類 × マス）
@@ -334,7 +387,7 @@ class RNaDLearner:
     """
 
     def __init__(self, net, cfg: RNaDConfig, device, packed: bool = False, device_batch: bool = False,
-                 fused: bool = False):
+                 fused: bool = False, compile: str = "off"):
         self.cfg = cfg
         self.device = device
         # packed = 方策の計算を合法手に詰めて行い、正則化方策の対数確率を1回目から2回目へ持ち越す
@@ -348,6 +401,10 @@ class RNaDLearner:
             raise ValueError("device_batch は packed と一緒に使う")
         self.device_batch = device_batch
         self.fused = fused
+        # compile = 更新の中のネットの順伝播（と逆伝播）を torch.compile する（`compiled`。off / default /
+        # max-autotune-no-cudagraphs）。packed と同じく計算の持ち方の指定なので設定には入れない
+        compiled(forward, compile, cfg.chunk)  # mode の検査
+        self.compile = compile
         self.net = net.to(device).eval()
         self.target = copy.deepcopy(self.net).eval()
         self.prev = copy.deepcopy(self.net).eval()
@@ -361,6 +418,12 @@ class RNaDLearner:
         # 補助ヘッドは使うときだけ作る（使わない run の checkpoint・乱数の消費は従来と同じ）
         self.aux = None
         self.aux_opt = None
+
+    def _fwd(self, net, x):
+        return compiled(forward, self.compile, self.cfg.chunk)(net, x)
+
+    def _fwd_aux(self, net, aux, x):
+        return compiled(forward_aux, self.compile, self.cfg.chunk)(net, aux, x)
 
     def _ensure_aux(self):
         if self.aux is None:
@@ -378,11 +441,11 @@ class RNaDLearner:
         # 重みが 0 の側は順伝播しない（段階の後半は α = 1 で prev_ が要らない）。対数確率は合法手で有限なので
         # 1.0·x + 0.0·y = x がビット単位で成り立ち、結果は混ぜた場合と同じ
         if alpha >= 1.0:
-            return legal_log_policy(sel(forward(self.prev, obs)[0]), legal)
+            return legal_log_policy(sel(self._fwd(self.prev, obs)[0]), legal)
         if alpha <= 0.0:
-            return legal_log_policy(sel(forward(self.prev_, obs)[0]), legal)
-        lp_prev = legal_log_policy(sel(forward(self.prev, obs)[0]), legal)
-        lp_prev_ = legal_log_policy(sel(forward(self.prev_, obs)[0]), legal)
+            return legal_log_policy(sel(self._fwd(self.prev_, obs)[0]), legal)
+        lp_prev = legal_log_policy(sel(self._fwd(self.prev, obs)[0]), legal)
+        lp_prev_ = legal_log_policy(sel(self._fwd(self.prev_, obs)[0]), legal)
         return alpha * lp_prev + (1 - alpha) * lp_prev_
 
     def _chunk_view(self, batch, sl):
@@ -484,7 +547,7 @@ class RNaDLearner:
         with torch.no_grad():
             for sl in self._chunks(n):
                 obs, legal, act, sel = self._chunk_view(batch, sl)
-                logits = sel(forward(self.net, obs)[0])
+                logits = sel(self._fwd(self.net, obs)[0])
                 log_pi = legal_log_policy(logits, legal)
                 pi = log_pi.exp() * legal
                 mix = self._lpr_mix(obs, legal, alpha, sel)
@@ -497,7 +560,7 @@ class RNaDLearner:
                 top_sum += float(top.sum())
                 top_hi += float((top > 0.999).sum())
                 ent_sum += float(-(pi * log_pi).sum())
-                v_tgt[sl] = forward(self.target, obs)[1].cpu()
+                v_tgt[sl] = self._fwd(self.target, obs)[1].cpu()
 
         vt, s = self._v_trace(batch, cfg, pi_a, ent, v_tgt)
         player_flat = batch["player"][batch["t"], batch["b"]].long()
@@ -515,9 +578,9 @@ class RNaDLearner:
         for ci, sl in enumerate(self._chunks(n)):
             obs, legal, act, sel = self._chunk_view(batch, sl)
             if use_aux:
-                logits, v, aux_logits = forward_aux(self.net, self.aux, obs)
+                logits, v, aux_logits = self._fwd_aux(self.net, self.aux, obs)
             else:
-                logits, v = forward(self.net, obs)
+                logits, v = self._fwd(self.net, obs)
             logits = sel(logits)
             with torch.no_grad():
                 mix = mix_cache[ci] if self.packed else self._lpr_mix(obs, legal, alpha)
@@ -581,7 +644,7 @@ class RNaDLearner:
         with torch.no_grad():
             for sl in chunks:
                 obs, legal, act, sel = res.chunk(sl)
-                logits = sel(forward(self.net, obs)[0])
+                logits = sel(self._fwd(self.net, obs)[0])
                 log_pi = legal_log_policy(logits, legal)
                 pi = log_pi.exp() * legal
                 mix = self._lpr_mix(obs, legal, alpha, sel)
@@ -592,7 +655,7 @@ class RNaDLearner:
                 top = pi.max(1).values
                 # 0.999 を超える数（チャンク ≤ 2^24 行）は float32 でも正確
                 stats.append(torch.stack([top.sum(), (top > 0.999).sum().to(top.dtype), -(pi * log_pi).sum()]))
-                v_tgt_d[sl] = forward(self.target, obs)[1]
+                v_tgt_d[sl] = self._fwd(self.target, obs)[1]
             res.check()
             pi_a, ent, v_tgt = pi_a_d.cpu(), ent_d.cpu(), v_tgt_d.cpu()
             top_sum = top_hi = ent_sum = 0.0
@@ -617,9 +680,9 @@ class RNaDLearner:
         for ci, sl in enumerate(chunks):
             obs, legal, act, sel = res.chunk(sl)
             if use_aux:
-                logits, v, aux_logits = forward_aux(self.net, self.aux, obs)
+                logits, v, aux_logits = self._fwd_aux(self.net, self.aux, obs)
             else:
-                logits, v = forward(self.net, obs)
+                logits, v = self._fwd(self.net, obs)
             logits = sel(logits)
             with torch.no_grad():
                 lpr = legal_log_policy(logits, legal) - mix_cache[ci]
@@ -683,9 +746,9 @@ class RNaDLearner:
             sl = chunks[ci]
             obs, legal, act, sel = view(sl)
             if use_aux:
-                logits, v, aux_logits = forward_aux(self.net, self.aux, obs)
+                logits, v, aux_logits = self._fwd_aux(self.net, self.aux, obs)
             else:
-                logits, v = forward(self.net, obs)
+                logits, v = self._fwd(self.net, obs)
             logits = sel(logits)
             with torch.no_grad():
                 log_pi = legal_log_policy(logits, legal)
@@ -694,7 +757,7 @@ class RNaDLearner:
                 top = pi.max(1).values
                 stats[ci] = torch.stack([top.sum(), (top > 0.999).sum().to(top.dtype), -(pi * log_pi).sum()])
                 pa_c, ent_c, vv_c = torch.stack([pi.gather(1, act[:, None]).squeeze(1), (pi * lpr).sum(-1),
-                                                 forward(self.target, obs)[1]]).cpu()
+                                                 self._fwd(self.target, obs)[1]]).cpu()
             pi_a[sl] = pa_c
             vt_c, s_c = self._v_trace_chunk(cfg, carry, t_idx[sl], b_idx[sl], player, reward, pa_c, mu[sl],
                                             ent_c, vv_c, c_ply)

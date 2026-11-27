@@ -55,7 +55,7 @@ ARENA_MATCH_SEED=20260927 cargo run --release --bin arena -- 100 "rl_policy:<pol
 | `openings.py` | 序盤の強制の定跡ブック（tsuitate-bot の `joseki.json` の形式）の読み込み・系統ごとの重み・env へ渡す引数・ログの監視値（`train_rnad.py --open-book`） |
 | `opening_eval.py` | 序盤の多様さ（`entropy`: 初期局面の方策・最初の k 手の並びのエントロピー）と、序盤を強制した対局（`robust`: 相手 / 自分 / 両者の序盤を定跡に強制したときの得点・接触の前の反則を系統ごとに） |
 | `gradsnr.py` | 学習なしの診断: 変種（クリップ・1/μ の上限・PG）ごとの局ごとの勾配の分散・期待勾配・雑音のスケール |
-| `bench_update.py` | 1更新の壁時計（従来 / `--packed` / 連続 / `--pipeline`）と、packed の勾配の一致。`--collect-arms` / `--update-arms` で `--fast-collect` / `--device-batch` / `--fused` を同じ batch・同じ乱数のペアで測り、結果がビット単位で同じかも出す（`--step` で α を選ぶ・`--precision`） |
+| `bench_update.py` | 1更新の壁時計（従来 / `--packed` / 連続 / `--pipeline`）と、packed の勾配の一致。`--collect-arms` / `--update-arms` で `--fast-collect` / `--device-batch` / `--fused` を同じ batch・同じ乱数のペアで測り、結果がビット単位で同じかも出す（`--step` で α を選ぶ・`--precision`）。更新の腕・`--mmd-arms` に `+compile` を付けると `torch.compile` の腕（勾配・ログの値の相対誤差とウォームアップの秒も出す。mode は `--compile`、ループは `--loop-compile`） |
 | `distill.py` | 方策ネットを小さいネットへ蒸留する（CPU の代理 P2 の出発点） |
 | `toy_kuhn.py` | クーンポーカーで R-NaD の変種の偏りを厳密な NashConv で見る |
 | `stage_log.py` | 学習ログ（log.jsonl）だけでの事前確認: α<1 / α=1 ごとの1更新の秒と律速、錨への勝率の段階内の形と段階の平らさ g（Δm を縮めるかの判断）、`--out-dir` で区切りでの停止の時間とループの外の雑費 |
@@ -86,6 +86,7 @@ ARENA_MATCH_SEED=20260927 cargo run --release --bin arena -- 100 "rl_policy:<pol
 | `--fast-collect py\|rust` | 自己対局の収集の CPU の仕事を減らす（**batch はビット単位で同じ**。`tests/test_fast_collect.py`）。py は Python だけ（生きている局の行を1回だけ抜く・観測を fp16 で送る・合法手の添字を1回だけ作る）、rust は加えて Rust 側で生きている局だけを観測する（`VecEnv.observe_alive_f16_csr`。tsuitate-bot の rl-env を `maturin develop` で作り直す）。`--compact-legal` と一緒に使い、`--league-device gpu`・入玉ボーナス・補助ヘッドとは使えない |
 | `--device-batch` | batch を更新の頭で1回だけ GPU へ送り、チャンクごとの転送と同期をなくす（**結果はビット単位で同じ**。`tests/test_fast_update.py`）。`--packed --compact-legal` と一緒に使う。GPU のメモリを batch あたり約1GB 使う |
 | `--fused` | 1回目（勾配なし）の現在のネットの順伝播を2回目へまとめる（決定点あたり順伝播1回分が減る。チャンクを後ろから回して v-trace をチャンクごとに進め、勾配はチャンクごとに取っておいて従来と同じ順に足すので**結果はビット単位で同じ**）。`--league-device gpu` とは使えない。GPU のメモリを約130MB 使う。v-trace は CPU でチャンクごとに進めるので、`--device-batch` と併用してもチャンクごとに1回の同期は残る |
+| `--compile default\|max-autotune-no-cudagraphs` | 更新（学習の順伝播・逆伝播）のネットを `torch.compile` する（既定 `off`。`rnad.compiled`）。R-NaD と `--algo mmd` の両方に効き、`--packed` / `--fused` / `--device-batch` / `--pipeline` / `--precision` と一緒に使える。**自己対局の推論は compile しない**（終局で batch の形が変わるので作り直しが続く）。行の数をチャンクの 1/4 の倍数に 0 で切り上げて形を4つに固定し、版は「形 × 勾配の扱い3通り」の最大12個ずつを最初に通ったときに作る（最初の数更新が遅い）。**結果はビット単位では同じでない**（BN・ReLU の融合で足し順が変わる。勾配の相対誤差 1e-6 程度。`tests/test_compile.py`）。checkpoint には残らないので再開のたびに付ける |
 | `--inv-mu-cap K` / `--neurd-clip C` | v-trace の s の 1/μ の上限 / NeuRD のクリップ（まれな手のスパイクを取る） |
 | `--policy-loss pg` | NeuRD の押し出しに π を掛ける（ソフトマックス方策勾配） |
 | `--c-vtrace` / `--c-ply 時刻:λ` | v-trace の c（λ-return）/ 終盤だけ λ |
