@@ -128,6 +128,11 @@ class MMDConfig:
     aux_escape: float = 0.0
 
 
+# 玉の逃げ場の補助ヘッドの手数帯別の集計の区切り（受理手の数。ログの `acc_escape_p<下限>` / `escape_pos_p<下限>`）。
+# 学習には効かない（記録だけ）
+ESCAPE_PLY_BANDS = (0, 30, 60, 90)
+
+
 PRESETS = {
     "tsuitate": {},
     # 設計の初版の既定（固定の混合磁石・温度を t で下げる・起点 2,000・pps 0.25・λ_A 0.8・8歩）。代理 P2 で崩れた形の再現用
@@ -438,6 +443,29 @@ ABS_BANDS = (0.0, 0.3, 0.6, 1.0001)
 REMAIN_BANDS = (0, 10, 40, 80, 10_000)
 
 
+# _chunk_loss の stats の長さ（0〜11 は従来の項目、12 以降は玉の逃げ場の手数帯別の [分子, 分母] × 帯の数）
+_NSTATS = 12 + 2 * len(ESCAPE_PLY_BANDS)
+
+
+def escape_ply_band(ply: torch.Tensor) -> torch.Tensor:
+    """受理手の数 → `ESCAPE_PLY_BANDS` の帯の番号"""
+    return torch.bucketize(ply.long(), torch.tensor(ESCAPE_PLY_BANDS[1:], device=ply.device), right=True)
+
+
+def escape_band_stats(batch) -> dict:
+    """batch の玉の逃げ場のラベルから、手数帯ごとの数えるマスの数と「動ける」の割合（ネットを通さない）"""
+    lab = batch["king_escape"].long()
+    band = escape_ply_band(batch["escape_ply"])
+    out = {}
+    for k, lo in enumerate(ESCAPE_PLY_BANDS):
+        cells = lab[band == k]
+        n_ok = int((cells >= 0).sum())
+        out[f"escape_cells_p{lo}"] = n_ok
+        if n_ok:
+            out[f"escape_pos_p{lo}"] = int((cells == 1).sum()) / n_ok
+    return out
+
+
 class MMDLearner:
     """現在のネット・ターゲット（書き出し用の EMA）・磁石のネット（`magnet_net`）を持ち、
     1つの batch（`collect(compact_legal=True, actor_extras=True)`）で `steps` 歩の Adam を進める。
@@ -609,7 +637,7 @@ class MMDLearner:
                     self.aux_opt.zero_grad(set_to_none=True)
                 if use_esc:
                     self.aux_esc_opt.zero_grad(set_to_none=True)
-                acc = torch.zeros(12, device=dev)
+                acc = torch.zeros(_NSTATS, device=dev)
                 for j in range(0, len(mb), cfg.chunk):
                     rows = mb[j:j + cfg.chunk]
                     loss, stats = self._chunk_loss(st, rows, m_pol, m_val, temp, value_only,
@@ -669,6 +697,13 @@ class MMDLearner:
                 # 重みを掛ける前の値（価値の行の重みつき二値交差エントロピー）と、数えるマスの正解率（行ごとの平均の重みつき平均）
                 out["loss_escape"] = float(ss[:, 10].mean())
                 out["acc_escape"] = float(ss[:, 11].mean())
+                # 手数帯別の正解率（全ミニバッチの和の比）と、同じ帯の数えるマスのうち「動ける」の割合（全部「動ける」と
+                # 答えたときの正解率 = 比べる基準。ネットを通さずラベルから出す）
+                for k, lo in enumerate(ESCAPE_PLY_BANDS):
+                    den = float(ss[:, 13 + 2 * k].sum())
+                    if den > 0:  # その帯の行が無ければ書かない
+                        out[f"acc_escape_p{lo}"] = float(ss[:, 12 + 2 * k].sum()) / den
+                out.update(escape_band_stats(batch))
             rd_sum, rd_cnt = (float(x) for x in ratio_dev_first)
             out["ratio_dev_first"] = rd_sum / rd_cnt if rd_cnt else 0.0
         else:
@@ -740,7 +775,7 @@ class MMDLearner:
         obs, pmask, apos, idx, pos = st.view(rows)
         r = rows.to(dev)
         wv, g, v_old = st.wv[r], st.g[r], st.v_old[r]
-        stats = torch.zeros(12, device=dev)
+        stats = torch.zeros(_NSTATS, device=dev)
         if value_only:
             v = _value_forward(self.net, obs)
             lv = (wv * (v - g) ** 2).sum() / m_val
@@ -789,6 +824,13 @@ class MMDLearner:
                 ok = lab >= 0
                 hit = (((esc > 0) == (lab > 0)) & ok).sum(1) / ok.sum(1).clamp(min=1)
                 stats[11] = (wv * hit).sum() / m_val
+                # 手数帯別: [正解率の分子（wv × 行の正解率）, 分母（数えるマスのある行の wv）] を帯ごとに足す
+                band = st.kband[r]
+                w_ok = wv * (ok.sum(1) > 0)
+                for k in range(len(ESCAPE_PLY_BANDS)):
+                    on = band == k
+                    stats[12 + 2 * k] = (w_ok * hit * on).sum()
+                    stats[13 + 2 * k] = (w_ok * on).sum()
         with torch.no_grad():
             on = w > 0
             stats[0], stats[1], stats[2], stats[3] = pol.detach(), kl.detach(), mag.detach(), lv.detach()
@@ -947,6 +989,8 @@ class _Rows:
         self.obs = batch["obs"][U].to(dev) if learner.device_batch else None
         self.mclass = batch["move_class"][U].to(dev, torch.long) if "move_class" in batch else None
         self.kesc = batch["king_escape"][U].to(dev, torch.long) if "king_escape" in batch else None
+        self.kband = (escape_ply_band(batch["escape_ply"][U]).to(dev) if "escape_ply" in batch
+                      else (torch.zeros(len(U), dtype=torch.long, device=dev) if self.kesc is not None else None))
         # 行ごとの選んだ手の、U の CSR の中の位置（外側の重要度を拾う）
         cols_cpu = cols_u.long()
         act_cpu = batch["action"][U]

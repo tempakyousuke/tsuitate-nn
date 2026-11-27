@@ -524,8 +524,8 @@ def main() -> None:
                          "maturin develop で作り直す）")
     if args.aux_escape > 0:
         names = getattr(tsuitate_rl, "KING_ESCAPE_NAMES", None)
-        if names is None or not hasattr(tsuitate_rl.VecEnv, "king_escape"):
-            raise SystemExit("--aux-escape には VecEnv.king_escape が要る（tsuitate-bot の rl-env を maturin develop で作り直す）")
+        if names is None or not all(hasattr(tsuitate_rl.VecEnv, m) for m in ("king_escape", "plies")):
+            raise SystemExit("--aux-escape には VecEnv.king_escape と VecEnv.plies が要る（tsuitate-bot の rl-env を maturin develop で作り直す）")
         if len(names) != NUM_KING_ESCAPE:
             raise SystemExit(f"玉の逃げ場のマスの数が合わない: tsuitate_rl は {len(names)}、model.NUM_KING_ESCAPE は "
                              f"{NUM_KING_ESCAPE}")

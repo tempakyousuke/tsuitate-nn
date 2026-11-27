@@ -3,11 +3,11 @@ tsuitate_rl（VecEnv.king_escape がある版）が要る。
 
     .venv/bin/python rnad/tests/test_aux_escape.py
 
-- collect(king_escape=True) は記録した手番ごとに [N, 8] のラベル（−1 / 0 / 1）を返し、ほかのキーは king_escape=False と
+- collect(king_escape=True) は記録した手番ごとに [N, 8] のラベル（−1 / 0 / 1）と受理手の数 escape_ply を返し、ほかのキーは king_escape=False と
   ビット単位で同じ（乱数を消費しない）。収集の速い経路（fast="py" / "rust"）でも同じ
 - aux_escape=0 の update は補助ヘッドを作らず、king_escape の有無で結果が変わらない（従来と同じ）
 - aux_escape>0 の update は同じ batch で繰り返すと補助損失が下がる。ネットの形と書き出しの state_dict は変わらない。
-  --aux-class と一緒でも回る
+  --aux-class と一緒でも回る。手数帯別の正解率（acc_escape_p<下限>）と「動ける」の割合（escape_pos_p<下限>）が出る
 - state_dict は補助ヘッドと optimizer を持ち回り、2更新→保存→読み込み→2更新が4更新を続けたものと一致する
 - train_rnad.py: --algo mmd --aux-escape（値なし = 既定の重み）で回り、ログに loss_escape / acc_escape が出る。
   --fast-collect・--pipeline とも回る。R-NaD とは起動時に止まる
@@ -62,6 +62,13 @@ def check_collect():
     # 初手（先手）: 前左・前・前右 だけ動ける（左右は金、後ろは盤外）
     first = (b["t"] == 0).nonzero()[0, 0]
     assert ke[first].tolist() == [1, 1, 1, -1, -1, -1, -1, -1], ke[first].tolist()
+    ply = b["escape_ply"]
+    assert ply.shape == b["action"].shape and int(ply[first]) == 0 and int(ply.min()) >= 0
+    # 受理手の数は同じ局の中で t とともに減らない（反則では増えない）
+    for g in b["b"].unique().tolist():
+        rows = (b["b"] == g).nonzero().squeeze(1)
+        p = ply[rows[b["t"][rows].argsort()]]
+        assert bool((p[1:] >= p[:-1]).all()), g
     n_ok = int((ke >= 0).sum())
     print(f"T1 collect(king_escape=True): {len(ke)} 行、数えるマス {n_ok}（うち動ける {int((ke == 1).sum())}）。"
           "ほかのキーはビット単位で同じ")
@@ -120,6 +127,13 @@ def check_on(bt):
     losses = [lg["loss_escape"] for lg in logs]
     assert losses[-1] < losses[0] * 0.9, losses  # 学習率が小さいので下がり方はゆっくり（25更新で約 0.69 → 0.59）
     assert 0.0 <= logs[-1]["acc_escape"] <= 1.0
+    # 手数帯別: 帯の数えるマスの合計が全体と一致し、正解率と「動ける」の割合は [0, 1]
+    from mmd import ESCAPE_PLY_BANDS
+    lg = logs[-1]
+    assert sum(lg[f"escape_cells_p{lo}"] for lo in ESCAPE_PLY_BANDS) == int((bt["king_escape"] >= 0).sum())
+    bands = [lo for lo in ESCAPE_PLY_BANDS if lg[f"escape_cells_p{lo}"]]
+    assert bands and all(0.0 <= lg[f"acc_escape_p{lo}"] <= 1.0 and 0.0 <= lg[f"escape_pos_p{lo}"] <= 1.0 for lo in bands)
+    band_txt = " ".join(f"p{lo}: {lg[f'acc_escape_p{lo}']:.3f}/{lg[f'escape_pos_p{lo}']:.3f}" for lo in bands)
     assert set(L.net.state_dict()) == keys  # 補助ヘッドはネットの外（書き出しに入らない）
     sd = L.state_dict()
     assert "aux_esc" in sd and "aux_esc_opt" in sd
@@ -136,7 +150,8 @@ def check_on(bt):
     lg = M.update(dict(both))
     assert "loss_aux" in lg and "loss_escape" in lg
     print(f"T3 aux_escape=1: 同じ batch で25更新して補助損失 {losses[0]:.3f} → {losses[-1]:.3f}"
-          f"（正解率 {logs[0]['acc_escape']:.3f} → {logs[-1]['acc_escape']:.3f}）、ネットの形は不変。--aux-class と併用可")
+          f"（正解率 {logs[0]['acc_escape']:.3f} → {logs[-1]['acc_escape']:.3f}。手数帯別の正解率/動けるの割合 {band_txt}）、"
+          "ネットの形は不変。--aux-class と併用可")
 
 
 def check_resume():
@@ -176,7 +191,7 @@ def check_train(tmp):
     r = run_train(tmp / "ok", "--aux-escape")
     assert r.returncode == 0, r.stderr[-1500:]
     recs = [json.loads(line) for line in open(tmp / "ok" / "log.jsonl") if line.strip()]
-    assert all("loss_escape" in json.dumps(rec) and "acc_escape" in json.dumps(rec) for rec in recs), recs[-1].keys()
+    assert all("loss_escape" in json.dumps(rec) and "acc_escape_p0" in json.dumps(rec) for rec in recs), recs[-1].keys()
     ck = torch.load(tmp / "ok" / "checkpoint.pt", map_location="cpu")
     assert "aux_esc" in ck
     assert ck["cfg"]["aux_escape"] == 0.1, ck["cfg"].get("aux_escape")  # 値なしの --aux-escape = 既定の重み

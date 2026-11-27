@@ -1142,6 +1142,9 @@ class MultiEnv:
     def king_escape(self):
         return np.concatenate([e.king_escape() for e in self.envs])
 
+    def plies(self):
+        return np.concatenate([e.plies() for e in self.envs])
+
     def move_classes(self, actions):
         return np.concatenate([e.move_classes(np.ascontiguousarray(x)) for e, x in zip(self.envs, self._split(actions))])
 
@@ -1225,7 +1228,8 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
 
     `king_escape=True` なら記録する各手番の**自玉の逃げ場のラベル**（`VecEnv.king_escape()`、tsuitate-bot の
     `EnvGame::king_escape_into`。[N, 8] int8。−1 = 数えない〔盤外・自駒〕、0 = 真実の盤面で玉が動けない、1 = 動ける）を
-    `king_escape` に入れて返す（玉の逃げ場の補助ヘッド用。乱数は消費しない）
+    `king_escape` に入れ、その手番までの受理手の数（`VecEnv.plies()`、[N] int32。手数帯別の集計用）を `escape_ply` に
+    入れて返す（玉の逃げ場の補助ヘッド用。乱数は消費しない）
 
     `compact_legal=True` なら合法手のマスクを密な [N, 11259] の bool でなく、**合法手の添字**（行ごとに昇順でつなげた
     `legal_cols` int16 と行ごとの個数 `legal_counts`）で持つ（768局で約 0.79GB → 約 11MB。`--pipeline` で batch が
@@ -1272,7 +1276,7 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
     obs_l, legal_l, act_l, mu_l, t_l, b_l, truth_l = [], [], [], [], [], [], []
     v_l, lp_l = [], []  # actor_extras
     mc_l = []  # move_class
-    ke_l = []  # king_escape
+    ke_l, kp_l = [], []  # king_escape
     valid = torch.zeros(max_steps, B, dtype=torch.bool)
     player = torch.zeros(max_steps, B, dtype=torch.long)
     reward = torch.zeros(max_steps, B, 2)
@@ -1289,6 +1293,7 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
         obs, mask, pl = env.observe()
         tr = env.truth() if truth else None
         ke = env.king_escape() if king_escape else None
+        kp = env.plies() if king_escape else None
         idx = np.flatnonzero(alive)
         all_idx = idx
         opp_by = {}
@@ -1402,6 +1407,7 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
             mc_l.append(torch.from_numpy(mc[idx]))
         if king_escape:
             ke_l.append(torch.from_numpy(ke[idx]))
+            kp_l.append(torch.from_numpy(kp[idx]))
     else:
         raise RuntimeError(f"{max_steps} 手で終わらない局がある")
     for t0, b, p, bonus in pending:
@@ -1415,6 +1421,7 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
         extra["move_class"] = torch.cat(mc_l)
     if king_escape:
         extra["king_escape"] = torch.cat(ke_l)
+        extra["escape_ply"] = torch.cat(kp_l)
     if actor_extras:
         extra.update(v_actor=torch.cat(v_l), mu_logp=torch.cat(lp_l))
     if shape_run is not None:
@@ -1469,7 +1476,7 @@ def _collect_fast(env, net, device, max_steps, generator, rust, extras=False, sh
     B = env.num_envs
     obs_l, cols_l, cnt_l, act_l, mu_l, t_l, b_l = [], [], [], [], [], [], []
     mc_l = []  # move_class
-    ke_l = []  # king_escape
+    ke_l, kp_l = [], []  # king_escape
     v_l, lp_l = [], []
     valid = torch.zeros(max_steps, B, dtype=torch.bool)
     player = torch.zeros(max_steps, B, dtype=torch.long)
@@ -1524,6 +1531,7 @@ def _collect_fast(env, net, device, max_steps, generator, rust, extras=False, sh
             mc_l.append(torch.from_numpy(env.move_classes(actions)[idx]))  # step の前（指す前の局面で区分を決める）
         if king_escape:
             ke_l.append(torch.from_numpy(env.king_escape()[idx]))  # step の前（指す前の局面のラベル）
+            kp_l.append(torch.from_numpy(env.plies()[idx]))
         rew, done = env.step(actions)
         outcome[done] = rew[done]
         if shape_run is not None:
@@ -1545,7 +1553,7 @@ def _collect_fast(env, net, device, max_steps, generator, rust, extras=False, sh
         **({"v_actor": torch.cat(v_l), "mu_logp": torch.cat(lp_l)} if extras else {}),
         **({"shape_run": shape_run} if shape_run is not None else {}),
         **({"move_class": torch.cat(mc_l)} if move_class else {}),
-        **({"king_escape": torch.cat(ke_l)} if king_escape else {}),
+        **({"king_escape": torch.cat(ke_l), "escape_ply": torch.cat(kp_l)} if king_escape else {}),
         "legal_cols": torch.cat(cols_l), "legal_counts": torch.cat(cnt_l),
         "obs": torch.cat(obs_l), "action": torch.cat(act_l),
         "mu_a": torch.cat(mu_l), "t": torch.cat(t_l), "b": torch.cat(b_l),
