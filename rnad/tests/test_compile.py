@@ -63,13 +63,13 @@ def log_rel(a, b):
     return worst, key
 
 
-def batches(net, n, truth=False, move_class=False, sizes=(10, 7, 13)):
+def batches(net, n, truth=False, move_class=False, king_escape=False, sizes=(10, 7, 13)):
     out = []
     for i in range(n):
         torch.manual_seed(10 + i)
         env = tsuitate_rl.VecEnv(sizes[i % len(sizes)], seed=20 + i, auto_reset=False, planes=91)
         out.append(collect(env, net, DEV, truth=truth, compact_legal=True, actor_extras=True,
-                           move_class=move_class))
+                           move_class=move_class, king_escape=king_escape))
     return out
 
 
@@ -90,6 +90,8 @@ def compare(name, base, bs, mode="default", log_tol=1e-3):
         lx = x.update(b)
         if getattr(ref.cfg, "aux_class", 0) > 0 or getattr(ref.cfg, "aux_truth", 0) > 0:
             assert "loss_aux" in lr and "loss_aux" in lx, f"{name}: 補助ヘッドが使われていない"
+        if getattr(ref.cfg, "aux_escape", 0) > 0:
+            assert any(k.startswith("loss_esc") or "escape" in k for k in lx), f"{name}: 逃げ場の補助ヘッドが使われていない"
         worst = max(worst, rel(grad_vec(x.net), grad_vec(ref.net)))
         e = log_rel(lr, lx)
         worst_log = max(worst_log, e, key=lambda t: t[0])
@@ -99,9 +101,10 @@ def compare(name, base, bs, mode="default", log_tol=1e-3):
             if hasattr(ref, a):
                 getattr(x, a).load_state_dict(getattr(ref, a).state_dict())
         x.opt.load_state_dict(ref.opt.state_dict())
-        if getattr(ref, "aux", None) is not None:
-            x.aux.load_state_dict(ref.aux.state_dict())
-            x.aux_opt.load_state_dict(ref.aux_opt.state_dict())
+        for h, o in (("aux", "aux_opt"), ("aux_esc", "aux_esc_opt")):
+            if getattr(ref, h, None) is not None:
+                getattr(x, h).load_state_dict(getattr(ref, h).state_dict())
+                getattr(x, o).load_state_dict(getattr(ref, o).state_dict())
         if hasattr(ref, "gen"):
             x.gen.set_state(ref.gen.get_state())
     assert worst < TOL, f"{name}: 勾配の相対誤差 {worst:.2e}"
@@ -170,6 +173,8 @@ def check_mmd():
     compare("MMD device_batch", b, bs)
     b = mmd_base(aux_class=0.5)
     compare("MMD 補助ヘッド", b, batches(b.net, 2, move_class=True))
+    b = mmd_base(aux_class=0.5, aux_escape=0.5)
+    compare("MMD 補助ヘッド2つ（手の狙い・玉の逃げ場）", b, batches(b.net, 2, move_class=True, king_escape=True))
     b = mmd_base(value_warmup=10)
     compare("MMD 価値だけの更新", b, bs[:2])
 

@@ -121,6 +121,16 @@ class MMDConfig:
     # 損失は w_v·(q[指した手の区分] − G_td)² の価値の行の平均（価値の損失と同じ行・重み・目標）。報酬・方策の目的は変えない。
     # batch には `collect(move_class=True)` の `move_class` が要る
     aux_class: float = 0.0
+    # 自玉の逃げ場（玉の周り8マスのそれぞれへ真実の盤面で動けるか）を当てる補助ヘッド（`model.KingEscapeHead`）の
+    # 損失の重み。0 = 使わない（従来と同じ）。損失は w_v·(数えるマスの二値交差エントロピーの平均) の価値の行の平均
+    # （`aux_class` と同じ行・重み）。報酬・方策の目的は変えない。batch には `collect(king_escape=True)` の
+    # `king_escape` が要る
+    aux_escape: float = 0.0
+
+
+# 玉の逃げ場の補助ヘッドの手数帯別の集計の区切り（受理手の数。ログの `acc_escape_p<下限>` / `escape_pos_p<下限>`）。
+# 学習には効かない（記録だけ）
+ESCAPE_PLY_BANDS = (0, 30, 60, 90)
 
 
 PRESETS = {
@@ -433,6 +443,25 @@ ABS_BANDS = (0.0, 0.3, 0.6, 1.0001)
 REMAIN_BANDS = (0, 10, 40, 80, 10_000)
 
 
+# _chunk_loss の stats の長さ（0〜10 は帯に分けない項目、11 以降は玉の逃げ場の手数帯別の
+# [正解率の分子, 「動ける」の割合の分子, 分母] × 帯の数。3つとも同じ行・同じ重み = 数えるマスのある価値の行の wv）
+_ESC0 = 11
+_NSTATS = _ESC0 + 3 * len(ESCAPE_PLY_BANDS)
+
+
+def escape_ply_band(ply: torch.Tensor) -> torch.Tensor:
+    """受理手の数 → `ESCAPE_PLY_BANDS` の帯の番号"""
+    return torch.bucketize(ply.long(), torch.tensor(ESCAPE_PLY_BANDS[1:], device=ply.device), right=True)
+
+
+def escape_band_stats(batch) -> dict:
+    """batch の玉の逃げ場のラベルから、手数帯ごとの数えるマスの数（batch の全行。ネットを通さない）。
+    「動ける」の割合は正解率と同じ行・同じ重みで比べるので、ここでなく `_chunk_loss` で数える"""
+    lab = batch["king_escape"]
+    band = escape_ply_band(batch["escape_ply"])
+    return {f"escape_cells_p{lo}": int((lab[band == k] >= 0).sum()) for k, lo in enumerate(ESCAPE_PLY_BANDS)}
+
+
 class MMDLearner:
     """現在のネット・ターゲット（書き出し用の EMA）・磁石のネット（`magnet_net`）を持ち、
     1つの batch（`collect(compact_legal=True, actor_extras=True)`）で `steps` 歩の Adam を進める。
@@ -477,6 +506,8 @@ class MMDLearner:
         # 補助ヘッドは使うときだけ作る（使わない run の checkpoint・乱数の消費は従来と同じ）
         self.aux = None
         self.aux_opt = None
+        self.aux_esc = None
+        self.aux_esc_opt = None
 
     def _fwd(self, fn):
         return R.compiled(fn, self.compile, self.cfg.chunk)
@@ -489,6 +520,14 @@ class MMDLearner:
                 self.aux = ClassValueHead(self.net.config["channels"]).to(self.device).eval()
             self.aux_opt = torch.optim.Adam(self.aux.parameters(), lr=self.cfg.lr[0],
                                             betas=(self.cfg.adam_b1, 0.999), eps=1e-8)
+
+    def _ensure_aux_esc(self):
+        if self.aux_esc is None:
+            from model import KingEscapeHead
+            with torch.random.fork_rng(devices=[]):  # 乱数を消費しない（`_ensure_aux` と同じ）
+                self.aux_esc = KingEscapeHead(self.net.config["channels"]).to(self.device).eval()
+            self.aux_esc_opt = torch.optim.Adam(self.aux_esc.parameters(), lr=self.cfg.lr[0],
+                                                betas=(self.cfg.adam_b1, 0.999), eps=1e-8)
 
     # ---- 予定
 
@@ -550,6 +589,14 @@ class MMDLearner:
                                  "MOVE_CLASS_NAMES と model.NUM_MOVE_CLASSES を合わせる")
             for g in self.aux_opt.param_groups:
                 g["lr"] = lr
+        use_esc = cfg.aux_escape > 0 and not value_only
+        if cfg.aux_escape > 0:
+            if "king_escape" not in batch or "escape_ply" not in batch:  # 更新を始める前に止める
+                raise ValueError("aux_escape > 0 には collect(..., king_escape=True) の batch が要る"
+                                 "（king_escape と escape_ply）")
+            self._ensure_aux_esc()
+            for g in self.aux_esc_opt.param_groups:
+                g["lr"] = lr
 
         n = len(batch["action"])
         v_act = batch["v_actor"].float()
@@ -592,7 +639,9 @@ class MMDLearner:
                 self.opt.zero_grad(set_to_none=True)
                 if use_aux:
                     self.aux_opt.zero_grad(set_to_none=True)
-                acc = torch.zeros(10, device=dev)
+                if use_esc:
+                    self.aux_esc_opt.zero_grad(set_to_none=True)
+                acc = torch.zeros(_NSTATS, device=dev)
                 for j in range(0, len(mb), cfg.chunk):
                     rows = mb[j:j + cfg.chunk]
                     loss, stats = self._chunk_loss(st, rows, m_pol, m_val, temp, value_only,
@@ -604,6 +653,8 @@ class MMDLearner:
                 self.opt.step()
                 if use_aux:
                     self.aux_opt.step()
+                if use_esc:
+                    self.aux_esc_opt.step()
                 step_stats.append(acc)
                 if ratio_dev_first is None:
                     ratio_dev_first = (acc[7], acc[8])
@@ -646,6 +697,22 @@ class MMDLearner:
                        clip_rate=float((gn > cfg.max_grad_norm).double().mean()) if cfg.max_grad_norm > 0 else 0.0)
             if use_aux:
                 out["loss_aux"] = float(ss[:, 9].mean())  # 重みを掛ける前の値（価値の行の重みつき二乗誤差）
+            if use_esc:
+                # 重みを掛ける前の値（価値の行の重みつき二値交差エントロピー）と、数えるマスの正解率（行ごとの平均の重みつき平均）
+                out["loss_escape"] = float(ss[:, 10].mean())
+                # 正解率と「動ける」の割合（全部「動ける」と答えたときの正解率 = 比べる基準）は、どちらも
+                # 「行ごとの数えるマスの平均」を、数えるマスのある価値の行の wv で重みづけた平均（全ミニバッチの和の比）。
+                # 同じ行・同じ重みなので差をそのまま読める。数えるマスの無い行は分母にも入れない
+                bs = ss[:, _ESC0:].sum(0).reshape(len(ESCAPE_PLY_BANDS), 3)
+                den_all = float(bs[:, 2].sum())
+                out["acc_escape"] = float(bs[:, 0].sum()) / den_all if den_all > 0 else 0.0
+                out["escape_pos"] = float(bs[:, 1].sum()) / den_all if den_all > 0 else 0.0
+                for k, lo in enumerate(ESCAPE_PLY_BANDS):
+                    den = float(bs[k, 2])
+                    if den > 0:  # その帯の行が無ければ書かない
+                        out[f"acc_escape_p{lo}"] = float(bs[k, 0]) / den
+                        out[f"escape_pos_p{lo}"] = float(bs[k, 1]) / den
+                out.update(escape_band_stats(batch))
             rd_sum, rd_cnt = (float(x) for x in ratio_dev_first)
             out["ratio_dev_first"] = rd_sum / rd_cnt if rd_cnt else 0.0
         else:
@@ -711,13 +778,13 @@ class MMDLearner:
 
     def _chunk_loss(self, st, rows, m_pol, m_val, temp, value_only, first):
         """1チャンクの損失（ミニバッチの m で割った和）と、ログ用の和 [pol, kl, mag, lv, vf_change, |r − 1| > clip の行の数,
-        方策の行の数, 最初の歩の |π_θ/μ − 1| の和, その数, 補助ヘッドの損失]"""
+        方策の行の数, 最初の歩の |π_θ/μ − 1| の和, その数, 補助ヘッドの損失, 玉の逃げ場の損失, 以降は玉の逃げ場の手数帯別の和（`_NSTATS`）]"""
         cfg = self.cfg
         dev = self.device
         obs, pmask, apos, idx, pos = st.view(rows)
         r = rows.to(dev)
         wv, g, v_old = st.wv[r], st.g[r], st.v_old[r]
-        stats = torch.zeros(10, device=dev)
+        stats = torch.zeros(_NSTATS, device=dev)
         if value_only:
             v = self._fwd(_value_forward)(self.net, obs)
             lv = (wv * (v - g) ** 2).sum() / m_val
@@ -725,8 +792,12 @@ class MMDLearner:
             stats[4] = ((wv * (v.detach() - v_old) ** 2).sum() / m_val)
             return cfg.vf * lv, stats
         use_aux = self.aux is not None and cfg.aux_class > 0
-        if use_aux:
-            logits, v, q = self._fwd(R.forward_aux)(self.net, self.aux, obs)
+        use_esc = self.aux_esc is not None and cfg.aux_escape > 0
+        if use_aux or use_esc:
+            heads = ([self.aux] if use_aux else []) + ([self.aux_esc] if use_esc else [])
+            logits, v, outs = self._fwd(R.forward_auxes)(self.net, heads, obs)
+            q = outs[0] if use_aux else None
+            esc = outs[-1] if use_esc else None
         else:
             logits, v = self._fwd(forward)(self.net, obs)
         lp = legal_log_policy(logits.gather(1, idx), pmask)
@@ -753,6 +824,25 @@ class MMDLearner:
             la = (wv * ok * (q_a - g) ** 2).sum() / m_val
             loss = loss + cfg.aux_class * la
             stats[9] = la.detach()
+        if use_esc:
+            lab = st.kesc[r]
+            le = (wv * R.aux_escape_loss(esc, lab)).sum() / m_val
+            loss = loss + cfg.aux_escape * le
+            stats[10] = le.detach()
+            with torch.no_grad():
+                ok = lab >= 0
+                n_ok = ok.sum(1).clamp(min=1)
+                hit = (((esc > 0) == (lab > 0)) & ok).sum(1) / n_ok
+                free = (lab > 0).sum(1) / n_ok
+                # 手数帯別: [正解率の分子（wv × 行の正解率）, 「動ける」の割合の分子（wv × 行の割合）,
+                # 分母（数えるマスのある行の wv）] を帯ごとに足す
+                band = st.kband[r]
+                w_ok = wv * (ok.sum(1) > 0)
+                for k in range(len(ESCAPE_PLY_BANDS)):
+                    on = band == k
+                    stats[_ESC0 + 3 * k] = (w_ok * hit * on).sum()
+                    stats[_ESC0 + 3 * k + 1] = (w_ok * free * on).sum()
+                    stats[_ESC0 + 3 * k + 2] = (w_ok * on).sum()
         with torch.no_grad():
             on = w > 0
             stats[0], stats[1], stats[2], stats[3] = pol.detach(), kl.detach(), mag.detach(), lv.detach()
@@ -802,6 +892,8 @@ class MMDLearner:
                 "rng": rng_state(self.device), "gen": self.gen.get_state(),
                 **({"filt_hist": list(self.filt_hist)} if self.filt_hist else {}),
                 **({"aux": self.aux.state_dict(), "aux_opt": self.aux_opt.state_dict()} if self.aux is not None else {}),
+                **({"aux_esc": self.aux_esc.state_dict(), "aux_esc_opt": self.aux_esc_opt.state_dict()}
+                   if self.aux_esc is not None else {}),
                 **({"init_from": self.init_from} if self.init_from else {})}
 
     def load_state_dict(self, d):
@@ -823,11 +915,17 @@ class MMDLearner:
             self._ensure_aux()
             self.aux.load_state_dict(d["aux"])
             self.aux_opt.load_state_dict(d["aux_opt"])
+        if "aux_esc" in d:
+            self._ensure_aux_esc()
+            self.aux_esc.load_state_dict(d["aux_esc"])
+            self.aux_esc_opt.load_state_dict(d["aux_esc_opt"])
 
     def reset_optimizer_state(self):
         self.opt.state.clear()
         if self.aux_opt is not None:
             self.aux_opt.state.clear()
+        if self.aux_esc_opt is not None:
+            self.aux_esc_opt.state.clear()
 
     def reseed(self, seed):
         self.gen.manual_seed(seed)
@@ -857,8 +955,12 @@ class MMDLearner:
             self.filt_hist = []
         self.parsed = parsed
         self.cfg = cfg
-        for g in self.opt.param_groups:
-            g["betas"] = (cfg.adam_b1, g["betas"][1])
+        # 補助ヘッドの optimizer も同じ β₁ にする（checkpoint から読んだものは古い β₁ を持っている。
+        # まだ作っていないものは作るときに self.cfg から取る）
+        for opt in (self.opt, self.aux_opt, self.aux_esc_opt):
+            if opt is not None:
+                for g in opt.param_groups:
+                    g["betas"] = (cfg.adam_b1, g["betas"][1])
 
 
 def _sched(spec, t):
@@ -902,6 +1004,9 @@ class _Rows:
         self.is_w = torch.ones(len(U), device=dev)
         self.obs = batch["obs"][U].to(dev) if learner.device_batch else None
         self.mclass = batch["move_class"][U].to(dev, torch.long) if "move_class" in batch else None
+        self.kesc = batch["king_escape"][U].to(dev, torch.long) if "king_escape" in batch else None
+        self.kband = (escape_ply_band(batch["escape_ply"][U]).to(dev) if "escape_ply" in batch
+                      else (torch.zeros(len(U), dtype=torch.long, device=dev) if self.kesc is not None else None))
         # 行ごとの選んだ手の、U の CSR の中の位置（外側の重要度を拾う）
         cols_cpu = cols_u.long()
         act_cpu = batch["action"][U]

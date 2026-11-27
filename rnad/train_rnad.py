@@ -37,7 +37,7 @@ from export_weights import write as write_weights
 from guard import apply_win_bonus as apply_guard_win_bonus
 from guard import summarize as summarize_guard
 from speed import summarize as summarize_speed
-from model import EXTENDED_PLANES, NUM_MOVE_CLASSES, NUM_PLANES, NUM_PLANES_DEDUCED, PolicyValueNet, planes_for
+from model import EXTENDED_PLANES, NUM_KING_ESCAPE, NUM_MOVE_CLASSES, NUM_PLANES, NUM_PLANES_DEDUCED, PolicyValueNet, planes_for
 from widen_planes import EXTRA_FLAG_NAMES, add_extra_flags, extras_from_args, widen_checkpoint
 from league import League
 import openings
@@ -51,6 +51,10 @@ from rnad import (COMPILE_MODES, PRECISIONS, MultiEnv, OpponentPool, PipelinedCo
                   collect, play_match, set_precision, split_noise)
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+# --aux-escape を値なしで付けたときの重み。逃げ場のラベルは相手の駒が見えないぶん観測からは決まらないことが多く、
+# 価値の損失（vf × 二乗誤差）より大きく効かせると幹を引っ張りすぎる見込みなので小さめにする（A/B で確かめる前提）
+AUX_ESCAPE_DEFAULT = 0.1
 
 
 def pick_device(name: str) -> torch.device:
@@ -181,6 +185,8 @@ def check_algo_args(ap, args):
             raise SystemExit("--mmd-* / --init-which / --init-step は --algo mmd のときだけ使う")
         if args.aux_class > 0:
             raise SystemExit("--aux-class は --algo mmd のときだけ使う（R-NaD の学習器には付けていない）")
+        if args.aux_escape > 0:
+            raise SystemExit("--aux-escape は --algo mmd のときだけ使う（R-NaD の学習器には付けていない）")
         return None
     if not args.compact_legal:
         raise SystemExit("--algo mmd は --compact-legal と一緒に使う（収集方策の対数確率を合法手の添字の並びで持つ）")
@@ -208,6 +214,7 @@ def check_algo_args(ap, args):
             t_scale=args.mmd_t_scale, steps=args.mmd_steps, chunk=args.mmd_chunk, epochs=args.mmd_epochs,
             max_grad_norm=args.mmd_max_grad_norm, adam_b1=args.mmd_adam_b1, value_warmup=args.mmd_value_warmup,
             adv_norm=args.mmd_adv_norm, aux_class=(args.aux_class if args.aux_class > 0 else None),
+            aux_escape=(args.aux_escape if args.aux_escape > 0 else None),
             target_avg=args.target_avg)
     except ValueError as e:
         raise SystemExit(f"MMD の設定: {e}") from e
@@ -267,6 +274,10 @@ def main() -> None:
     ap.add_argument("--aux-class", type=float, default=0.0,
                     help="（--algo mmd）手の区分ごとの期待値を予測する補助ヘッドの損失の重み（0 = 使わない。報酬・方策の"
                          "目的は変えない。区分は tsuitate-bot の rl::move_class。--fast-collect / --pipeline とは使えない）")
+    ap.add_argument("--aux-escape", type=float, nargs="?", const=AUX_ESCAPE_DEFAULT, default=0.0, metavar="W",
+                    help="（--algo mmd）自玉の逃げ場（玉の周り8マスのそれぞれへ真実の盤面で動けるか）を当てる補助ヘッドの"
+                         f"損失の重み（0 = 使わない。値を省くと {AUX_ESCAPE_DEFAULT}。報酬・方策の目的は変えない。"
+                         "ラベルは tsuitate-bot の VecEnv.king_escape）")
     ap.add_argument("--override-config", action="store_true",
                     help="再開時に checkpoint と違う設定（学習率・β など）を使うことを許す。"
                          "指定しないと設定の食い違いは停止する")
@@ -514,6 +525,13 @@ def main() -> None:
     if args.fast_collect == "rust" and not hasattr(tsuitate_rl.VecEnv, "observe_alive_f16_csr"):
         raise SystemExit("--fast-collect rust には VecEnv.observe_alive_f16_csr が要る（tsuitate-bot の rl-env を "
                          "maturin develop で作り直す）")
+    if args.aux_escape > 0:
+        names = getattr(tsuitate_rl, "KING_ESCAPE_NAMES", None)
+        if names is None or not all(hasattr(tsuitate_rl.VecEnv, m) for m in ("king_escape", "plies")):
+            raise SystemExit("--aux-escape には VecEnv.king_escape と VecEnv.plies が要る（tsuitate-bot の rl-env を maturin develop で作り直す）")
+        if len(names) != NUM_KING_ESCAPE:
+            raise SystemExit(f"玉の逃げ場のマスの数が合わない: tsuitate_rl は {len(names)}、model.NUM_KING_ESCAPE は "
+                             f"{NUM_KING_ESCAPE}")
     if args.aux_class > 0:
         # 区分の数は tsuitate-bot の rl::move_class と補助ヘッドの出力の数（model.NUM_MOVE_CLASSES）の2か所にある
         names = getattr(tsuitate_rl, "MOVE_CLASS_NAMES", None)
@@ -899,7 +917,7 @@ def main() -> None:
                      if n_self else None), device,
             seed=args.seed * 1_000_003 + 17 + learner.step_count, compact_legal=args.compact_legal,
             fast=args.fast_collect, actor_extras=args.algo == "mmd", shaping=shape, watch_signals=watch_signals,
-            move_class=args.aux_class > 0)
+            move_class=args.aux_class > 0, king_escape=args.aux_escape > 0)
 
         def pipe_shape_mult(step):
             """step で使う batch の整形の倍率（--pipeline なしと同じく「その batch を使う step」で決める）"""
@@ -1091,7 +1109,7 @@ def main() -> None:
                             nyugyoku_win_only=args.nyugyoku_cond == "win",
                             opponents=(None if league_games is None else [None] * n_self + league_games),
                             opp_nets=(opp_nets if league_games is not None else None),
-                            truth=cfg.aux_truth > 0, move_class=args.aux_class > 0,
+                            truth=cfg.aux_truth > 0, move_class=args.aux_class > 0, king_escape=args.aux_escape > 0,
                             compact_legal=args.compact_legal, fast=args.fast_collect,
                             actor_extras=args.algo == "mmd", shaping=shape, shape_mult=shape_mult,
                             watch_signals=watch_signals,
