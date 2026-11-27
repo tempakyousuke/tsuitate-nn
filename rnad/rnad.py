@@ -79,6 +79,29 @@ def forward_aux(net, aux, x: torch.Tensor):
     return logits.float(), v.float(), a.float()
 
 
+def forward_auxes(net, auxes, x: torch.Tensor):
+    """`forward_aux` の補助ヘッドを複数にしたもの（幹は1回だけ通す）: (ロジット, 価値, [各補助ヘッドの出力])"""
+    if _AMP_DTYPE is None:
+        f = net.trunk(x)
+        logits, v = net.heads(f)
+        return logits, v, [a(f) for a in auxes]
+    if x.device.type != "cuda":
+        raise RuntimeError("bf16 は CUDA でだけ使う")
+    with torch.autocast("cuda", dtype=_AMP_DTYPE):
+        f = net.trunk(x)
+        logits, v = net.heads(f)
+        outs = [a(f) for a in auxes]
+    return logits.float(), v.float(), [o.float() for o in outs]
+
+
+def aux_escape_loss(logits: torch.Tensor, label: torch.Tensor) -> torch.Tensor:
+    """決定点ごとの玉の逃げ場の補助損失 [B]: ラベル −1（盤外・自駒）を除いた二値交差エントロピーのマス平均
+    （数えるマスが無い行は 0）"""
+    ok = label >= 0
+    bce = F.binary_cross_entropy_with_logits(logits, label.clamp(min=0).to(logits.dtype), reduction="none")
+    return (bce * ok).sum(1) / ok.sum(1).clamp(min=1)
+
+
 def aux_truth_loss(aux_logits: torch.Tensor, truth: torch.Tensor) -> torch.Tensor:
     """決定点ごとの補助損失 [B]: 自駒のマス（ラベル −1）を除いた交差エントロピーのマス平均"""
     ce = F.cross_entropy(aux_logits.reshape(-1, aux_logits.shape[-1]), truth.reshape(-1),
@@ -1116,6 +1139,12 @@ class MultiEnv:
     def truth(self):
         return np.concatenate([e.truth() for e in self.envs])
 
+    def king_escape(self):
+        return np.concatenate([e.king_escape() for e in self.envs])
+
+    def plies(self):
+        return np.concatenate([e.plies() for e in self.envs])
+
     def move_classes(self, actions):
         return np.concatenate([e.move_classes(np.ascontiguousarray(x)) for e, x in zip(self.envs, self._split(actions))])
 
@@ -1149,7 +1178,7 @@ class MultiEnv:
 
 def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode="enter",
             nyugyoku_zero_sum=True, opponents=None, opp_nets=None, nyugyoku_win_only=False, truth=False,
-            generator=None, move_class=False, compact_legal=False, fast="", actor_extras=False, shaping=None, shape_mult=1.0,
+            generator=None, move_class=False, king_escape=False, compact_legal=False, fast="", actor_extras=False, shaping=None, shape_mult=1.0,
             watch_signals=False, noise_rng=None):
     """`env`（auto_reset=False の VecEnv）の全局を1局ずつ最後まで自己対局し、学習用に並べる。
 
@@ -1197,6 +1226,11 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
     [N] int8、`tsuitate_rl.MOVE_CLASS_NAMES` の添字）を `move_class` に入れて返す（区分ごとの期待値の補助ヘッド用。
     乱数は消費しない）
 
+    `king_escape=True` なら記録する各手番の**自玉の逃げ場のラベル**（`VecEnv.king_escape()`、tsuitate-bot の
+    `EnvGame::king_escape_into`。[N, 8] int8。−1 = 数えない〔盤外・自駒〕、0 = 真実の盤面で玉が動けない、1 = 動ける）を
+    `king_escape` に入れ、その手番までの受理手の数（`VecEnv.plies()`、[N] int32。手数帯別の集計用）を `escape_ply` に
+    入れて返す（玉の逃げ場の補助ヘッド用。乱数は消費しない）
+
     `compact_legal=True` なら合法手のマスクを密な [N, 11259] の bool でなく、**合法手の添字**（行ごとに昇順でつなげた
     `legal_cols` int16 と行ごとの個数 `legal_counts`）で持つ（768局で約 0.79GB → 約 11MB。`--pipeline` で batch が
     2つ同時にあるときのメモリ対策。`RNaDLearner.update` はどちらの形でも同じ結果になる）
@@ -1236,12 +1270,13 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
             env.reset()  # 整形の基準（収集の頭の信号）は reset の後に読む
             shape_run = _start_shape_run(env, shaping, shape_mult)
         return _collect_fast(env, net, device, max_steps, generator, rust=fast == "rust", extras=actor_extras,
-                             shape_run=shape_run, move_class=move_class)
+                             shape_run=shape_run, move_class=move_class, king_escape=king_escape)
     env.reset()
     B = env.num_envs
     obs_l, legal_l, act_l, mu_l, t_l, b_l, truth_l = [], [], [], [], [], [], []
     v_l, lp_l = [], []  # actor_extras
     mc_l = []  # move_class
+    ke_l, kp_l = [], []  # king_escape
     valid = torch.zeros(max_steps, B, dtype=torch.bool)
     player = torch.zeros(max_steps, B, dtype=torch.long)
     reward = torch.zeros(max_steps, B, 2)
@@ -1257,6 +1292,8 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
             break
         obs, mask, pl = env.observe()
         tr = env.truth() if truth else None
+        ke = env.king_escape() if king_escape else None
+        kp = env.plies() if king_escape else None
         idx = np.flatnonzero(alive)
         all_idx = idx
         opp_by = {}
@@ -1368,6 +1405,9 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
             truth_l.append(torch.from_numpy(tr[idx]))
         if move_class:
             mc_l.append(torch.from_numpy(mc[idx]))
+        if king_escape:
+            ke_l.append(torch.from_numpy(ke[idx]))
+            kp_l.append(torch.from_numpy(kp[idx]))
     else:
         raise RuntimeError(f"{max_steps} 手で終わらない局がある")
     for t0, b, p, bonus in pending:
@@ -1379,6 +1419,9 @@ def collect(env, net, device, max_steps=260, nyugyoku_lambda=0.0, nyugyoku_mode=
     extra = {"truth": torch.cat(truth_l)} if truth else {}
     if move_class:
         extra["move_class"] = torch.cat(mc_l)
+    if king_escape:
+        extra["king_escape"] = torch.cat(ke_l)
+        extra["escape_ply"] = torch.cat(kp_l)
     if actor_extras:
         extra.update(v_actor=torch.cat(v_l), mu_logp=torch.cat(lp_l))
     if shape_run is not None:
@@ -1412,7 +1455,8 @@ def _shape_step(shape_run, env, done, rew):
 
 
 @torch.no_grad()
-def _collect_fast(env, net, device, max_steps, generator, rust, extras=False, shape_run=None, move_class=False):
+def _collect_fast(env, net, device, max_steps, generator, rust, extras=False, shape_run=None, move_class=False,
+                  king_escape=False):
     """`collect(..., compact_legal=True)`（自己対局・入玉ボーナスなし・truth なし）と**ビット単位で同じ batch** を返す。
 
     数式と乱数の消費の順は同じで、CPU の仕事だけを減らす（2026-10-24 の計測で、768局の収集の CPU 時間の半分が
@@ -1432,6 +1476,7 @@ def _collect_fast(env, net, device, max_steps, generator, rust, extras=False, sh
     B = env.num_envs
     obs_l, cols_l, cnt_l, act_l, mu_l, t_l, b_l = [], [], [], [], [], [], []
     mc_l = []  # move_class
+    ke_l, kp_l = [], []  # king_escape
     v_l, lp_l = [], []
     valid = torch.zeros(max_steps, B, dtype=torch.bool)
     player = torch.zeros(max_steps, B, dtype=torch.long)
@@ -1484,6 +1529,9 @@ def _collect_fast(env, net, device, max_steps, generator, rust, extras=False, sh
         actions[idx] = a.numpy()
         if move_class:
             mc_l.append(torch.from_numpy(env.move_classes(actions)[idx]))  # step の前（指す前の局面で区分を決める）
+        if king_escape:
+            ke_l.append(torch.from_numpy(env.king_escape()[idx]))  # step の前（指す前の局面のラベル）
+            kp_l.append(torch.from_numpy(env.plies()[idx]))
         rew, done = env.step(actions)
         outcome[done] = rew[done]
         if shape_run is not None:
@@ -1505,6 +1553,7 @@ def _collect_fast(env, net, device, max_steps, generator, rust, extras=False, sh
         **({"v_actor": torch.cat(v_l), "mu_logp": torch.cat(lp_l)} if extras else {}),
         **({"shape_run": shape_run} if shape_run is not None else {}),
         **({"move_class": torch.cat(mc_l)} if move_class else {}),
+        **({"king_escape": torch.cat(ke_l), "escape_ply": torch.cat(kp_l)} if king_escape else {}),
         "legal_cols": torch.cat(cols_l), "legal_counts": torch.cat(cnt_l),
         "obs": torch.cat(obs_l), "action": torch.cat(act_l),
         "mu_a": torch.cat(mu_l), "t": torch.cat(t_l), "b": torch.cat(b_l),
