@@ -253,6 +253,30 @@ class ClassValueHead(nn.Module):
         return torch.tanh(self.fc2(torch.relu(self.fc1(h))))  # [B, 12]
 
 
+NUM_KING_ESCAPE = 8
+
+
+class KingEscapeHead(nn.Module):
+    """**自玉の逃げ場を当てる補助ヘッド**（2026-11-27。`--aux-escape`）。
+
+    幹の出力から、手番側の玉の周り8マス（tsuitate-bot の `KING_ESCAPE_NAMES` = 手番側から見た前左・前・前右・左・右・
+    後左・後・後右）それぞれについて「真実の盤面で玉がそこへ動けるか」のロジットを出す（多ラベルの二値分類）。
+    盤外と自駒のマスはラベル −1 で数えない（自駒は観測から分かるので、実質は「そのマスに相手の利きがあるか」の推定）。
+    補助損失にだけ使い、**ネットの書き出しには入らない**（`ClassValueHead` と同じく `PolicyValueNet` の外に持つ）
+    """
+
+    def __init__(self, channels: int = 64):
+        super().__init__()
+        self.conv = nn.Conv2d(channels, 4, 1, bias=False)
+        self.bn = nn.BatchNorm2d(4)
+        self.fc1 = nn.Linear(4 * 81, 128)
+        self.fc2 = nn.Linear(128, NUM_KING_ESCAPE)
+
+    def forward(self, x):
+        h = torch.relu(self.bn(self.conv(x))).flatten(1)
+        return self.fc2(torch.relu(self.fc1(h)))  # [B, 8] のロジット
+
+
 def masked_logits(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """マスク外を -inf 相当にする（softmax・argmax・交差エントロピーの前に通す）"""
     return logits.masked_fill(~mask, -1e9)
